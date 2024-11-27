@@ -3,6 +3,9 @@ title: Datahub
 ---
 # Pimcore Datahub
 
+[<img src="https://sonarcloud.io/images/project_badges/sonarcloud-light.svg" alt="SonarQube Cloud" height="30">](https://sonarcloud.io/summary/new_code?id=pimcore_data-hub)
+
+
 Pimcore Datahub (data delivery and consumption platform) integrates different input & output channel
 technologies into a simple & easy-to-configure system on top of Pimcore.
 
