@@ -48,6 +48,19 @@ class Helper extends ObjectType
                     }
                 },
             ],
+            'title' => [
+                'type' => Type::string(),
+                'resolve' => static function ($value = null, $args = [], $context = [], ResolveInfo $resolveInfo = null) {
+                    if ($value instanceof FeatureDescriptor) {
+                        $keyConfig = KeyConfig::getById($value->getId());
+                        if ($keyConfig) {
+                            return $keyConfig->getTitle();
+                        }
+                    }
+
+                    return null;
+                },
+            ],
             'description' => [
                 'type' => Type::string(),
                 'resolve' => static function ($value = null, $args = [], $context = [], ResolveInfo $resolveInfo = null) {

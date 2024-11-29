@@ -41,6 +41,9 @@ class CsFeature
                             'name' => [
                                 'type' => Type::string(),
                             ],
+                            'title' => [
+                                'type' => Type::string(),
+                            ],
                             'type' => [
                                 'type' => Type::string(),
                             ],
