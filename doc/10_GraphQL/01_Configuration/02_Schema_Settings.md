@@ -2,6 +2,8 @@
 
 Schema settings define which data entities (Data Object classes, Assets, Documents) should be exposed via the endpoint. For Assets and Documents, default schemas are provided, for Data Object classes the schema can be defined in the field configuration.
 
+<div class="image-as-lightbox"></div>
+
 ![Add](../../img/graphql/schema_add.png)
 
 ## Query Schema
@@ -14,9 +16,16 @@ When adding a new entity with the `Add` button, you can access the `Available Fi
 
 In addition, you can employ a set of operators.
 
+<div class="image-as-lightbox"></div>
+
 ![Schema Settings](../../img/graphql/schema.png)
 
+:::info
+
 Please note that not all data types are supported yet!
+
+:::
+
 You will get a notice if you try to add an unsupported data type.
 
 ## Mutation Schema

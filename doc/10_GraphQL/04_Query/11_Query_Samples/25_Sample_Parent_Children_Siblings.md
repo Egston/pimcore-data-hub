@@ -2,11 +2,18 @@
 
 For example, to get `berlina` object's (id:261) parent, children and siblings
 
+<div class="image-as-lightbox"></div>
+
 ![](../../../img/graphql/sample_parentChildrenSiblings.png)
 
 ### Request
 
+:::info
+
 Note that for `children` and `_siblings` you can use the `objectTypes` argument to filter for specific types.
+
+:::
+
 Any combination of `variant`, `object`, `folder` is possible as a value for the `objectTypes` argument (default: `["object", "folder"]`).
 
 ```graphql
