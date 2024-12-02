@@ -1,77 +1,39 @@
 # DataObject Mutations
 
->TODO: Align this with the new demo as soon as reasonable content is available.
- 
-* Create Objects
-* Update Objects
-* Delete Objects
+Data object mutations are used to create, update and delete data objects, documents, assets and translations.
+Keep in mind that for all kinds of mutations you need the `Write` permission and the mutation itself needs to be enabled in the configuration.
 
-In addition, you can turn on mutations to modify assets, create object folders and on on.
- 
+:::info
+
+Please be aware, that not all operations are supported for all data types.
+
+:::
+
+<div class="image-as-lightbox"></div>
 
 ![Mutation grid](../../img/graphql/mutation_grid.png)
- 
+
+:::info
+
 Note that for `Create` and `Update` operate you can query the updated data using the same request.
-Keep in mind that for all kinds of mutations you need the `Write` permission.
+
+:::
 
 ## Supported Mutation Datatypes
 
-![Mutation grid](../../img/graphql/mutation_grid.png)
-
-Also check out the Pimcore's [data type documentation](https://pimcore.com/docs/6.x/Development_Documentation/Objects/Object_Classes/Data_Types/index.html). 
-
-* Boolean Select
-* Checkbox
-* Country
-* Countries (Multiselect)
-* Date
-* DateTime
-* Email
-* External Image
-* Field Collections
-* Firstname
-* Gender
-* Geopoint
-* Image
-* ImageGallery
-* Input
-* Input Quantity Value
-* Language
-* Lastname
-* Link
-* Many-to-One Relation
-* Many-to-Many Relation
-* Many-to-Many Object Relation
-* Advanced Many-to-Many Relation
-* Advanced Many-to-Many Object Relation
-* Multiselect
-* Newsletter Active
-* Newsletter Confirmed
-* Numeric
-* Quantity Value
-* Select
-* Slider
-* Table
-* Textarea
-* Time
-* Wysiwyg
+Also check out the Pimcore's [data type documentation](https://pimcore.com/docs/6.x/Development_Documentation/Objects/Object_Classes/Data_Types/index.html).
+For supported mutation datatypes please check the `DataObjectMutationFieldConfigGenerator` folder in `src/GraphQL/`.
 
 ## Supported Mutation Operators
 
-* IfEmpty
-* Locale Switcher
-* ...
-
-See [the overview page](./21_Mutation_Operators.md) for more details.
+See [operators section](../08_Operators/README.md) for more details.
 
 ## Create Object
 
-TBD: do we need an extra workspace permission for that ? (in addition to write which would be only used for updates)
-
 Request:
-```
+```graphql
 mutation {
-  createNews(parentId: 66, key: "testcreate27", published: false) {
+  createNews(parentId: 429, key: "news_created_by_gql", published: false) {
     success
     message
     output(defaultLanguage: "de") {
@@ -85,16 +47,16 @@ mutation {
 ```
 
 Response:
-```
+```json
 {
   "data": {
     "createNews": {
       "success": true,
-      "message": "object created: 98",
+      "message": "object created: 1196",
       "output": {
-        "id": "98",
-        "creationDate": 1559642310,
-        "fullpath": "/tests/testcreate2/testcreate27",
+        "id": "1196",
+        "creationDate": 1732785597,
+        "fullpath": "/Product Data/Accessories/lights/indicator lights/chevrolet-bel air-tail lights/news_created_by_gql",
         "title": null
       }
     }
@@ -107,25 +69,31 @@ Response:
 Updates german title and short text and returns the modification date. 
 
 Request:
-```
+```graphql
 mutation {
-  updateNews(id: 773, defaultLanguage: "de", input: {title: "german TITLE", shortText: "new short text"}) {
+  updateNews(id: 1196, defaultLanguage: "de", input: {
+    title: "german TITLE", 
+    shortText: "new short text"
+  }
+  ) {
     success
     output {
-      modificationDate
+      modificationDate,
+      title
     }
   }
 }
 ```
 
 Response:
-```
+```json
 {
   "data": {
     "updateNews": {
       "success": true,
       "output": {
-        "modificationDate": 1559746654
+        "modificationDate": 1732785648,
+        "title": "german TITLE"
       }
     }
   }
@@ -135,9 +103,9 @@ Response:
 ## Delete Object
 
 Request:
-```
+```graphql
 mutation {
-  deleteBlogCategory(id: 37) {
+  deleteNews(id: 1196) {
     success
     message
   }
@@ -145,18 +113,16 @@ mutation {
 ```
 
 Response:
-```
+```graphql
 {
   "data": {
-    "deleteBlogCategory": {
+    "deleteNews": {
       "success": true,
       "message": ""
     }
   }
 }
 ```
-
-
 
 
 ## Extend Data Object Mutations

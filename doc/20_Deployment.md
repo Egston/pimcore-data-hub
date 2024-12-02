@@ -14,7 +14,7 @@ When deploying configurations following steps are necessary:
 Either call: 
 ```bash
 datahub:configuration:rebuild-workspaces
-``` 
+```
 to do that for all definitions, or:
 
 
@@ -23,7 +23,11 @@ datahub:configuration:rebuild-workspaces --configs=assets,events
 ```
 for specific definitions.
 
->Note: The command ```datahub:graphql:rebuild-definitions ``` is marked as deprecated and will be removed in a future release.   
+:::warning
+
+Note: The command ```datahub:graphql:rebuild-definitions ``` is marked as deprecated and will be removed in a future release.
+
+:::
 
 ### Configuration Storage
 
