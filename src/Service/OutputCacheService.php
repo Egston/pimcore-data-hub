@@ -162,7 +162,7 @@ class OutputCacheService
 
     private function useCache(Request $request): bool
     {
-        $forceUseCache = true;
+        $forceUseCache = false;
         if (!$this->cacheEnabled) {
             Logger::error('Output cache is disabled');
 
