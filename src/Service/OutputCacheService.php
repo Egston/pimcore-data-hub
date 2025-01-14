@@ -143,7 +143,11 @@ class OutputCacheService
      */
     protected function saveToCache($key, $item, $tags = []): void
     {
-        \Pimcore\Cache::save($item, $key, $tags, $this->lifetime);
+        $saved = \Pimcore\Cache::save($item, $key, $tags, $this->lifetime, 0, true);
+        if (!$saved) {
+            Logger::error('Could not save output cache item with key ' . $key);
+        }
+    
     }
 
     private function computeKey(Request $request): string
@@ -158,6 +162,7 @@ class OutputCacheService
 
     private function useCache(Request $request): bool
     {
+        return true;
         if (!$this->cacheEnabled) {
             Logger::debug('Output cache is disabled');
 
