@@ -162,11 +162,11 @@ class OutputCacheService
 
     private function useCache(Request $request): bool
     {
-        return true;
+        $forceUseCache = true;
         if (!$this->cacheEnabled) {
-            Logger::debug('Output cache is disabled');
+            Logger::error('Output cache is disabled');
 
-            return false;
+            return $forceUseCache;
         }
 
         if (\Pimcore::inDebugMode()) {
@@ -174,15 +174,20 @@ class OutputCacheService
             || filter_var($request->query->get('pimcore_outputfilters_disabled', 'false'), FILTER_VALIDATE_BOOLEAN);
 
             if ($disableCacheForSingleRequest) {
-                Logger::debug('Output cache is disabled for this request');
+                Logger::error('Output cache is disabled for this request');
 
-                return false;
+                return $forceUseCache;
             }
         }
 
         // So far, cache will be used, unless the listener denies it
         $event = new OutputCachePreLoadEvent($request, true);
         $this->eventDispatcher->dispatch($event, OutputCacheEvents::PRE_LOAD);
+        if (!$event->isUseCache()) {
+            Logger::error('Output cache is disabled by listener');
+
+            return $forceUseCache;
+        }
 
         return $event->isUseCache();
     }
