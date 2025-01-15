@@ -111,7 +111,9 @@ class OutputCacheService
      */
     protected function saveToCache($key, $item, $tags = []): void
     {
-        \Pimcore\Cache::save($item, $key, $tags, $this->lifetime);
+        # Increase priority to 1 to make it less likely this cache item is evicted from the
+        # queue before actually being written
+        \Pimcore\Cache::save($item, $key, $tags, $this->lifetime, 1);
     }
 
     private function computeKey(Request $request): string
