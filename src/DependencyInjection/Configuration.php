@@ -54,6 +54,10 @@ class Configuration implements ConfigurationInterface
                             ->info('Optional Retry-After header value in seconds for in-progress responses')
                             ->defaultNull()
                         ->end()
+                        ->scalarNode('in_progress_key_strategy')
+                            ->info("how to build the in-progress key: 'request' (query+variables) or 'operation' (operationName only)")
+                            ->defaultValue('request')
+                        ->end()
                         ->booleanNode('allow_introspection')->info('enables introspection for graphql. It is enabled by default')->defaultValue(true)->end()
                         ->booleanNode('allow_sqlObjectCondition')
                             ->setDeprecated(

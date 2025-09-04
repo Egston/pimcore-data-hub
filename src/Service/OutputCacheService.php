@@ -64,6 +64,12 @@ class OutputCacheService
     private $inProgressRetryAfter = null;
 
     /**
+     * Strategy for guard key: 'request' (query+variables) or 'operation' (operationName only).
+     * @var string
+     */
+    private $inProgressKeyStrategy = 'request';
+
+    /**
      * @var EventDispatcherInterface
      */
     public $eventDispatcher;
@@ -100,6 +106,11 @@ class OutputCacheService
             if (array_key_exists('in_progress_retry_after', $dataHubConfig['graphql'])) {
                 $v = $dataHubConfig['graphql']['in_progress_retry_after'];
                 $this->inProgressRetryAfter = $v === null ? null : intval($v);
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_key_strategy'])) {
+                $strategy = (string) $dataHubConfig['graphql']['in_progress_key_strategy'];
+                $strategy = in_array($strategy, ['request', 'operation'], true) ? $strategy : 'request';
+                $this->inProgressKeyStrategy = $strategy;
             }
         }
     }
@@ -267,13 +278,22 @@ class OutputCacheService
         \Pimcore\Cache::save(null, $key, [], 1, 1);
     }
 
-    /** Compute a client-agnostic key based on query and variables. */
+    /** Compute a client-agnostic guard key according to configured strategy. */
     private function computeGuardKey(Request $request): string
     {
-        // Client-agnostic guard key: only request body matters
-        $input = json_decode($request->getContent(), true);
-        $input = print_r($input, true);
-        return md5('output_' . $input);
+        $input = json_decode($request->getContent(), true) ?: [];
+
+        if ($this->inProgressKeyStrategy === 'operation') {
+            $operationName = $input['operationName'] ?? '';
+            // If operationName is missing, fall back to full request body
+            if ($operationName !== '') {
+                return md5('op_' . $operationName);
+            }
+        }
+
+        // Default: include query+variables (full request body) to scope lock per variant
+        $print = print_r($input, true);
+        return md5('req_' . $print);
     }
 
     /**

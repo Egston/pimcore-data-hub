@@ -107,11 +107,15 @@ pimcore_data_hub:
     in_progress_ttl: 60                 # seconds for the in-progress marker
     in_progress_http_status: 503        # status returned to duplicates
     in_progress_retry_after: 5          # optional Retry-After header (seconds)
+    in_progress_key_strategy: request   # 'request' (query+variables) or 'operation' (operationName only)
 ```
 
 Notes
 - The operationName is the GraphQL operation’s name in your document, e.g. `query getResourceLibraryAssetItemListing { ... }`; add that string to `in_progress_queries`.
 - Protection is client-agnostic: one client’s execution blocks other clients for the same query+variables until the response is cached.
+- Key strategy:
+  - `request` (default): blocks only identical query+variables; different variables are independent.
+  - `operation`: blocks all variants of the same operationName, regardless of variables.
 - On duplicates, the endpoint returns the configured status (e.g., 503) with a JSON error and optional `Retry-After` header.
 
 Atomic locking (recommended)
