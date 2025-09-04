@@ -107,14 +107,33 @@ class WebserviceController extends FrontendController
         }
 
         if ($response = $this->cacheService->load($request)) {
-            Logger::debug('Loading response from cache');
+            Logger::debug('Output cache HIT');
 
             $responseService->addCorsHeaders($response);
+            $responseService->addHitMissHeaders($response, true);
 
             return $response;
         }
 
-        Logger::debug('Cache entry not found');
+        Logger::debug('Output cache MISS');
+
+        // Try to acquire an in-progress marker for selected protected queries to avoid thundering herd
+        if ($inProgressResponse = $this->cacheService->maybeRejectOrAcquire($request)) {
+            $input = json_decode($request->getContent(), true) ?: [];
+            $operationName = $input['operationName'] ?? null;
+            Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
+            $responseService->addCorsHeaders($inProgressResponse);
+            return $inProgressResponse;
+        }
+
+        // If we get here and a lock attribute exists, we acquired the protection lock
+        if ($request->attributes->get('datahub_inprogress_lock')) {
+            $input = json_decode($request->getContent(), true) ?: [];
+            $operationName = $input['operationName'] ?? null;
+            Logger::debug(sprintf('In-progress: lock ACQUIRED (operationName=%s)', (string)$operationName));
+        } else {
+            Logger::debug('In-progress: no protection (not enabled or query not listed)');
+        }
 
         // context info, will be passed on to all resolver function
         $context = ['clientname' => $clientname, 'configuration' => $configuration];
@@ -234,6 +253,7 @@ class WebserviceController extends FrontendController
         $responseService->removeCorsHeaders($response);
         $this->cacheService->save($request, $response);
         $responseService->addCorsHeaders($response);
+        $responseService->addHitMissHeaders($response, false);
 
         return $response;
     }

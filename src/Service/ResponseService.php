@@ -45,4 +45,9 @@ final class ResponseService implements ResponseServiceInterface
         $response->headers->set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         $response->headers->set('Access-Control-Allow-Headers', 'Origin, Content-Type, X-Auth-Token');
     }
+
+    public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void
+    {
+        $response->headers->set('X-Pimcore-DataHub-Cache', $isCacheHit ? 'HIT' : 'MISS');
+    }
 }
