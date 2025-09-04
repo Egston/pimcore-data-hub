@@ -281,7 +281,7 @@ class OutputCacheService
     private function saveInProgressLock(string $guardKey, Request $request): void
     {
         $clientname = $request->attributes->getString('clientname');
-        $tags = ['output', 'datahub', $clientname, 'inprogress'];
+        $tags = ['datahub_inprogress', $clientname];
         $key = $this->lockKeyFor($guardKey);
 
         // value is irrelevant; we only care about existence; use low priority
