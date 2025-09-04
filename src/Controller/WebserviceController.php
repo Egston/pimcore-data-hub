@@ -110,6 +110,7 @@ class WebserviceController extends FrontendController
             Logger::debug('Output cache HIT');
 
             $responseService->addCorsHeaders($response);
+            $responseService->addHitMissHeaders($response, true);
 
             return $response;
         }
@@ -252,6 +253,7 @@ class WebserviceController extends FrontendController
         $responseService->removeCorsHeaders($response);
         $this->cacheService->save($request, $response);
         $responseService->addCorsHeaders($response);
+        $responseService->addHitMissHeaders($response, false);
 
         return $response;
     }
