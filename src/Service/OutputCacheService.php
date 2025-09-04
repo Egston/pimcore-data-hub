@@ -189,8 +189,13 @@ class OutputCacheService
     protected function saveToCache($key, $item, $tags = []): void
     {
         # Increase priority to 1 to make it less likely this cache item is evicted from the
-        # queue before actually being written
-        \Pimcore\Cache::save($item, $key, $tags, $this->lifetime, 1);
+        # queue before actually being written, or better yet, write it immediately.
+        \Pimcore\Cache::save($item, $key, $tags, $this->lifetime, 1, true);
+        try {
+            Logger::debug(sprintf('Output cache SAVED (key=%s, ttl=%d, tags=%s)', $key, (int) $this->lifetime, implode(',', $tags)));
+        } catch (\Throwable $e) {
+            // ignore logging failures
+        }
     }
 
     private function computeKey(Request $request): string
@@ -284,8 +289,8 @@ class OutputCacheService
         $tags = ['datahub_inprogress', $clientname];
         $key = $this->lockKeyFor($guardKey);
 
-        // value is irrelevant; we only care about existence; use low priority
-        \Pimcore\Cache::save(1, $key, $tags, $this->inProgressTtl, 1);
+        // value is irrelevant; we only care about existence
+        \Pimcore\Cache::save(1, $key, $tags, $this->inProgressTtl, 1, true);
     }
 
     /** Remove the in-progress marker. */
@@ -304,7 +309,7 @@ class OutputCacheService
             // ignore
         }
         // Fallback: overwrite with very short TTL
-        \Pimcore\Cache::save(null, $key, [], 1, 1);
+        \Pimcore\Cache::save(null, $key, [], 1, 1, true);
     }
 
     /** Compute a client-agnostic guard key according to configured strategy. */
