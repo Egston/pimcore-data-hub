@@ -39,6 +39,10 @@ class Configuration implements ConfigurationInterface
                         ->scalarNode('not_allowed_policy')->info('throw exception = 1, return null = 2')->defaultValue(2)->end()
                         ->booleanNode('output_cache_enabled')->info('enables output cache for graphql responses. It is disabled by default')->defaultValue(false)->end()
                         ->integerNode('output_cache_lifetime')->info('output cache in seconds. Default is 30 seconds')->defaultValue(30)->end()
+                        ->booleanNode('persistent_output_cache_enabled')->info('enables persistent output cache for graphql responses (separate from Pimcore \"output\" tag).')->defaultValue(false)->end()
+                        ->integerNode('persistent_output_cache_lifetime')->info('persistent output cache TTL in seconds. Defaults to output_cache_lifetime when not set')->defaultNull()->end()
+                        ->integerNode('persistent_output_cache_payload_ttl')->info('TTL in seconds for the large payload entry; use a longer TTL to avoid frequent rewrites')->defaultValue(86400)->end()
+                        ->booleanNode('persistent_output_cache_guard_only')->info('apply persistent cache only to queries listed in in_progress_queries')->defaultValue(true)->end()
                         ->booleanNode('in_progress_protection_enabled')->info('reject duplicate parallel requests for selected queries while the first one is in progress')->defaultValue(false)->end()
                         ->arrayNode('in_progress_queries')
                             ->info('list of GraphQL operation names to protect (thundering herd protection)')
@@ -59,6 +63,11 @@ class Configuration implements ConfigurationInterface
                             ->defaultValue('request')
                         ->end()
                         ->booleanNode('allow_introspection')->info('enables introspection for graphql. It is enabled by default')->defaultValue(true)->end()
+                        ->booleanNode('persistent_refresh_lock_enabled')->info('enable a lightweight refresh lock for background refresh when operation is not guarded by herd protection')->defaultValue(true)->end()
+                        ->integerNode('persistent_refresh_lock_ttl')->info('TTL in seconds for the background refresh lock marker')->defaultValue(120)->end()
+                        ->booleanNode('persistent_refresh_queue_enabled')->info('enqueue background refresh jobs to Symfony Messenger instead of running them in kernel.terminate')->defaultValue(false)->end()
+                        ->integerNode('persistent_refresh_operation_lock_ttl')->info('TTL (seconds) for per-operation lock in the worker when herd guard uses operation-name; set slightly above p99 refresh time')->defaultValue(120)->end()
+                        ->integerNode('persistent_enqueue_dedupe_ttl')->info('TTL (seconds) for enqueue dedupe marker to avoid flooding the queue with identical refresh jobs')->defaultValue(60)->end()
                         ->booleanNode('allow_sqlObjectCondition')
                             ->setDeprecated(
                                 'pimcore/data-hub',

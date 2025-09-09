@@ -1,0 +1,95 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Pimcore\Bundle\DataHubBundle\Command;
+
+use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
+use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
+use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
+use Pimcore\Helper\LongRunningHelper;
+use Pimcore\Localization\LocaleServiceInterface;
+use Pimcore\Model\Factory;
+use Symfony\Component\Console\Attribute\AsCommand;
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\HttpFoundation\Request;
+
+#[AsCommand(name: 'datahub:graphql:persistent-cache:refresh', description: 'Refresh persistent GraphQL cache by executing a GraphQL request')]
+class PersistentCacheRefreshCommand extends Command
+{
+    public function __construct(
+        private WebserviceController $controller,
+        private GraphQLService $graphQlService,
+        private LocaleServiceInterface $localeService,
+        private Factory $modelFactory,
+        private LongRunningHelper $longRunningHelper,
+        private ResponseServiceInterface $responseService
+    ) {
+        parent::__construct();
+    }
+
+    protected function configure(): void
+    {
+        $this
+            ->addArgument('client', InputArgument::REQUIRED, 'DataHub client name')
+            ->addOption('operation', null, InputOption::VALUE_OPTIONAL, 'Operation name (optional)')
+            ->addOption('query', null, InputOption::VALUE_OPTIONAL, 'GraphQL query (string)')
+            ->addOption('variables', null, InputOption::VALUE_OPTIONAL, 'Variables as JSON string')
+            ->addOption('body-file', null, InputOption::VALUE_OPTIONAL, 'Path to file containing raw JSON GraphQL body');
+    }
+
+    protected function execute(InputInterface $input, OutputInterface $output): int
+    {
+        $client = (string)$input->getArgument('client');
+        $bodyFile = $input->getOption('body-file');
+        $query = $input->getOption('query');
+        $variables = $input->getOption('variables');
+        $operation = $input->getOption('operation');
+
+        $payload = null;
+        if ($bodyFile) {
+            if (!is_file($bodyFile)) {
+                $output->writeln('<error>Body file not found: ' . $bodyFile . '</error>');
+                return Command::FAILURE;
+            }
+            $payload = file_get_contents($bodyFile) ?: '';
+        } else {
+            $data = [
+                'query' => (string)$query,
+            ];
+            if ($variables) {
+                $vars = json_decode((string)$variables, true);
+                if (!is_array($vars)) {
+                    $output->writeln('<error>Invalid variables JSON</error>');
+                    return Command::FAILURE;
+                }
+                $data['variables'] = $vars;
+            }
+            if ($operation) {
+                $data['operationName'] = (string)$operation;
+            }
+            $payload = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+
+        $request = Request::create('/datahub/graphql', 'POST', [], [], [], [], (string)$payload);
+        $request->attributes->set('clientname', $client);
+
+        // Directly invoke the controller action to reuse the same pipeline
+        $this->controller->webonyxAction(
+            $this->graphQlService,
+            $this->localeService,
+            $this->modelFactory,
+            $request,
+            $this->longRunningHelper,
+            $this->responseService
+        );
+
+        $output->writeln('<info>Executed GraphQL request for client: ' . $client . '</info>');
+        return Command::SUCCESS;
+    }
+}
+

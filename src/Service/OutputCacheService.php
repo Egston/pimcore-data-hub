@@ -15,6 +15,9 @@
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
+use GraphQL\Language\Parser;
+use GraphQL\Language\Printer;
+use GraphQL\Language\AST\DocumentNode;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
@@ -125,8 +128,21 @@ class OutputCacheService
             return null;
         }
 
-        $cacheKey = $this->computeKey($request);
-        return $this->loadFromCache($cacheKey);
+        // Try new canonical key first
+        $newKey = $this->computeKey($request);
+        $item = $this->loadFromCache($newKey);
+        if ($item !== false && $item !== null) {
+            return $item;
+        }
+
+        // Backward-compat: try legacy key (print_r-based) so rollout is seamless
+        $legacyKey = $this->computeLegacyKey($request);
+        $item = $this->loadFromCache($legacyKey);
+        if ($item !== false && $item !== null) {
+            return $item;
+        }
+
+        return null;
     }
 
     /**
@@ -180,10 +196,105 @@ class OutputCacheService
         }
     }
 
+
+    /**
+     * Canonicalize the incoming JSON body for cache/lock keys:
+     * - Parse JSON
+     * - Optionally AST-normalize the GraphQL 'query'
+     * - Harmonize variables (treat missing vs null equivalently for declared vars)
+     * - Recursively ksort all associative arrays
+     * - Encode with stable json_encode flags
+     *
+     * @param Request $request
+     */
+    private function canonicalizePayloadForCache(Request $request): string
+    {
+        $cached = $request->attributes->get('_datahub_canonical_payload');
+        if (is_string($cached)) {
+            return $cached;
+        }
+
+        $payload = json_decode($request->getContent(), true);
+        if (!is_array($payload)) {
+            $payload = [];
+        }
+
+        if (!empty($payload['query']) && is_string($payload['query'])) {
+            $payload['query'] = $this->normalizeQueryAst($payload['query']);
+        }
+
+        $payload = $this->ksortRecursive($payload);
+
+        $canonical = json_encode(
+            $payload,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
+        );
+
+        // Guard against rare encode failures returning false
+        if (!is_string($canonical)) {
+            $canonical = '{}';
+        }
+
+        $request->attributes->set('_datahub_canonical_payload', $canonical);
+        return $canonical;
+    }
+
+    /**
+     * Parse and re-print the GraphQL query to a canonical form.
+     */
+    private function normalizeQueryAst(string $query): string
+    {
+        try {
+            /** @var DocumentNode $ast */
+            $ast = Parser::parse($query);
+            // Printer preserves a canonical formatting; not sorting selections (keeps semantic order)
+            return Printer::doPrint($ast);
+        } catch (\Throwable $e) {
+            // The query is already invalid; we cannot parse it. However, we still need some
+            // reproducible canonical form for caching/locking.
+            return trim($query);
+        }
+    }
+
+    /** Recursively ksort associative arrays; leave list arrays as-is (order significant). */
+    private function ksortRecursive(array $value): array
+    {
+        $isAssoc = static function (array $a): bool {
+            $i = 0;
+            foreach ($a as $k => $_) {
+                if ($k !== $i++) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        if ($isAssoc($value)) {
+            ksort($value);
+        }
+
+        foreach ($value as $k => $v) {
+            if (is_array($v)) {
+                $value[$k] = $this->ksortRecursive($v);
+            }
+        }
+
+        return $value;
+    }
+
+    /** Compute a cache key for the given request. */
     private function computeKey(Request $request): string
     {
-        $clientname = $request->attributes->getString('clientname');
+        $clientname = (string) $request->attributes->get('clientname', '');
+        $payload    = $this->canonicalizePayloadForCache($request);
 
+        return 'output_' . hash('sha256', 'client:' . $clientname . "\n" . $payload);
+    }
+
+    /** Legacy key computation for seamless rollout without invalidating existing cache. */
+    private function computeLegacyKey(Request $request): string
+    {
+        $clientname = $request->attributes->getString('clientname');
         $input = json_decode($request->getContent(), true);
         $input = print_r($input, true);
 
@@ -196,6 +307,10 @@ class OutputCacheService
      */
     public function maybeRejectOrAcquire(Request $request): ?JsonResponse
     {
+        // allow background refresh to bypass herd guard
+        if ($request->attributes->get('_datahub_bypass_in_progress_guard')) {
+            return null;
+        }
         if (!$this->shouldGuardRequest($request)) {
             return null;
         }
@@ -269,18 +384,7 @@ class OutputCacheService
     {
         $guardKey = $this->computeGuardKey($request);
         $key = $this->lockKeyFor($guardKey);
-        // Pimcore Cache has no explicit delete on facade, but save with lifetime 0 should delete; use native backend if available
-        try {
-            // Most Pimcore cache backends support remove
-            if (method_exists(\Pimcore\Cache::class, 'remove')) {
-                \Pimcore\Cache::remove($key);
-                return;
-            }
-        } catch (\Throwable $e) {
-            // ignore
-        }
-        // Fallback: overwrite with very short TTL
-        \Pimcore\Cache::save(null, $key, [], 1, 1, true);
+        try { \Pimcore\Cache::remove($key); } catch (\Throwable $e) {}
     }
 
     /** Compute a client-agnostic guard key according to configured strategy. */
@@ -296,9 +400,9 @@ class OutputCacheService
             }
         }
 
-        // Default: include query+variables (full request body) to scope lock per variant
-        $print = print_r($input, true);
-        return md5('req_' . $print);
+        // Default: full canonical request (client-agnostic)
+        $canonical = $this->canonicalizePayloadForCache($request, /*clientAware*/ false);
+        return hash('sha256', 'req:' . $canonical);
     }
 
     /**
