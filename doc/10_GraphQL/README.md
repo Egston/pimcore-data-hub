@@ -108,9 +108,6 @@ pimcore_data_hub:
     in_progress_http_status: 503        # status returned to duplicates
     in_progress_retry_after: 5          # optional Retry-After header (seconds)
     in_progress_key_strategy: request   # 'request' (query+variables) or 'operation' (operationName only)
-    # Optional: enable guard only when a query param is present
-    in_progress_enable_by_param: true   # enable protection only when a query parameter is set
-    in_progress_param_name: datahub_guard  # requests must include ?datahub_guard=true to activate guard
 ```
 
 Notes
@@ -119,9 +116,6 @@ Notes
 - Key strategy:
   - `request` (default): blocks only identical query+variables; different variables are independent.
   - `operation`: blocks all variants of the same operationName, regardless of variables.
-- Opt-in by URL parameter:
-  - When `in_progress_enable_by_param: true`, protection applies only if the request URL contains `?<param>=true`.
-  - The parameter name is configurable via `in_progress_param_name` (default: `datahub_guard`).
 - On duplicates, the endpoint returns the configured status (e.g., 503) with a JSON error and optional `Retry-After` header.
 
 Atomic locking (recommended)

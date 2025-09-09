@@ -70,18 +70,6 @@ class OutputCacheService
     private $inProgressKeyStrategy = 'request';
 
     /**
-     * If true, guard is enabled only when a specific query param is present and truthy.
-     * @var bool
-     */
-    private $inProgressEnableByParam = false;
-
-    /**
-     * Name of the query parameter that enables guarding when present and truthy.
-     * @var string
-     */
-    private $inProgressParamName = 'datahub_guard';
-
-    /**
      * @var EventDispatcherInterface
      */
     public $eventDispatcher;
@@ -123,12 +111,6 @@ class OutputCacheService
                 $strategy = (string) $dataHubConfig['graphql']['in_progress_key_strategy'];
                 $strategy = in_array($strategy, ['request', 'operation'], true) ? $strategy : 'request';
                 $this->inProgressKeyStrategy = $strategy;
-            }
-            if (isset($dataHubConfig['graphql']['in_progress_enable_by_param'])) {
-                $this->inProgressEnableByParam = filter_var($dataHubConfig['graphql']['in_progress_enable_by_param'], FILTER_VALIDATE_BOOLEAN);
-            }
-            if (isset($dataHubConfig['graphql']['in_progress_param_name']) && is_string($dataHubConfig['graphql']['in_progress_param_name'])) {
-                $this->inProgressParamName = $dataHubConfig['graphql']['in_progress_param_name'];
             }
         }
     }
@@ -242,19 +224,8 @@ class OutputCacheService
     /** Determine if the current request should be protected. */
     private function shouldGuardRequest(Request $request): bool
     {
-        if ($this->inProgressEnableByParam) {
-            $paramVal = $request->query->get($this->inProgressParamName, null);
-            if ($paramVal === null) {
-                return false;
-            }
-            $enabledByParam = filter_var($paramVal, FILTER_VALIDATE_BOOLEAN);
-            if (!$enabledByParam) {
-                return false;
-            }
-        } else {
-            if (!$this->inProgressProtectionEnabled) {
-                return false;
-            }
+        if (!$this->inProgressProtectionEnabled) {
+            return false;
         }
 
         if (empty($this->inProgressQueries)) {
