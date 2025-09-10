@@ -34,6 +34,7 @@ use Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService;
 use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
+use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Cache\RuntimeCache;
 use Pimcore\Controller\FrontendController;
 use Pimcore\Helper\LongRunningHelper;
@@ -64,6 +65,11 @@ class WebserviceController extends FrontendController
     private $cacheService;
 
     /**
+     * @var PersistentOutputCacheService
+     */
+    private $persistentCacheService;
+
+    /**
      * @var FileUploadService
      */
     private $uploadService;
@@ -72,11 +78,13 @@ class WebserviceController extends FrontendController
         EventDispatcherInterface $eventDispatcher,
         CheckConsumerPermissionsService $permissionsService,
         OutputCacheService $cacheService,
+        PersistentOutputCacheService $persistentCacheService,
         FileUploadService $uploadService
     ) {
         $this->eventDispatcher = $eventDispatcher;
         $this->permissionsService = $permissionsService;
         $this->cacheService = $cacheService;
+        $this->persistentCacheService = $persistentCacheService;
         $this->uploadService = $uploadService;
     }
 
@@ -106,7 +114,17 @@ class WebserviceController extends FrontendController
             throw new AccessDeniedHttpException('Permission denied, apikey not valid');
         }
 
-        if ($response = $this->cacheService->load($request)) {
+        // Persistent cache pre-check: may short-circuit or mark for background refresh
+        if ($pResponse = $this->persistentCacheService->preHandle($request, $responseService)) {
+            // Persistent HIT (fresh). Add output-cache header as MISS to clarify layer used
+            $responseService->addHitMissHeaders($pResponse, true);
+            return $pResponse;
+        }
+
+        // When running a background refresh, bypass the standard output cache layer
+        $isPersistentRefresh = (bool)$request->attributes->get('_datahub_persistent_refresh');
+
+        if (!$isPersistentRefresh && ($response = $this->cacheService->load($request))) {
             Logger::debug('Output cache HIT');
 
             $responseService->addCorsHeaders($response);
@@ -251,7 +269,14 @@ class WebserviceController extends FrontendController
         $response = new JsonResponse($output);
 
         $responseService->removeCorsHeaders($response);
-        $this->cacheService->save($request, $response);
+        if (!$isPersistentRefresh) {
+            $this->cacheService->save($request, $response);
+        }
+
+        // Persistent cache post-handle: save/refresh, possibly return stale response
+        if ($override = $this->persistentCacheService->postHandle($request, $response)) {
+            return $override;
+        }
         $responseService->addCorsHeaders($response);
         $responseService->addHitMissHeaders($response, false);
 
