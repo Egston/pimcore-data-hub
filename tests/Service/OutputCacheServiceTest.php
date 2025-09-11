@@ -161,4 +161,106 @@ class OutputCacheServiceTest extends Unit
         $this->assertTrue(\Pimcore::inDebugMode());
         $this->assertEquals(null, $cacheItem);
     }
+
+    public function testCanonicalKeyForEquivalentPayloads()
+    {
+        // Arrange
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'output_cache_lifetime' => 25,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $keys = [];
+        $sut = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut->method('saveToCache')->willReturnCallback(function ($key) use (&$keys) {
+            $keys[] = $key;
+        });
+
+        $clientname = 'client-a';
+        $queryA = 'query Op(
+  $id: ID!
+){
+  node(id: $id) {
+    id
+  }
+}';
+        $queryB = 'query  Op($id: ID!){node(id:$id){id}}'; // same semantics, different formatting
+        $bodyA = json_encode(['query' => $queryA, 'variables' => ['id' => 123], 'operationName' => 'Op']);
+        $bodyB = json_encode(['variables' => ['id' => 123], 'operationName' => 'Op', 'query' => $queryB]); // different order
+
+        $reqA = Request::create('/api', 'POST', [], [], [], [], $bodyA);
+        $reqA->attributes->set('clientname', $clientname);
+        $reqA->headers->set('Content-Type', 'application/json');
+
+        $reqB = Request::create('/api', 'POST', [], [], [], [], $bodyB);
+        $reqB->attributes->set('clientname', $clientname);
+        $reqB->headers->set('Content-Type', 'application/json');
+
+        // Act
+        $sut->save($reqA, new JsonResponse(['data' => ['ok' => true]]));
+        $sut->save($reqB, new JsonResponse(['data' => ['ok' => true]]));
+
+        // Assert: same computed cache key for both payloads
+        $this->assertCount(2, $keys);
+        $this->assertSame($keys[0], $keys[1]);
+    }
+
+    public function testGuardRequestStrategyCanonicalizesPayload()
+    {
+        // Configure guard to use 'request' strategy
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => ['Op'],
+                'in_progress_key_strategy' => 'request',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $clientname = 'client-b';
+        $queryA = 'query Op(
+  $id: ID!
+){
+  node(id: $id) { id }
+}';
+        $queryB = 'query Op($id: ID!){node(id:$id){id}}';
+        $bodyA = json_encode(['query' => $queryA, 'variables' => ['id' => 456], 'operationName' => 'Op']);
+        $bodyB = json_encode(['variables' => ['id' => 456], 'operationName' => 'Op', 'query' => $queryB]);
+
+        $reqA = Request::create('/api', 'POST', [], [], [], [], $bodyA);
+        $reqA->attributes->set('clientname', $clientname);
+        $reqB = Request::create('/api', 'POST', [], [], [], [], $bodyB);
+        $reqB->attributes->set('clientname', $clientname);
+
+        // First request should acquire guard (no rejection)
+        $reject1 = $sut->maybeRejectOrAcquire($reqA);
+        $this->assertNull($reject1, 'First guard attempt should not be rejected');
+
+        // Second equivalent request should be rejected (deduped)
+        $reject2 = $sut->maybeRejectOrAcquire($reqB);
+        $this->assertInstanceOf(JsonResponse::class, $reject2);
+        $this->assertSame(503, $reject2->getStatusCode());
+
+        // Cleanup: release guard by saving the first request (releases lock + removes marker)
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut2->method('saveToCache')->willReturnCallback(function () {});
+        $sut2->save($reqA, new JsonResponse(['data' => ['ok' => true]]));
+    }
 }
