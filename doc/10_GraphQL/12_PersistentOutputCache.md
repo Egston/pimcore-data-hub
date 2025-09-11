@@ -113,6 +113,43 @@ framework:
       'Pimcore\\Bundle\\DataHubBundle\\Message\\PersistentRefreshMessage': datahub_graphql_refresh
 ```
 
+### Lightweight Cache Status Probe
+
+For polling and external cache services, you can obtain cache status without fetching the full response.
+
+- Methods:
+  - For POST workflows: send the same GraphQL body but add `?cache_status=1` to the request (recommended for POST).
+  - Alternatively, use `HEAD` to the same endpoint. Note: many clients do not send a body with `HEAD`; for GraphQL POST flows prefer `cache_status=1` to ensure status is computed against the same payload.
+
+- Response:
+  - Status: `204 No Content` (no body)
+  - Headers:
+    - `Cache-Status`: includes both layers when applicable, following RFC 9211
+      - `pimcore-output; hit|miss|disabled`
+      - and, when the persistent layer applies: `pimcore-persistent; hit|stale|miss`
+    - `X-Pimcore-DataHub-Cache`: `HIT` or `MISS` (compat)
+    - `X-Pimcore-DataHub-Persistent-Cache`: `HIT|STALE|MISS` (compat, only when persistent applies)
+    - `Warning: 110 - "Response is Stale"` when the persistent status is `STALE`
+    - CORS headers are included
+
+- Side effects: none. Probing does not update TTLs nor schedule refreshes.
+
+- Examples:
+
+```
+# POST flow: same GraphQL body, light status-only probe
+curl -s -X POST 'https://host/datahub/graphql?cache_status=1' \
+  -H 'Content-Type: application/json' \
+  --data '{"query":"query Op($id:ID!){node(id:$id){id}}","variables":{"id":123},"operationName":"Op"}' -i
+
+# (Optional) HEAD flow: only if your client can submit an equivalent request context via query string
+curl -s -X HEAD 'https://host/datahub/graphql?cache_status=1' -i
+```
+
+Notes:
+- The persistent layer “applies” only to requests matching its conditions (e.g., `persistent_output_cache_guard_only` with an `operationName` included in `in_progress_queries`). If it does not apply, the `pimcore-persistent` entry is omitted from `Cache-Status` and only the output cache status is returned.
+- For POST flows, prefer the `?cache_status=1` probe with the same body to obtain precise status for the exact query and variables.
+
 
 ## Console Commands
 
