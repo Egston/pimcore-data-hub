@@ -121,10 +121,17 @@ class WebserviceController extends FrontendController
             return $pResponse;
         }
 
+        // Optionally bypass standard output cache when persistent applies to this request
+        $configAll = $this->getParameter('pimcore_data_hub');
+        $graphqlCfg = $configAll['graphql'] ?? [];
+        $skipOutputCacheForGuarded = (bool)($graphqlCfg['persistent_disable_output_cache_for_guarded'] ?? false);
+
         // When running a background refresh, bypass the standard output cache layer
         $isPersistentRefresh = (bool)$request->attributes->get('_datahub_persistent_refresh');
+        $isPersistentApplies = (bool)$request->attributes->get('_datahub_persistent_applies');
+        $skipOutputCache = $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
 
-        if (!$isPersistentRefresh && ($response = $this->cacheService->load($request))) {
+        if (!$skipOutputCache && ($response = $this->cacheService->load($request))) {
             Logger::debug('Output cache HIT');
 
             $responseService->addCorsHeaders($response);
@@ -269,7 +276,7 @@ class WebserviceController extends FrontendController
         $response = new JsonResponse($output);
 
         $responseService->removeCorsHeaders($response);
-        if (!$isPersistentRefresh) {
+        if (!$skipOutputCache) {
             $this->cacheService->save($request, $response);
         }
 

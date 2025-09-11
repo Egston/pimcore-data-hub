@@ -74,6 +74,8 @@ class PersistentOutputCacheService
         if (!$this->shouldUseForRequest($request)) {
             return null;
         }
+        // Mark that persistent cache applies for this request (used to optionally skip standard output cache)
+        $request->attributes->set('_datahub_persistent_applies', true);
         // Skip interception when running a background refresh after response
         if ($request->attributes->get('_datahub_persistent_refresh')) {
             return null;
@@ -177,6 +179,8 @@ class PersistentOutputCacheService
             'refreshedAt' => time(),
             'client' => $client,
             'operation' => $operationName,
+            // store canonical request body to allow later refresh scheduling
+            'canonical' => $canonical,
         ];
 
         $tags = $this->buildTags($request, $operationName);

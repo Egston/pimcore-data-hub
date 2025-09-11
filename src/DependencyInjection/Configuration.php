@@ -43,6 +43,7 @@ class Configuration implements ConfigurationInterface
                         ->integerNode('persistent_output_cache_lifetime')->info('persistent output cache TTL in seconds. Defaults to output_cache_lifetime when not set')->defaultNull()->end()
                         ->integerNode('persistent_output_cache_payload_ttl')->info('TTL in seconds for the large payload entry; use a longer TTL to avoid frequent rewrites')->defaultValue(86400)->end()
                         ->booleanNode('persistent_output_cache_guard_only')->info('apply persistent cache only to queries listed in in_progress_queries')->defaultValue(true)->end()
+                        ->booleanNode('persistent_disable_output_cache_for_guarded')->info('when true, skip the standard output cache layer for requests where the persistent cache applies (recommended to reduce duplicate work)')->defaultValue(false)->end()
                         ->booleanNode('in_progress_protection_enabled')->info('reject duplicate parallel requests for selected queries while the first one is in progress')->defaultValue(false)->end()
                         ->arrayNode('in_progress_queries')
                             ->info('list of GraphQL operation names to protect (thundering herd protection)')
