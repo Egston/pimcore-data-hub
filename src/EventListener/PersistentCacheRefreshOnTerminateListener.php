@@ -123,15 +123,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             // Do not break terminate; background refresh best-effort
         } finally {
             if ($markerKey) {
-                try {
-                    if (method_exists(PimcoreCache::class, 'remove')) {
-                        PimcoreCache::remove($markerKey);
-                    } else {
-                        PimcoreCache::save(null, $markerKey, [], 0, 1, true);
-                    }
-                } catch (\Throwable $e) {
-                    // ignore
-                }
+                try { PimcoreCache::remove($markerKey); } catch (\Throwable $e) {}
             }
         }
     }

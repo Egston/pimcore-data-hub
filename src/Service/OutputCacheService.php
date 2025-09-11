@@ -384,18 +384,7 @@ class OutputCacheService
     {
         $guardKey = $this->computeGuardKey($request);
         $key = $this->lockKeyFor($guardKey);
-        // Pimcore Cache has no explicit delete on facade, but save with lifetime 0 should delete; use native backend if available
-        try {
-            // Most Pimcore cache backends support remove
-            if (method_exists(\Pimcore\Cache::class, 'remove')) {
-                \Pimcore\Cache::remove($key);
-                return;
-            }
-        } catch (\Throwable $e) {
-            // ignore
-        }
-        // Fallback: overwrite with very short TTL
-        \Pimcore\Cache::save(null, $key, [], 1, 1, true);
+        try { \Pimcore\Cache::remove($key); } catch (\Throwable $e) {}
     }
 
     /** Compute a client-agnostic guard key according to configured strategy. */
