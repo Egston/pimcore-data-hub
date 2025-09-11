@@ -149,6 +149,35 @@ class PersistentOutputCacheService
         return null; // don't override
     }
 
+    /**
+     * Probe the persistent cache status without side effects.
+     * Returns array with keys:
+     * - applies: bool
+     * - status: 'HIT'|'STALE'|'MISS'
+     */
+    public function probeStatus(Request $request): array
+    {
+        $applies = $this->shouldUseForRequest($request);
+        if (!$applies) {
+            return ['applies' => false, 'status' => 'MISS'];
+        }
+
+        [$client, $canonical] = $this->clientAndCanonical($request);
+        $metaKey = $this->keyMeta($client, $canonical);
+        $payloadKey = $this->keyPayload($client, $canonical);
+
+        $meta = $this->cacheLoad($metaKey);
+        $payload = $this->cacheLoad($payloadKey);
+        if ($meta === false || $meta === null || $payload === false || $payload === null) {
+            return ['applies' => true, 'status' => 'MISS'];
+        }
+
+        $lastInvalidation = (int) ($this->cacheLoad(self::KEY_LAST_INVALIDATION) ?: 0);
+        $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
+        $isStale = $lastInvalidation > 0 && $refreshedAt > 0 && $refreshedAt < $lastInvalidation;
+        return ['applies' => true, 'status' => $isStale ? 'STALE' : 'HIT'];
+    }
+
     /** Manually set the last invalidation timestamp to now. */
     public function markOutputInvalidated(?int $ts = null): void
     {

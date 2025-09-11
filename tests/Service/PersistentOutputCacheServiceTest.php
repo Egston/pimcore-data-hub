@@ -324,4 +324,60 @@ final class PersistentOutputCacheServiceTest extends Unit
         $this->assertNull($pre, 'preHandle should not return on MISS');
         $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_applies'), 'applies flag not set on MISS');
     }
+
+    public function testProbeStatusHitMissStale(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+            'persistent_output_cache_guard_only' => true,
+            'in_progress_queries' => ['TestOp'],
+        ];
+
+        // HIT
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+
+        $meta = ['refreshedAt' => time(), 'client' => 'c1'];
+        $payload = ['data' => ['x' => 1]];
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload) {
+            if ($key === 'datahub_graphql_output_last_invalidation_ts') { return 0; }
+            if (str_contains($key, 'meta_')) { return $meta; }
+            if (str_contains($key, 'payload_')) { return $payload; }
+            return null;
+        });
+
+        $req = $this->makeRequest('c1', ['query' => '{__typename}', 'operationName' => 'TestOp']);
+        $probe = $service->probeStatus($req);
+        $this->assertTrue($probe['applies']);
+        $this->assertSame('HIT', $probe['status']);
+
+        // STALE
+        $service2 = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+        $meta2 = ['refreshedAt' => time() - 100, 'client' => 'c1'];
+        $service2->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta2, $payload) {
+            if ($key === 'datahub_graphql_output_last_invalidation_ts') { return time(); }
+            if (str_contains($key, 'meta_')) { return $meta2; }
+            if (str_contains($key, 'payload_')) { return $payload; }
+            return null;
+        });
+        $probe2 = $service2->probeStatus($req);
+        $this->assertTrue($probe2['applies']);
+        $this->assertSame('STALE', $probe2['status']);
+
+        // MISS
+        $service3 = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+        $service3->method('cacheLoad')->willReturn(null);
+        $probe3 = $service3->probeStatus($req);
+        $this->assertTrue($probe3['applies']);
+        $this->assertSame('MISS', $probe3['status']);
+    }
 }

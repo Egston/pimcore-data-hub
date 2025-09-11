@@ -114,15 +114,25 @@ class WebserviceController extends FrontendController
             throw new AccessDeniedHttpException('Permission denied, apikey not valid');
         }
 
-        // Lightweight cache-status probe for output cache: HEAD or cache_status=1
+        // Lightweight cache-status probe: HEAD or cache_status=1
         $isStatusProbe = strtoupper($request->getMethod()) === 'HEAD' || $request->query->getBoolean('cache_status');
         if ($isStatusProbe) {
-            $status = $this->cacheService->probeStatus($request);
+            $outStatus = $this->cacheService->probeStatus($request);
+            $persistProbe = $this->persistentCacheService->probeStatus($request);
             $response = new JsonResponse(null, 204);
             $response->setData(null);
-            $response->headers->set('Cache-Status', sprintf('pimcore-output; %s', strtolower($status)));
+            $cacheStatus = sprintf('pimcore-output; %s', strtolower($outStatus));
+            if ($persistProbe['applies']) {
+                $cacheStatus .= sprintf(', pimcore-persistent; %s', strtolower($persistProbe['status']));
+                // Also expose persistent header for compatibility
+                $response->headers->set('X-Pimcore-DataHub-Persistent-Cache', $persistProbe['status']);
+                if ($persistProbe['status'] === 'STALE') {
+                    $response->headers->set('Warning', '110 - "Response is Stale"');
+                }
+            }
+            $response->headers->set('Cache-Status', $cacheStatus);
             $responseService->addCorsHeaders($response);
-            $responseService->addHitMissHeaders($response, $status === 'HIT');
+            $responseService->addHitMissHeaders($response, $outStatus === 'HIT');
             return $response;
         }
 
