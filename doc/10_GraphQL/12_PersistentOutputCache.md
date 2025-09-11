@@ -46,9 +46,15 @@ pimcore_data_hub:
     persistent_output_cache_guard_only: true
     # large payload TTL (sidecar key), longer than freshness TTL to avoid frequent rewrites
     persistent_output_cache_payload_ttl: 86400
-    # optional: dedupe background refresh for non-guarded ops
+    # optional: dedupe background refresh for non-guarded ops (kernel.terminate path)
     persistent_refresh_lock_enabled: true
     persistent_refresh_lock_ttl: 120
+    # queue background refresh to Symfony Messenger instead of kernel.terminate
+    persistent_refresh_queue_enabled: false
+    # operation-level lock TTL in worker (when herd guard uses operation-name)
+    persistent_refresh_operation_lock_ttl: 120
+    # enqueue dedupe TTL to avoid flooding queue with identical refresh jobs
+    persistent_enqueue_dedupe_ttl: 60
 ```
 
 Notes:
@@ -79,7 +85,31 @@ bin/console pimcore:cache:clear --tags=datahub_graphql_client:my-client
 ### Background refresh deduplication
 
 - For operations listed in `in_progress_queries`, the existing thundering herd guard already deduplicates background refresh calls.
-- For other operations, enable a lightweight refresh lock with `persistent_refresh_lock_enabled`. The lock uses a request‑scoped key and is explicitly removed after refresh; the TTL is a safety net if the process dies.
+- For other operations, enable a lightweight refresh lock with `persistent_refresh_lock_enabled` (kernel.terminate path). The lock uses a request‑scoped key and is explicitly removed after refresh; the TTL is a safety net if the process dies.
+
+### Queueing background refresh (Messenger)
+
+- Enable `persistent_refresh_queue_enabled` to dispatch a refresh job to Symfony Messenger using transport `datahub_graphql_refresh` (configure in your app). The handler serializes refreshes per operation (when herd guard uses operation name) and recomputes the exact request.
+- TTLs:
+  - `persistent_refresh_operation_lock_ttl`: TTL for per‑operation lock (seconds). Set slightly above your p99 refresh duration (e.g., 120). Used to ensure one refresh per operation at a time.
+  - `persistent_enqueue_dedupe_ttl`: TTL for enqueue dedupe marker (seconds). Prevents flooding the queue with identical refresh jobs when many stale hits arrive. Short window (e.g., 60) is usually sufficient.
+
+Worker deduplication
+- Per‑operation serialization (when herd guard uses operation name) via Symfony Lock: resource `datahub_refresh_op:<operationName>`, TTL = `persistent_refresh_operation_lock_ttl`, released after refresh.
+- Per‑request deduplication always on the worker via lock resource `datahub_refresh_req:<hash(client + body)>`, ensures no parallel refresh for the same variant even if multiple jobs are queued.
+
+Transport setup (example):
+
+```
+# config/packages/messenger.yaml
+framework:
+  messenger:
+    transports:
+      datahub_graphql_refresh: '%env(MESSENGER_TRANSPORT_DSN)%'
+    routing:
+      'Pimcore\\Bundle\\DataHubBundle\\Message\\PersistentRefreshMessage': datahub_graphql_refresh
+```
+
 
 ## Console Commands
 

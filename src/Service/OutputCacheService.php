@@ -307,6 +307,10 @@ class OutputCacheService
      */
     public function maybeRejectOrAcquire(Request $request): ?JsonResponse
     {
+        // allow background refresh to bypass herd guard
+        if ($request->attributes->get('_datahub_bypass_in_progress_guard')) {
+            return null;
+        }
         if (!$this->shouldGuardRequest($request)) {
             return null;
         }

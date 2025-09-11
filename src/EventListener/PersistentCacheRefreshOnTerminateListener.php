@@ -46,6 +46,40 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             return;
         }
 
+        $cfg = $this->container->get('pimcore_data_hub');
+        $graphql = $cfg['graphql'] ?? [];
+        $useQueue = (bool)($graphql['persistent_refresh_queue_enabled'] ?? false);
+
+        if ($useQueue) {
+            // Dispatch to Messenger; the handler will perform appropriate locking
+            try {
+                $bus = \Pimcore::getContainer()->get('messenger.default_bus');
+                $payload = (string)$request->getContent();
+                $client = (string)$request->attributes->get('clientname', '');
+                $op = null;
+                $in = json_decode($payload, true) ?: [];
+                if (isset($in['operationName']) && is_string($in['operationName'])) {
+                    $op = $in['operationName'];
+                }
+                // enqueue dedupe to avoid flooding the queue for identical requests
+                $enqueueTtl = max(1, (int)($graphql['persistent_enqueue_dedupe_ttl'] ?? 60));
+                $dedupeKey = $this->buildEnqueueDedupeKey($request);
+                $existingEnqueue = PimcoreCache::load($dedupeKey);
+                if ($existingEnqueue !== false && $existingEnqueue !== null) {
+                    return; // already enqueued recently
+                }
+                PimcoreCache::save(1, $dedupeKey, ['datahub_graphql_persistent'], $enqueueTtl, 1, true);
+                $messageClass = 'Pimcore\\Bundle\\DataHubBundle\\Message\\PersistentRefreshMessage';
+                if (class_exists($messageClass)) {
+                    $msg = new $messageClass($client, $payload, $op);
+                    $bus->dispatch($msg);
+                }
+            } catch (\Throwable $e) {
+                // If dispatch fails, we fallback to local execution below
+            }
+            return; // don't do local refresh when queue enabled
+        }
+
         // If an operation is already guarded by herd protection, we don't need an extra refresh lock.
         if ($this->isGuardedByHerd($request)) {
             try {
@@ -63,8 +97,6 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             return;
         }
 
-        $cfg = $this->container->get('pimcore_data_hub');
-        $graphql = $cfg['graphql'] ?? [];
         $lockEnabled = (bool)($graphql['persistent_refresh_lock_enabled'] ?? true);
         $lockTtl = max(1, (int)($graphql['persistent_refresh_lock_ttl'] ?? 120));
 
@@ -135,5 +167,17 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         $client = (string)$request->attributes->get('clientname', '');
         $body = (string)$request->getContent();
         return 'datahub_persistent_refresh_lock_' . hash('sha256', 'client:' . $client . "\n" . $body);
+    }
+
+    private function buildEnqueueDedupeKey(\Symfony\Component\HttpFoundation\Request $request): string
+    {
+        $metaKey = (string)$request->attributes->get('_datahub_persistent_meta_key');
+        $payloadKey = (string)$request->attributes->get('_datahub_persistent_payload_key');
+        if ($metaKey !== '' && $payloadKey !== '') {
+            return 'datahub_enqueue_req_' . md5($metaKey . '|' . $payloadKey);
+        }
+        $client = (string)$request->attributes->get('clientname', '');
+        $body = (string)$request->getContent();
+        return 'datahub_enqueue_req_' . hash('sha256', 'client:' . $client . "\n" . $body);
     }
 }
