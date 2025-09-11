@@ -119,6 +119,37 @@ class OutputCacheService
     }
 
     /**
+     * Probe the standard output cache status for this request without side effects.
+     * Returns one of: 'HIT', 'MISS', or 'DISABLED'.
+     */
+    public function probeStatus(Request $request): string
+    {
+        // Reuse the same gating logic as normal load/save
+        $event = new OutputCachePreLoadEvent($request, true);
+        $this->eventDispatcher->dispatch($event, OutputCacheEvents::PRE_LOAD);
+        $use = $this->cacheEnabled && $event->isUseCache();
+
+        if (!$use) {
+            return 'DISABLED';
+        }
+
+        $newKey = $this->computeKey($request);
+        $item = $this->loadFromCache($newKey);
+        if ($item !== false && $item !== null) {
+            return 'HIT';
+        }
+
+        // try legacy key for completeness
+        $legacyKey = $this->computeLegacyKey($request);
+        $item = $this->loadFromCache($legacyKey);
+        if ($item !== false && $item !== null) {
+            return 'HIT';
+        }
+
+        return 'MISS';
+    }
+
+    /**
      *
      * @return mixed
      */

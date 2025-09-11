@@ -291,4 +291,28 @@ class OutputCacheServiceTest extends Unit
         $reject = $sut->maybeRejectOrAcquire($req);
         $this->assertNull($reject, 'Background refresh must bypass herd guard');
     }
+
+    public function testProbeStatusDisabledHitMiss()
+    {
+        // disabled
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn(['graphql' => ['output_cache_enabled' => false]]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $sut = new OutputCacheService($container, $eventDispatcher);
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode(['query' => '{__typename}']));
+        $this->assertSame('DISABLED', $sut->probeStatus($req));
+
+        // enabled: MISS then HIT
+        $container2 = $this->createMock(ContainerBagInterface::class);
+        $container2->method('get')->willReturn(['graphql' => ['output_cache_enabled' => true, 'output_cache_lifetime' => 5]]);
+        $eventDispatcher2 = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher2->method('dispatch')->willReturnArgument(0);
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container2, $eventDispatcher2])
+            ->onlyMethods(['loadFromCache', 'saveToCache'])
+            ->getMock();
+
+        $sut2->method('loadFromCache')->willReturnOnConsecutiveCalls(null, null); // MISS probe path, then not used further
+        $this->assertSame('MISS', $sut2->probeStatus($req));
+    }
 }
