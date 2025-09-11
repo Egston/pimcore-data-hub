@@ -55,6 +55,9 @@ pimcore_data_hub:
     persistent_refresh_operation_lock_ttl: 120
     # enqueue dedupe TTL to avoid flooding queue with identical refresh jobs
     persistent_enqueue_dedupe_ttl: 60
+
+    # skip standard output cache for requests where the persistent layer applies (reduces duplicate work)
+    persistent_disable_output_cache_for_guarded: false
 ```
 
 Notes:
@@ -135,3 +138,15 @@ bin/console datahub:graphql:persistent-cache:refresh <client> \
 
 - This layer is designed to be minimally invasive and complementary to the existing output cache and guards.
 - If your project exposes a dedicated event for Pimcore’s cache tag invalidation, you can switch the invalidation listener to that event; the current implementation listens to content change events as a robust default.
+
+### Skipping standard output cache for persistent‑guarded requests
+
+- Enable `persistent_disable_output_cache_for_guarded` to bypass the standard output cache for requests where the persistent layer applies (typically your guarded operation names when `persistent_output_cache_guard_only` is true).
+- Pros:
+  - Reduces duplicate writes/storage and removes one cache layer for those requests.
+  - Simplifies invalidation semantics (persistent layer fully owns guarded queries).
+- Cons / considerations:
+  - OutputCacheEvents (PRE_LOAD/PRE_SAVE) will not fire for those requests; if you rely on listeners to modify responses, they won’t run.
+  - Standard output cache TTLs don’t apply; only persistent TTLs are in effect.
+  - Output cache metrics for those requests won’t be recorded; use persistent headers instead.
+  - If a request doesn’t match persistent “applies” conditions (e.g., missing operationName when guard_only is true), the output cache is still used.

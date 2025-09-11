@@ -74,6 +74,8 @@ class PersistentOutputCacheService
         if (!$this->shouldUseForRequest($request)) {
             return null;
         }
+        // Mark that persistent cache applies for this request (used to optionally skip standard output cache)
+        $request->attributes->set('_datahub_persistent_applies', true);
         // Skip interception when running a background refresh after response
         if ($request->attributes->get('_datahub_persistent_refresh')) {
             return null;

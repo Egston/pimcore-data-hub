@@ -94,6 +94,7 @@ final class PersistentOutputCacheServiceTest extends Unit
         $this->assertInstanceOf(JsonResponse::class, $response);
         $this->assertSame('HIT', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
         $this->assertSame('*', $response->headers->get('Access-Control-Allow-Origin'));
+        $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_applies'), 'applies flag not set on fresh HIT');
     }
 
     public function testStaleHitReturnsStaleImmediately(): void
@@ -139,6 +140,7 @@ final class PersistentOutputCacheServiceTest extends Unit
         $this->assertInstanceOf(JsonResponse::class, $pre);
         $this->assertSame('STALE', $pre->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
         $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_refresh'));
+        $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_applies'), 'applies flag not set on stale HIT');
     }
 
     public function testGuardOnlyBlocksWhenOperationNotListed(): void
@@ -299,5 +301,27 @@ final class PersistentOutputCacheServiceTest extends Unit
         $this->assertArrayHasKey('canonical', $meta);
         $this->assertIsString($meta['canonical']);
         $this->assertNotSame('', $meta['canonical']);
+    }
+
+    public function testAppliesFlagSetOnMiss(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+            'persistent_output_cache_guard_only' => true,
+            'in_progress_queries' => ['TestOp'],
+        ];
+
+        // MISS: cacheLoad returns null for both meta and payload
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+        $service->method('cacheLoad')->willReturn(null);
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $pre = $service->preHandle($request, $this->makeResponseService());
+        $this->assertNull($pre, 'preHandle should not return on MISS');
+        $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_applies'), 'applies flag not set on MISS');
     }
 }
