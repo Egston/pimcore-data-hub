@@ -114,6 +114,18 @@ class WebserviceController extends FrontendController
             throw new AccessDeniedHttpException('Permission denied, apikey not valid');
         }
 
+        // Lightweight cache-status probe for output cache: HEAD or cache_status=1
+        $isStatusProbe = strtoupper($request->getMethod()) === 'HEAD' || $request->query->getBoolean('cache_status');
+        if ($isStatusProbe) {
+            $status = $this->cacheService->probeStatus($request);
+            $response = new JsonResponse(null, 204);
+            $response->setData(null);
+            $response->headers->set('Cache-Status', sprintf('pimcore-output; %s', strtolower($status)));
+            $responseService->addCorsHeaders($response);
+            $responseService->addHitMissHeaders($response, $status === 'HIT');
+            return $response;
+        }
+
         // Persistent cache pre-check: may short-circuit or mark for background refresh
         if ($pResponse = $this->persistentCacheService->preHandle($request, $responseService)) {
             // Persistent HIT (fresh). Add output-cache header as MISS to clarify layer used
