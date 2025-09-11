@@ -263,4 +263,32 @@ class OutputCacheServiceTest extends Unit
         $sut2->method('saveToCache')->willReturnCallback(function () {});
         $sut2->save($reqA, new JsonResponse(['data' => ['ok' => true]]));
     }
+
+    public function testBypassGuardForBackgroundRefresh()
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => ['Op'],
+                'in_progress_key_strategy' => 'request',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
+            'query' => 'query Op($id: ID!){node(id:$id){id}}',
+            'variables' => ['id' => 1],
+            'operationName' => 'Op',
+        ]));
+        $req->attributes->set('_datahub_bypass_in_progress_guard', true);
+
+        $reject = $sut->maybeRejectOrAcquire($req);
+        $this->assertNull($reject, 'Background refresh must bypass herd guard');
+    }
 }

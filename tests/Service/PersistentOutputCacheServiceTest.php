@@ -267,4 +267,37 @@ final class PersistentOutputCacheServiceTest extends Unit
         $this->assertInstanceOf(JsonResponse::class, $pre);
         $this->assertSame('HIT', $pre->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
     }
+
+    public function testSavePersistentSavesCanonicalInMeta(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 12,
+            'persistent_output_cache_payload_ttl' => 3456,
+            'persistent_output_cache_guard_only' => false,
+        ];
+
+        $saved = [];
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+            $saved[] = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'Op']);
+        $fresh = new JsonResponse(['data' => ['x' => 3]]);
+
+        $service->savePersistent($request, $fresh);
+
+        $metaEntries = array_values(array_filter($saved, fn($c) => str_starts_with($c['key'], 'persistent_output_meta_')));
+        $this->assertNotEmpty($metaEntries);
+        $meta = $metaEntries[0]['value'];
+        $this->assertIsArray($meta);
+        $this->assertArrayHasKey('canonical', $meta);
+        $this->assertIsString($meta['canonical']);
+        $this->assertNotSame('', $meta['canonical']);
+    }
 }
