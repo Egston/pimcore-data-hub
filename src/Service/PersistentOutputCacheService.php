@@ -177,6 +177,8 @@ class PersistentOutputCacheService
             'refreshedAt' => time(),
             'client' => $client,
             'operation' => $operationName,
+            // store canonical request body to allow later refresh scheduling
+            'canonical' => $canonical,
         ];
 
         $tags = $this->buildTags($request, $operationName);
