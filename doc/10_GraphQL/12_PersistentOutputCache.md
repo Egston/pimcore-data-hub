@@ -46,6 +46,9 @@ pimcore_data_hub:
     persistent_output_cache_guard_only: true
     # large payload TTL (sidecar key), longer than freshness TTL to avoid frequent rewrites
     persistent_output_cache_payload_ttl: 86400
+    # optional: dedupe background refresh for non-guarded ops
+    persistent_refresh_lock_enabled: true
+    persistent_refresh_lock_ttl: 120
 ```
 
 Notes:
@@ -72,6 +75,11 @@ bin/console pimcore:cache:clear --tags=datahub_graphql_client:my-client
 
 - The persistent layer stores a single “last output invalidation” timestamp internally. On data changes (objects/documents/assets updated/deleted), this timestamp is updated. On each HIT, the cached item’s `refreshedAt` is compared to that timestamp to decide if it’s stale.
 - This does not alter Pimcore’s own output cache invalidation; it merely allows the persistent layer to continue serving stale data while a fresh result is recomputed.
+
+### Background refresh deduplication
+
+- For operations listed in `in_progress_queries`, the existing thundering herd guard already deduplicates background refresh calls.
+- For other operations, enable a lightweight refresh lock with `persistent_refresh_lock_enabled`. The lock uses a request‑scoped key and is explicitly removed after refresh; the TTL is a safety net if the process dies.
 
 ## Console Commands
 

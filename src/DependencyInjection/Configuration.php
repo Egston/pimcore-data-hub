@@ -63,6 +63,8 @@ class Configuration implements ConfigurationInterface
                             ->defaultValue('request')
                         ->end()
                         ->booleanNode('allow_introspection')->info('enables introspection for graphql. It is enabled by default')->defaultValue(true)->end()
+                        ->booleanNode('persistent_refresh_lock_enabled')->info('enable a lightweight refresh lock for background refresh when operation is not guarded by herd protection')->defaultValue(true)->end()
+                        ->integerNode('persistent_refresh_lock_ttl')->info('TTL in seconds for the background refresh lock marker')->defaultValue(120)->end()
                         ->booleanNode('allow_sqlObjectCondition')
                             ->setDeprecated(
                                 'pimcore/data-hub',
