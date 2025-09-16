@@ -380,4 +380,80 @@ final class PersistentOutputCacheServiceTest extends Unit
         $this->assertTrue($probe3['applies']);
         $this->assertSame('MISS', $probe3['status']);
     }
+
+    public function testSavePersistentUpdatesIndices(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 60,
+            'persistent_output_cache_payload_ttl' => 3600,
+            'persistent_output_cache_guard_only' => false,
+        ];
+
+        $saved = [];
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+            $saved[] = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $request = $this->makeRequest('clientA', [
+            'query' => '{ __typename }',
+            'operationName' => 'IdxOp',
+        ]);
+        $fresh = new JsonResponse(['data' => ['ok' => true]]);
+
+        $service->savePersistent($request, $fresh);
+
+        $keys = array_column($saved, 'key');
+        $this->assertContains('datahub_graphql_persistent_index_all', $keys);
+        $this->assertContains('datahub_graphql_persistent_index_client:clientA', $keys);
+        $this->assertContains('datahub_graphql_persistent_index_op:IdxOp', $keys);
+
+        // index entries use TTL 0 (infinite)
+        foreach ($saved as $call) {
+            if (str_starts_with($call['key'], 'datahub_graphql_persistent_index_')) {
+                $this->assertSame(0, $call['ttl']);
+                $this->assertContains('datahub_graphql_persistent', $call['tags']);
+            }
+        }
+    }
+
+    public function testMarkOutputInvalidatedStoresTimestamp(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $observed = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$observed) {
+            $observed = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $service->markOutputInvalidated(123456);
+
+        $this->assertSame('datahub_graphql_output_last_invalidation_ts', $observed['key']);
+        $this->assertSame(123456, $observed['value']);
+        $this->assertSame(0, $observed['ttl']);
+        $this->assertContains('datahub_graphql_persistent', $observed['tags']);
+    }
+
+    public function testShouldUseSkipsNonPost(): void
+    {
+        $service = new PersistentOutputCacheService($this->makeContainer([
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_guard_only' => false,
+        ]));
+
+        $req = Request::create('/datahub/graphql', 'GET');
+        $req->attributes->set('clientname', 'c1');
+        $this->assertNull($service->preHandle($req, $this->makeResponseService()));
+        $this->assertNull($service->postHandle($req, new JsonResponse(['x' => 1])));
+    }
 }
