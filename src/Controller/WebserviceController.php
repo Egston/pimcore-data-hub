@@ -33,8 +33,8 @@ use Pimcore\Bundle\DataHubBundle\PimcoreDataHubBundle;
 use Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService;
 use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
-use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Cache\RuntimeCache;
 use Pimcore\Controller\FrontendController;
 use Pimcore\Helper\LongRunningHelper;
@@ -120,11 +120,9 @@ class WebserviceController extends FrontendController
             $outStatus = $this->cacheService->probeStatus($request);
             $persistProbe = $this->persistentCacheService->probeStatus($request);
             $response = new JsonResponse(null, 204);
-            $response->setData(null);
             $cacheStatus = sprintf('pimcore-output; %s', strtolower($outStatus));
             if ($persistProbe['applies']) {
                 $cacheStatus .= sprintf(', pimcore-persistent; %s', strtolower($persistProbe['status']));
-                // Also expose persistent header for compatibility
                 $response->headers->set('X-Pimcore-DataHub-Persistent-Cache', $persistProbe['status']);
                 if ($persistProbe['status'] === 'STALE') {
                     $response->headers->set('Warning', '110 - "Response is Stale"');
@@ -133,6 +131,7 @@ class WebserviceController extends FrontendController
             $response->headers->set('Cache-Status', $cacheStatus);
             $responseService->addCorsHeaders($response);
             $responseService->addHitMissHeaders($response, $outStatus === 'HIT');
+
             return $response;
         }
 
@@ -140,6 +139,7 @@ class WebserviceController extends FrontendController
         if ($pResponse = $this->persistentCacheService->preHandle($request, $responseService)) {
             // Persistent HIT (fresh). Add output-cache header as MISS to clarify layer used
             $responseService->addHitMissHeaders($pResponse, true);
+
             return $pResponse;
         }
 
@@ -170,6 +170,7 @@ class WebserviceController extends FrontendController
             $operationName = $input['operationName'] ?? null;
             Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
             $responseService->addCorsHeaders($inProgressResponse);
+
             return $inProgressResponse;
         }
 
@@ -302,10 +303,7 @@ class WebserviceController extends FrontendController
             $this->cacheService->save($request, $response);
         }
 
-        // Persistent cache post-handle: save/refresh, possibly return stale response
-        if ($override = $this->persistentCacheService->postHandle($request, $response)) {
-            return $override;
-        }
+        $this->persistentCacheService->postHandle($request, $response);
         $responseService->addCorsHeaders($response);
         $responseService->addHitMissHeaders($response, false);
 

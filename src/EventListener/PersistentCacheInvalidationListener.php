@@ -2,13 +2,30 @@
 
 declare(strict_types=1);
 
+/**
+ * Pimcore
+ *
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
+ */
+
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
+use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Event\AssetEvents;
 use Pimcore\Event\DataObjectEvents;
 use Pimcore\Event\DocumentEvents;
+use Pimcore\Logger;
+use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\Messenger\MessageBusInterface;
 
 /**
  * Marks the persistent GraphQL cache as potentially stale when content changes.
@@ -19,8 +36,11 @@ use Symfony\Component\EventDispatcher\EventSubscriberInterface;
  */
 class PersistentCacheInvalidationListener implements EventSubscriberInterface
 {
-    public function __construct(private PersistentOutputCacheService $persistentCache)
-    {
+    public function __construct(
+        private PersistentOutputCacheService $persistentCache,
+        private ContainerBagInterface $container,
+        private ?MessageBusInterface $bus = null
+    ) {
     }
 
     public static function getSubscribedEvents(): array
@@ -38,52 +58,58 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
     public function mark(): void
     {
         $this->persistentCache->markOutputInvalidated();
-        // Additionally schedule refreshes for guarded queries if queueing is enabled
+
+        // Additionally schedule background refreshes for every persisted entry
+        // when async refresh is enabled. INDEX_ALL is iterated so non-guarded
+        // operations (persistent_output_cache_guard_only=false) are covered too;
+        // herd protection and the index are independent concerns.
         try {
-            $cfg = \Pimcore::getContainer()->get('pimcore_data_hub');
+            $cfg = $this->container->get('pimcore_data_hub');
             $graphql = $cfg['graphql'] ?? [];
-            if (!($graphql['persistent_refresh_queue_enabled'] ?? false)) {
+            if (!($graphql['persistent_refresh_queue_enabled'] ?? false) || $this->bus === null) {
                 return;
             }
 
-            $herdEnabled = (bool)($graphql['in_progress_protection_enabled'] ?? false);
-            $ops = (array)($graphql['in_progress_queries'] ?? []);
-            if (!$herdEnabled || empty($ops)) {
-                return;
-            }
-
-            $bus = \Pimcore::getContainer()->get('messenger.default_bus');
             $enqueueTtl = max(1, (int)($graphql['persistent_enqueue_dedupe_ttl'] ?? 60));
 
-            foreach ($ops as $op) {
-                if (!is_string($op) || $op === '') { continue; }
-                $indexKey = 'datahub_graphql_persistent_index_op:' . $op;
-                $list = \Pimcore\Cache::load($indexKey);
-                if (!is_array($list)) { continue; }
-                foreach ($list as $payloadKey) {
-                    if (!is_string($payloadKey)) { continue; }
-                    if (!str_starts_with($payloadKey, 'persistent_output_payload_')) { continue; }
-                    $suffix = substr($payloadKey, strlen('persistent_output_payload_'));
-                    $metaKey = 'persistent_output_meta_' . $suffix;
-                    $meta = \Pimcore\Cache::load($metaKey);
-                    if (!is_array($meta)) { continue; }
-                    $client = (string)($meta['client'] ?? '');
-                    $canonical = (string)($meta['canonical'] ?? '');
-                    if ($client === '' || $canonical === '') { continue; }
-                    $dedupeKey = 'datahub_enqueue_req_' . hash('sha256', 'client:' . $client . "\n" . $canonical);
-                    $existing = \Pimcore\Cache::load($dedupeKey);
-                    if ($existing !== false && $existing !== null) { continue; }
-                    \Pimcore\Cache::save(1, $dedupeKey, ['datahub_graphql_persistent'], $enqueueTtl, 1, true);
-
-                    $messageClass = 'Pimcore\\Bundle\\DataHubBundle\\Message\\PersistentRefreshMessage';
-                    if (class_exists($messageClass)) {
-                        $msg = new $messageClass($client, $canonical, $op);
-                        $bus->dispatch($msg);
-                    }
+            $list = \Pimcore\Cache::load(PersistentOutputCacheService::INDEX_ALL);
+            if (!is_array($list)) {
+                return;
+            }
+            $metaPrefixLen = strlen(PersistentOutputCacheService::PAYLOAD_KEY_PREFIX);
+            foreach ($list as $payloadKey) {
+                if (!is_string($payloadKey) || !str_starts_with($payloadKey, PersistentOutputCacheService::PAYLOAD_KEY_PREFIX)) {
+                    continue;
                 }
+                $metaKey = PersistentOutputCacheService::META_KEY_PREFIX . substr($payloadKey, $metaPrefixLen);
+                $meta = \Pimcore\Cache::load($metaKey);
+                if (!is_array($meta)) {
+                    continue;
+                }
+                $client = (string)($meta['client'] ?? '');
+                $canonical = (string)($meta['canonical'] ?? '');
+                $operation = (string)($meta['operation'] ?? '');
+                if ($client === '' || $canonical === '') {
+                    continue;
+                }
+                $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX
+                    . hash('sha256', 'client:' . $client . "\n" . $canonical);
+                $existing = \Pimcore\Cache::load($dedupeKey);
+                if ($existing !== false && $existing !== null) {
+                    continue;
+                }
+                \Pimcore\Cache::save(
+                    1,
+                    $dedupeKey,
+                    [PersistentOutputCacheService::TAG_COMMON],
+                    $enqueueTtl,
+                    1,
+                    true
+                );
+                $this->bus->dispatch(new PersistentRefreshMessage($client, $canonical, $operation !== '' ? $operation : null));
             }
         } catch (\Throwable $e) {
-            // best-effort scheduling
+            Logger::error('DataHub persistent cache invalidation listener: scheduling failed: ' . $e->getMessage());
         }
     }
 }

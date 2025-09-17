@@ -23,15 +23,34 @@
     "webonyx/graphql-php": "^15.2.3"
   },
   "require-dev": {
-    "phpstan/phpstan": "^1.9",
-    "phpunit/phpunit": "^9.6",
-    "symfony/phpunit-bridge": "^6",
     "codeception/codeception": "^5.0.3",
-    "codeception/phpunit-wrapper": "^9",
     "codeception/module-asserts": "^2",
     "codeception/module-symfony": "^3.1.0",
+    "codeception/phpunit-wrapper": "^9",
+    "doctrine/instantiator": "^2.0.0,<2.1",
+    "friendsofphp/php-cs-fixer": "^3.0",
+    "phpmd/phpmd": "^2.15",
+    "phpstan/phpstan": "^1.9",
+    "phpstan/phpstan-symfony": "^1.4",
+    "phpunit/phpunit": "^9.6",
     "symfony/dotenv": "^6.2",
+    "symfony/phpunit-bridge": "^6",
     "symfony/runtime": "^6.4"
+  },
+  "scripts": {
+    "test": "vendor/bin/phpunit --colors=always",
+    "cs:fix": "vendor/bin/php-cs-fixer fix",
+    "cs:check": "vendor/bin/php-cs-fixer fix --dry-run --diff",
+    "stan": "vendor/bin/phpstan analyse --memory-limit=-1",
+    "md": "vendor/bin/phpmd src text phpmd.xml",
+    "lint": [
+      "@cs:check",
+      "@stan"
+    ],
+    "ci": [
+      "@lint",
+      "@test"
+    ]
   },
   "autoload": {
     "psr-4": {
@@ -42,10 +61,7 @@
   "autoload-dev": {
     "psr-4": {
       "Pimcore\\Bundle\\DataHubBundle\\Tests\\": "tests"
-    },
-    "files": [
-      "kernel/Kernel.php"
-    ]
+    }
   },
   "extra": {
     "pimcore": {

@@ -2,6 +2,19 @@
 
 declare(strict_types=1);
 
+/**
+ * Pimcore
+ *
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
+ */
+
 namespace Pimcore\Bundle\DataHubBundle\Command;
 
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
@@ -22,7 +35,7 @@ class PersistentCacheMarkInvalidatedCommand extends Command
     {
         $this->persistent->markOutputInvalidated();
         $output->writeln('<info>Marked persistent GraphQL cache as stale (timestamp updated).</info>');
+
         return Command::SUCCESS;
     }
 }
-

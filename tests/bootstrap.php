@@ -15,14 +15,4 @@ declare(strict_types=1);
  *  @license    http://www.pimcore.org/license     GPLv3 and PCL
  */
 
-namespace Pimcore\Bundle\DataHubBundle\Message;
-
-final class PersistentRefreshMessage
-{
-    public function __construct(
-        public readonly string $client,
-        public readonly string $bodyJson,
-        public readonly ?string $operationName = null
-    ) {
-    }
-}
+require_once __DIR__ . '/../vendor/autoload.php';

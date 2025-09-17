@@ -2,14 +2,27 @@
 
 declare(strict_types=1);
 
+/**
+ * Pimcore
+ *
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
+ */
+
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use Codeception\Test\Unit;
+use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 
-final class PersistentOutputCacheServiceTest extends Unit
+final class PersistentOutputCacheServiceTest extends TestCase
 {
     private ContainerBagInterface $container;
 
@@ -17,6 +30,7 @@ final class PersistentOutputCacheServiceTest extends Unit
     {
         $c = $this->createMock(ContainerBagInterface::class);
         $c->method('get')->willReturn(['graphql' => $graphql]);
+
         return $c;
     }
 
@@ -26,15 +40,25 @@ final class PersistentOutputCacheServiceTest extends Unit
         $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], $payload);
         $req->attributes->set('clientname', $client);
         $req->headers->set('Content-Type', 'application/json');
+
         return $req;
     }
 
     private function makeResponseService(): ResponseServiceInterface
     {
         return new class implements ResponseServiceInterface {
-            public function removeCorsHeaders(JsonResponse $response): void {}
-            public function addCorsHeaders(JsonResponse $response): void { $response->headers->set('Access-Control-Allow-Origin', '*'); }
-            public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void {}
+            public function removeCorsHeaders(JsonResponse $response): void
+            {
+            }
+
+            public function addCorsHeaders(JsonResponse $response): void
+            {
+                $response->headers->set('Access-Control-Allow-Origin', '*');
+            }
+
+            public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void
+            {
+            }
         };
     }
 
@@ -48,7 +72,8 @@ final class PersistentOutputCacheServiceTest extends Unit
         $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
 
         $this->assertNull($service->preHandle($request, $this->makeResponseService()));
-        $this->assertNull($service->postHandle($request, new JsonResponse(['ok' => true])));
+        // postHandle is void; assert it does not throw on disabled config
+        $service->postHandle($request, new JsonResponse(['ok' => true]));
     }
 
     public function testFreshHitReturnsImmediatelyAndRefreshes(): void
@@ -81,12 +106,13 @@ final class PersistentOutputCacheServiceTest extends Unit
             if (str_starts_with($key, 'persistent_output_payload_')) {
                 return $payload;
             }
+
             return null;
         });
 
         // expect a single meta refresh save (not payload rewrite)
         $service->expects($this->once())->method('cacheSave')
-            ->with($this->callback(fn($k) => str_starts_with($k, 'persistent_output_meta_')));
+            ->with($this->callback(fn ($k) => str_starts_with($k, 'persistent_output_meta_')));
 
         $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
 
@@ -128,6 +154,7 @@ final class PersistentOutputCacheServiceTest extends Unit
             if (str_starts_with($key, 'persistent_output_payload_')) {
                 return $payload;
             }
+
             return null;
         });
 
@@ -172,6 +199,7 @@ final class PersistentOutputCacheServiceTest extends Unit
             if (str_starts_with($key, 'persistent_output_payload_')) {
                 return $payload;
             }
+
             return null;
         });
 
@@ -197,8 +225,9 @@ final class PersistentOutputCacheServiceTest extends Unit
             ->getMock();
 
         $saved = [];
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
             $saved[] = compact('key', 'value', 'tags', 'ttl');
+
             return null;
         });
 
@@ -215,15 +244,15 @@ final class PersistentOutputCacheServiceTest extends Unit
                 $foundPayload = true;
                 $this->assertSame(3456, $call['ttl']);
                 $this->assertContains('datahub_graphql_persistent', $call['tags']);
-                $this->assertContains('datahub_graphql_op:TestOp', $call['tags']);
-                $this->assertContains('datahub_graphql_client:c1', $call['tags']);
+                $this->assertContains('datahub_graphql_op_TestOp', $call['tags']);
+                $this->assertContains('datahub_graphql_client_c1', $call['tags']);
             }
             if (str_starts_with($call['key'], 'persistent_output_meta_')) {
                 $foundMeta = true;
                 $this->assertSame(12, $call['ttl']);
                 $this->assertContains('datahub_graphql_persistent', $call['tags']);
-                $this->assertContains('datahub_graphql_op:TestOp', $call['tags']);
-                $this->assertContains('datahub_graphql_client:c1', $call['tags']);
+                $this->assertContains('datahub_graphql_op_TestOp', $call['tags']);
+                $this->assertContains('datahub_graphql_client_c1', $call['tags']);
             }
         }
         $this->assertTrue($foundPayload, 'Payload save not observed');
@@ -257,12 +286,13 @@ final class PersistentOutputCacheServiceTest extends Unit
             if (str_starts_with($key, 'persistent_output_payload_')) {
                 return $payload;
             }
+
             return null;
         });
 
         $service->expects($this->once())
             ->method('cacheSave') // meta refresh
-            ->with($this->callback(fn($k) => str_starts_with($k, 'persistent_output_meta_')));
+            ->with($this->callback(fn ($k) => str_starts_with($k, 'persistent_output_meta_')));
 
         $request = $this->makeRequest('c1', ['query' => '{ __typename }']); // no operationName
         $pre = $service->preHandle($request, $this->makeResponseService());
@@ -282,10 +312,11 @@ final class PersistentOutputCacheServiceTest extends Unit
         $saved = [];
         $service = $this->getMockBuilder(PersistentOutputCacheService::class)
             ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
-            ->onlyMethods(['cacheSave'])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
             ->getMock();
 
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+        $service->method('cacheLoad')->willReturn(null);
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
             $saved[] = compact('key', 'value', 'tags', 'ttl');
         });
 
@@ -294,7 +325,7 @@ final class PersistentOutputCacheServiceTest extends Unit
 
         $service->savePersistent($request, $fresh);
 
-        $metaEntries = array_values(array_filter($saved, fn($c) => str_starts_with($c['key'], 'persistent_output_meta_')));
+        $metaEntries = array_values(array_filter($saved, fn ($c) => str_starts_with($c['key'], 'persistent_output_meta_')));
         $this->assertNotEmpty($metaEntries);
         $meta = $metaEntries[0]['value'];
         $this->assertIsArray($meta);
@@ -343,9 +374,16 @@ final class PersistentOutputCacheServiceTest extends Unit
         $meta = ['refreshedAt' => time(), 'client' => 'c1'];
         $payload = ['data' => ['x' => 1]];
         $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload) {
-            if ($key === 'datahub_graphql_output_last_invalidation_ts') { return 0; }
-            if (str_contains($key, 'meta_')) { return $meta; }
-            if (str_contains($key, 'payload_')) { return $payload; }
+            if ($key === 'datahub_graphql_output_last_invalidation_ts') {
+                return 0;
+            }
+            if (str_contains($key, 'meta_')) {
+                return $meta;
+            }
+            if (str_contains($key, 'payload_')) {
+                return $payload;
+            }
+
             return null;
         });
 
@@ -361,9 +399,16 @@ final class PersistentOutputCacheServiceTest extends Unit
             ->getMock();
         $meta2 = ['refreshedAt' => time() - 100, 'client' => 'c1'];
         $service2->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta2, $payload) {
-            if ($key === 'datahub_graphql_output_last_invalidation_ts') { return time(); }
-            if (str_contains($key, 'meta_')) { return $meta2; }
-            if (str_contains($key, 'payload_')) { return $payload; }
+            if ($key === 'datahub_graphql_output_last_invalidation_ts') {
+                return time();
+            }
+            if (str_contains($key, 'meta_')) {
+                return $meta2;
+            }
+            if (str_contains($key, 'payload_')) {
+                return $payload;
+            }
+
             return null;
         });
         $probe2 = $service2->probeStatus($req);
@@ -393,10 +438,11 @@ final class PersistentOutputCacheServiceTest extends Unit
         $saved = [];
         $service = $this->getMockBuilder(PersistentOutputCacheService::class)
             ->setConstructorArgs([$this->makeContainer($graphqlCfg)])
-            ->onlyMethods(['cacheSave'])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
             ->getMock();
 
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+        $service->method('cacheLoad')->willReturn(null);
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
             $saved[] = compact('key', 'value', 'tags', 'ttl');
         });
 
@@ -410,13 +456,14 @@ final class PersistentOutputCacheServiceTest extends Unit
 
         $keys = array_column($saved, 'key');
         $this->assertContains('datahub_graphql_persistent_index_all', $keys);
-        $this->assertContains('datahub_graphql_persistent_index_client:clientA', $keys);
-        $this->assertContains('datahub_graphql_persistent_index_op:IdxOp', $keys);
+        $this->assertContains('datahub_graphql_persistent_index_client_clientA', $keys);
+        $this->assertContains('datahub_graphql_persistent_index_op_IdxOp', $keys);
 
-        // index entries use TTL 0 (infinite)
+        // index entries use TTL null (no expiry); Symfony's CacheItem::expiresAfter(0)
+        // means "expires now", which is why null is correct here, not 0.
         foreach ($saved as $call) {
             if (str_starts_with($call['key'], 'datahub_graphql_persistent_index_')) {
-                $this->assertSame(0, $call['ttl']);
+                $this->assertNull($call['ttl']);
                 $this->assertContains('datahub_graphql_persistent', $call['tags']);
             }
         }
@@ -432,7 +479,7 @@ final class PersistentOutputCacheServiceTest extends Unit
             ->getMock();
 
         $observed = [];
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$observed) {
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$observed) {
             $observed = compact('key', 'value', 'tags', 'ttl');
         });
 
@@ -440,8 +487,8 @@ final class PersistentOutputCacheServiceTest extends Unit
 
         $this->assertSame('datahub_graphql_output_last_invalidation_ts', $observed['key']);
         $this->assertSame(123456, $observed['value']);
-        $this->assertSame(0, $observed['ttl']);
-        $this->assertContains('datahub_graphql_persistent', $observed['tags']);
+        $this->assertNull($observed['ttl']);
+        $this->assertContains('datahub_graphql_persistent_watermark', $observed['tags']);
     }
 
     public function testShouldUseSkipsNonPost(): void
@@ -454,6 +501,6 @@ final class PersistentOutputCacheServiceTest extends Unit
         $req = Request::create('/datahub/graphql', 'GET');
         $req->attributes->set('clientname', 'c1');
         $this->assertNull($service->preHandle($req, $this->makeResponseService()));
-        $this->assertNull($service->postHandle($req, new JsonResponse(['x' => 1])));
+        $service->postHandle($req, new JsonResponse(['x' => 1]));
     }
 }

@@ -15,13 +15,13 @@
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use Codeception\Test\Unit;
+use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 
-class OutputCacheServiceTest extends Unit
+class OutputCacheServiceTest extends TestCase
 {
     protected $container;
 
@@ -260,7 +260,8 @@ class OutputCacheServiceTest extends Unit
             ->setConstructorArgs([$container, $eventDispatcher])
             ->onlyMethods(['saveToCache'])
             ->getMock();
-        $sut2->method('saveToCache')->willReturnCallback(function () {});
+        $sut2->method('saveToCache')->willReturnCallback(function () {
+        });
         $sut2->save($reqA, new JsonResponse(['data' => ['ok' => true]]));
     }
 

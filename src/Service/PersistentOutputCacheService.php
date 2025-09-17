@@ -3,13 +3,16 @@
 declare(strict_types=1);
 
 /**
- * Additional, persistent GraphQL output cache layer (SWR) for Data Hub.
+ * Pimcore
  *
- * - Stores responses independently from Pimcore's 'output' tag cache.
- * - Survives 'output' tag invalidations and serves stale results with a header.
- * - TTL is refreshed on each hit.
- * - Applies to the same guarded queries by default, but is configurable.
- * - Provides tagging for console-based cache clearing, incl. per-operation tags.
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
  */
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
@@ -24,22 +27,50 @@ use Symfony\Component\HttpFoundation\Request;
 
 class PersistentOutputCacheService
 {
-    private const TAG_COMMON = 'datahub_graphql_persistent';
-    private const TAG_OP_PREFIX = 'datahub_graphql_op:'; // datahub_graphql_op:<operation>
-    private const TAG_CLIENT_PREFIX = 'datahub_graphql_client:'; // datahub_graphql_client:<client>
-    private const KEY_LAST_INVALIDATION = 'datahub_graphql_output_last_invalidation_ts';
+    // Tag/key names use '_' instead of ':' — PSR-6 reserves '{}()/\@:' and
+    // CacheItem validation throws on any of them in either a key or a tag.
+    public const TAG_COMMON = 'datahub_graphql_persistent';
 
-    private const INDEX_ALL = 'datahub_graphql_persistent_index_all';
-    private const INDEX_OP_PREFIX = 'datahub_graphql_persistent_index_op:'; // + <operation>
-    private const INDEX_CLIENT_PREFIX = 'datahub_graphql_persistent_index_client:'; // + <client>
+    /**
+     * Dedicated tag for the singleton invalidation watermark; kept separate from
+     * TAG_COMMON so a blanket clear of cached entries by TAG_COMMON does not
+     * collaterally reset the watermark (which would make every cached entry
+     * look FRESH until the next mutation event).
+     */
+    public const TAG_WATERMARK = 'datahub_graphql_persistent_watermark';
+
+    public const TAG_OP_PREFIX = 'datahub_graphql_op_';
+
+    public const TAG_CLIENT_PREFIX = 'datahub_graphql_client_';
+
+    public const KEY_LAST_INVALIDATION = 'datahub_graphql_output_last_invalidation_ts';
+
+    public const PAYLOAD_KEY_PREFIX = 'persistent_output_payload_';
+
+    public const META_KEY_PREFIX = 'persistent_output_meta_';
+
+    public const ENQUEUE_DEDUPE_PREFIX = 'datahub_enqueue_req_';
+
+    public const INDEX_ALL = 'datahub_graphql_persistent_index_all';
+
+    public const INDEX_OP_PREFIX = 'datahub_graphql_persistent_index_op_';
+
+    public const INDEX_CLIENT_PREFIX = 'datahub_graphql_persistent_index_client_';
+
+    /** Soft cap on per-index entry count; prune dead entries before growing past this. */
+    private const MAX_INDEX_SIZE = 5000;
 
     private bool $enabled = false;
+
     private int $ttl; // seconds
+
     private bool $guardOnly = true;
+
     private array $guardOperations = [];
+
     private int $payloadTtl = 86400;
 
-    public function __construct(private ContainerBagInterface $container)
+    public function __construct(ContainerBagInterface $container)
     {
         $cfg = $container->get('pimcore_data_hub');
 
@@ -65,9 +96,11 @@ class PersistentOutputCacheService
     /**
      * Pre-request hook.
      *
-     * - If persistent cache HIT and FRESH: returns the response to short-circuit.
-     * - If HIT but STALE: marks request attributes to return stale later and revalidate now, returns null.
-     * - Otherwise: returns null.
+     * - HIT/FRESH:  returns the cached response (controller short-circuits).
+     * - HIT/STALE:  returns the stale cached response AND marks request attributes
+     *               so PersistentCacheRefreshOnTerminateListener kicks off a
+     *               background refresh after the response is flushed.
+     * - MISS:       returns null (controller proceeds to execute GraphQL).
      */
     public function preHandle(Request $request, ResponseServiceInterface $responseService): ?JsonResponse
     {
@@ -108,6 +141,7 @@ class PersistentOutputCacheService
             $request->attributes->set('_datahub_persistent_refresh', true);
             $request->attributes->set('_datahub_persistent_meta_key', $metaKey);
             $request->attributes->set('_datahub_persistent_payload_key', $payloadKey);
+
             return $response;
         }
 
@@ -121,23 +155,25 @@ class PersistentOutputCacheService
     }
 
     /**
-     * Post-request hook. Save/refresh persistent cache. Does not override the response.
+     * Post-request hook. Save fresh response into the persistent (SWR) layer
+     * when applicable. Side-effect only — never mutates the outgoing response.
      */
-    public function postHandle(Request $request, JsonResponse $freshResponse): ?JsonResponse
+    public function postHandle(Request $request, JsonResponse $freshResponse): void
     {
-        if (!$this->shouldUseForRequest($request)) {
-            return null;
+        if (!$this->enabled || strtoupper($request->getMethod()) !== 'POST') {
+            return;
+        }
+        // Trust the preHandle-set applicability flag to avoid re-parsing the body.
+        $applies = (bool) $request->attributes->get('_datahub_persistent_applies');
+        if (!$applies && !$this->shouldUseForRequest($request)) {
+            return;
         }
 
-        // Save fresh into persistent layer
         try {
             $this->savePersistent($request, $freshResponse);
         } catch (\Throwable $e) {
-            // ignore, do not block response
             Logger::warning('DataHub persistent cache save failed: ' . $e->getMessage());
         }
-
-        return null; // do not override response
     }
 
     /**
@@ -166,14 +202,21 @@ class PersistentOutputCacheService
         $lastInvalidation = (int) ($this->cacheLoad(self::KEY_LAST_INVALIDATION) ?: 0);
         $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
         $isStale = $lastInvalidation > 0 && $refreshedAt > 0 && $refreshedAt < $lastInvalidation;
+
         return ['applies' => true, 'status' => $isStale ? 'STALE' : 'HIT'];
     }
 
     /** Manually set the last invalidation timestamp to now. */
     public function markOutputInvalidated(?int $ts = null): void
     {
-        $ts = $ts ?? time();
-        $this->cacheSave(self::KEY_LAST_INVALIDATION, $ts, [self::TAG_COMMON], 0);
+        // A caller passing 0 or a negative value almost certainly meant "now",
+        // not "the epoch"; an epoch watermark would let `$refreshedAt > 0 &&
+        // $refreshedAt < $lastInvalidation` evaluate to false forever and freeze
+        // every cached entry as FRESH.
+        if ($ts === null || $ts <= 0) {
+            $ts = time();
+        }
+        $this->cacheSave(self::KEY_LAST_INVALIDATION, $ts, [self::TAG_WATERMARK], null);
     }
 
     /** Persist a fresh response for the given request. */
@@ -183,17 +226,43 @@ class PersistentOutputCacheService
             return;
         }
 
+        // Refuse to persist failure responses — otherwise a transient downstream
+        // error (DB hiccup, herd-guard 503, schema build crash) gets cached as a
+        // "valid" payload for payloadTtl seconds, and every refresh that hits the
+        // same broken state silently re-poisons the entry.
+        $status = $response->getStatusCode();
+        if ($status < 200 || $status >= 300) {
+            Logger::warning(sprintf(
+                'DataHub persistent cache: refusing to save non-2xx response (status=%d, client=%s)',
+                $status,
+                (string)$request->attributes->get('clientname')
+            ));
+
+            return;
+        }
+        $payload = json_decode($response->getContent() ?: 'null', true);
+        if (!is_array($payload) || $payload === []) {
+            Logger::warning('DataHub persistent cache: refusing to save empty or non-array payload');
+
+            return;
+        }
+        if (!empty($payload['errors'])) {
+            $messages = array_column((array)$payload['errors'], 'message');
+            Logger::error(sprintf(
+                'DataHub persistent cache: refusing to save GraphQL error payload (client=%s, errors=%s)',
+                (string)$request->attributes->get('clientname'),
+                json_encode($messages)
+            ));
+
+            return;
+        }
+
         [$client, $canonical] = $this->clientAndCanonical($request);
         $metaKey = $this->keyMeta($client, $canonical);
         $payloadKey = $this->keyPayload($client, $canonical);
 
         $input = json_decode($request->getContent(), true) ?: [];
         $operationName = (string)($input['operationName'] ?? '');
-
-        $payload = json_decode($response->getContent() ?: 'null', true);
-        if ($payload === null) {
-            $payload = [];
-        }
 
         $meta = [
             'refreshedAt' => time(),
@@ -219,6 +288,7 @@ class PersistentOutputCacheService
         if ($operationName) {
             $tags[] = self::TAG_OP_PREFIX . $operationName;
         }
+
         return $tags;
     }
 
@@ -239,10 +309,27 @@ class PersistentOutputCacheService
         if (!is_array($list)) {
             $list = [];
         }
-        if (!in_array($memberKey, $list, true)) {
-            $list[] = $memberKey;
-            $this->cacheSave($indexKey, $list, [self::TAG_COMMON], 0);
+        if (in_array($memberKey, $list, true)) {
+            return;
         }
+        $list[] = $memberKey;
+        // Prune dead entries when we cross the soft cap; FIFO-evict if still over.
+        // Without bounding, the index grows by one entry per unique canonical
+        // request body, never shrinks even when payloads have expired.
+        if (count($list) > self::MAX_INDEX_SIZE) {
+            $alive = [];
+            foreach ($list as $k) {
+                $v = $this->cacheLoad($k);
+                if ($v !== false && $v !== null) {
+                    $alive[] = $k;
+                }
+            }
+            $list = $alive;
+            if (count($list) > self::MAX_INDEX_SIZE) {
+                $list = array_slice($list, -self::MAX_INDEX_SIZE);
+            }
+        }
+        $this->cacheSave($indexKey, $list, [self::TAG_COMMON], null);
     }
 
     private function shouldUseForRequest(Request $request): bool
@@ -270,17 +357,9 @@ class PersistentOutputCacheService
         return true;
     }
 
-    private function computePersistentKey(Request $request): string
-    {
-        $clientname = (string)$request->attributes->get('clientname', '');
-        $canonical = $this->canonicalizePayload($request);
-        return $this->computePersistentKeyFromCanonical($clientname, $canonical);
-    }
-
     /**
      * Read helper – separated for testability.
      *
-     * @param string $key
      * @return mixed
      */
     protected function cacheLoad(string $key)
@@ -291,36 +370,31 @@ class PersistentOutputCacheService
     /**
      * Write helper – separated for testability.
      *
-     * @param string $key
-     * @param mixed  $value
-     * @param array  $tags
-     * @param int    $ttl
+     * @param mixed    $value
+     * @param int|null $ttl  null = no expiry (use for sentinel/index entries);
+     *                       int  = seconds. Do NOT pass 0 — Symfony Cache
+     *                       interprets that as "expires immediately".
      */
-    protected function cacheSave(string $key, $value, array $tags, int $ttl): void
+    protected function cacheSave(string $key, $value, array $tags, ?int $ttl): void
     {
-        // priority=1, force write immediately
         \Pimcore\Cache::save($value, $key, $tags, $ttl, 1, true);
-    }
-
-    private function computePersistentKeyFromCanonical(string $clientname, string $canonical): string
-    {
-        return 'persistent_output_' . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
     }
 
     private function keyPayload(string $clientname, string $canonical): string
     {
-        return 'persistent_output_payload_' . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+        return self::PAYLOAD_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
     }
 
     private function keyMeta(string $clientname, string $canonical): string
     {
-        return 'persistent_output_meta_' . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+        return self::META_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
     }
 
     private function clientAndCanonical(Request $request): array
     {
         $clientname = (string)$request->attributes->get('clientname', '');
         $canonical = $this->canonicalizePayload($request);
+
         return [$clientname, $canonical];
     }
 
@@ -352,6 +426,7 @@ class PersistentOutputCacheService
         }
 
         $request->attributes->set('_datahub_persistent_canonical', $canonical);
+
         return $canonical;
     }
 
@@ -360,6 +435,7 @@ class PersistentOutputCacheService
         try {
             /** @var DocumentNode $ast */
             $ast = Parser::parse($query);
+
             return Printer::doPrint($ast);
         } catch (\Throwable $e) {
             return trim($query);
@@ -375,6 +451,7 @@ class PersistentOutputCacheService
                     return true;
                 }
             }
+
             return false;
         };
 
