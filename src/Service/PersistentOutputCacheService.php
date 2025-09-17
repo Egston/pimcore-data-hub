@@ -125,7 +125,13 @@ class PersistentOutputCacheService
      */
     public function postHandle(Request $request, JsonResponse $freshResponse): ?JsonResponse
     {
-        if (!$this->shouldUseForRequest($request)) {
+        // Only apply to enabled POST GraphQL requests
+        if (!$this->enabled || strtoupper($request->getMethod()) !== 'POST') {
+            return null;
+        }
+        // If preHandle determined applicability, trust that flag to avoid re-parsing body issues
+        $applies = (bool) $request->attributes->get('_datahub_persistent_applies');
+        if (!$applies && !$this->shouldUseForRequest($request)) {
             return null;
         }
 
