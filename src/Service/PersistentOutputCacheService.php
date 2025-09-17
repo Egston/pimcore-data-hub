@@ -121,17 +121,13 @@ class PersistentOutputCacheService
     }
 
     /**
-     * Post-request hook. Save/refresh persistent cache and decide which response to return.
-     *
-     * Returns a response when we must override the default response (stale-while-revalidate). Otherwise null.
+     * Post-request hook. Save/refresh persistent cache. Does not override the response.
      */
     public function postHandle(Request $request, JsonResponse $freshResponse): ?JsonResponse
     {
         if (!$this->shouldUseForRequest($request)) {
             return null;
         }
-
-        $stale = $request->attributes->get('_datahub_persistent_stale_response');
 
         // Save fresh into persistent layer
         try {
@@ -141,12 +137,7 @@ class PersistentOutputCacheService
             Logger::warning('DataHub persistent cache save failed: ' . $e->getMessage());
         }
 
-        if ($stale instanceof JsonResponse) {
-            // Serve stale (SWR) and let fresh be cached
-            return $stale;
-        }
-
-        return null; // don't override
+        return null; // do not override response
     }
 
     /**
