@@ -17,6 +17,7 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
+use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Logger;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
@@ -57,6 +58,14 @@ class InProgressLockReleaseListener implements EventSubscriberInterface
     {
         $hasWork = $request->attributes->has('datahub_inprogress_lock')
             || $request->attributes->has('datahub_inprogress_guard_key');
+
+        // ALWAYS stop the SIGALRM refresher — even if this request never set
+        // the guard attributes itself. A previous request in the same worker
+        // may have armed the alarm and exited through a path that bypassed
+        // save() and the local uninstall (e.g. fatal-then-listener), leaving
+        // a closure-captured Lock that would otherwise refresh itself forever
+        // on this idle worker. Cheap to call when nothing was armed.
+        OutputCacheService::clearRefresherState();
 
         if (!$hasWork) {
             return;

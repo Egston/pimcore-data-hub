@@ -77,6 +77,26 @@ class OutputCacheService
     private $pcntlRefresherInstalled = false;
 
     /**
+     * Per-worker SIGALRM refresher state. Kept as class statics (not closure
+     * captures) so external callers — notably InProgressLockReleaseListener
+     * on the kernel.exception / kernel.terminate path — can clear it without
+     * needing service injection. Capturing the Lock inside a closure would
+     * also keep the object alive past request boundaries, defeating the
+     * Lock destructor's autoRelease.
+     *
+     * @var object|null Symfony Lock currently being refreshed
+     */
+    private static $activeLock = null;
+
+    private static ?string $activeMarkerKey = null;
+
+    private static array $activeMarkerTags = [];
+
+    private static int $activeTtl = 0;
+
+    private static int $activeInterval = 0;
+
+    /**
      * HTTP status code used when rejecting duplicates.
      */
     private $inProgressHttpStatus = 503;
@@ -586,31 +606,101 @@ class OutputCacheService
         }
 
         try {
+            self::$activeLock = $lock;
+            self::$activeMarkerKey = $this->lockKeyFor($guardKey);
+            self::$activeMarkerTags = ['datahub_inprogress', $clientname];
+            self::$activeTtl = $this->inProgressTtl;
+            self::$activeInterval = $this->inProgressRefreshInterval;
+
             pcntl_async_signals(true);
+            pcntl_signal(SIGALRM, [self::class, 'handleRefreshSignal']);
+            pcntl_alarm($this->inProgressRefreshInterval);
 
-            $ttl = $this->inProgressTtl;
-            $interval = $this->inProgressRefreshInterval;
-            $markerKey = $this->lockKeyFor($guardKey);
-            $tags = ['datahub_inprogress', $clientname];
-
-            $handler = static function () use ($lock, $markerKey, $tags, $ttl, $interval): void {
-                try {
-                    if (method_exists($lock, 'refresh')) {
-                        $lock->refresh($ttl);
-                    }
-                    \Pimcore\Cache::save(1, $markerKey, $tags, $ttl, 1, true);
-                } catch (\Throwable $e) {
-                    // best-effort; a missed refresh just shrinks the safety margin
-                }
-                pcntl_alarm($interval);
-            };
-
-            pcntl_signal(SIGALRM, $handler);
-            pcntl_alarm($interval);
             $this->pcntlRefresherInstalled = true;
         } catch (\Throwable $e) {
             // Never let refresher setup break the request flow
+            self::clearRefresherState();
             $this->pcntlRefresherInstalled = false;
+        }
+    }
+
+    /**
+     * SIGALRM handler. Refreshes the Lock TTL + Pimcore marker if the Lock is
+     * still acquired. Self-clears + stops re-arming the alarm once the Lock
+     * has been released externally (save(), listener, destructor), so a
+     * post-release race can't keep zombie-refreshing forever.
+     *
+     * Called via pcntl_signal callable [self::class, __FUNCTION__], so it has
+     * no captured state and reads everything from class statics. This is what
+     * makes external clearing (listener) effective.
+     *
+     * @internal pcntl_signal handler; not for direct invocation.
+     */
+    public static function handleRefreshSignal(): void
+    {
+        $lock = self::$activeLock;
+        if ($lock === null) {
+            return;
+        }
+
+        try {
+            // If the Lock has been released externally (listener, destructor,
+            // explicit save()), stop refreshing immediately. isAcquired() goes
+            // through the store and reflects current Redis state.
+            if (method_exists($lock, 'isAcquired') && !$lock->isAcquired()) {
+                self::clearRefresherState();
+
+                return;
+            }
+
+            if (method_exists($lock, 'refresh')) {
+                $lock->refresh(self::$activeTtl);
+            }
+            if (self::$activeMarkerKey !== null) {
+                \Pimcore\Cache::save(
+                    1,
+                    self::$activeMarkerKey,
+                    self::$activeMarkerTags,
+                    self::$activeTtl,
+                    1,
+                    true
+                );
+            }
+        } catch (\Throwable $e) {
+            // best-effort; a missed refresh just shrinks the safety margin.
+            // Re-arm anyway — the next tick might succeed.
+        }
+
+        if (self::$activeInterval > 0 && function_exists('pcntl_alarm')) {
+            pcntl_alarm(self::$activeInterval);
+        }
+    }
+
+    /**
+     * Drop all per-request refresher state and stop the alarm. Public so the
+     * safety-net listener can clear without needing OutputCacheService
+     * injected. Idempotent — safe to call from any release path or before any
+     * acquire ever ran.
+     */
+    public static function clearRefresherState(): void
+    {
+        self::$activeLock = null;
+        self::$activeMarkerKey = null;
+        self::$activeMarkerTags = [];
+        self::$activeTtl = 0;
+        self::$activeInterval = 0;
+
+        if (function_exists('pcntl_alarm')) {
+            try {
+                pcntl_alarm(0);
+            } catch (\Throwable $e) {
+            }
+        }
+        if (function_exists('pcntl_signal') && defined('SIGALRM')) {
+            try {
+                pcntl_signal(SIGALRM, SIG_IGN);
+            } catch (\Throwable $e) {
+            }
         }
     }
 
@@ -624,16 +714,7 @@ class OutputCacheService
             return;
         }
 
-        try {
-            if (function_exists('pcntl_alarm')) {
-                pcntl_alarm(0);
-            }
-            if (function_exists('pcntl_signal') && defined('SIGALRM')) {
-                pcntl_signal(SIGALRM, SIG_IGN);
-            }
-        } catch (\Throwable $e) {
-            // best-effort
-        }
+        self::clearRefresherState();
         $this->pcntlRefresherInstalled = false;
     }
 
