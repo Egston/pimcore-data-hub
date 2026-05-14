@@ -54,9 +54,27 @@ class OutputCacheService
     private $inProgressQueries = [];
 
     /**
-     * TTL (seconds) for the in-progress marker/lock.
+     * TTL (seconds) for the in-progress marker/lock. Bounds the leak window when
+     * a request dies between acquire and release without an exception (SIGKILL,
+     * OOM, FPM worker recycle). Periodic refresh keeps the lock alive during
+     * legitimate long-running requests, so this can be set much smaller than the
+     * worst-case execution time.
      */
     private $inProgressTtl = 60;
+
+    /**
+     * Seconds between background refresh ticks for the in-progress lock and
+     * marker. Must be < $inProgressTtl. 0 = disabled (legacy behaviour: TTL
+     * alone bounds both the leak window and the longest supported request).
+     * Auto-defaulted to floor($inProgressTtl / 2) when left at 0.
+     */
+    private $inProgressRefreshInterval = 0;
+
+    /**
+     * Process-wide latch: SIGALRM handler is currently armed. Guards uninstall
+     * from running pcntl calls when nothing was ever installed.
+     */
+    private $pcntlRefresherInstalled = false;
 
     /**
      * HTTP status code used when rejecting duplicates.
@@ -105,6 +123,16 @@ class OutputCacheService
             }
             if (isset($dataHubConfig['graphql']['in_progress_ttl'])) {
                 $this->inProgressTtl = max(1, intval($dataHubConfig['graphql']['in_progress_ttl']));
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_refresh_interval'])) {
+                $this->inProgressRefreshInterval = max(0, intval($dataHubConfig['graphql']['in_progress_refresh_interval']));
+            }
+            if ($this->inProgressRefreshInterval === 0 && $this->inProgressTtl > 1) {
+                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
+            }
+            if ($this->inProgressRefreshInterval >= $this->inProgressTtl) {
+                // Refresh must fire before the TTL elapses or the lock leaks for a full TTL window.
+                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
             }
             if (isset($dataHubConfig['graphql']['in_progress_http_status'])) {
                 $this->inProgressHttpStatus = intval($dataHubConfig['graphql']['in_progress_http_status']);
@@ -421,6 +449,8 @@ class OutputCacheService
     /** Remove the in-progress marker and clear the request attribute so the safety-net listener is a no-op. */
     private function deleteInProgressLock(Request $request): void
     {
+        $this->uninstallLockRefresher();
+
         $guardKey = $this->computeGuardKey($request);
         $key = $this->lockKeyFor($guardKey);
 
@@ -491,10 +521,17 @@ class OutputCacheService
         $resource = 'datahub_inprogress:' . $this->computeGuardKey($request);
 
         try {
-            $lock = $factory->createLock($resource, $this->inProgressTtl, false);
+            // autoRelease=true so the Lock destructor releases on graceful PHP
+            // shutdown even if save() and the safety-net listener both fail to run.
+            $lock = $factory->createLock($resource, $this->inProgressTtl, true);
             if ($lock->acquire(false)) {
                 // keep reference on request for releasing in save()
                 $request->attributes->set('datahub_inprogress_lock', $lock);
+                $this->installLockRefresher(
+                    $lock,
+                    $this->computeGuardKey($request),
+                    $request->attributes->getString('clientname')
+                );
 
                 return $lock;
             }
@@ -511,6 +548,8 @@ class OutputCacheService
      */
     private function releaseAtomicLockIfAny(Request $request): void
     {
+        $this->uninstallLockRefresher();
+
         $lock = $request->attributes->get('datahub_inprogress_lock');
         if ($lock) {
             try {
@@ -522,6 +561,80 @@ class OutputCacheService
             }
             $request->attributes->remove('datahub_inprogress_lock');
         }
+    }
+
+    /**
+     * Arm a SIGALRM handler that periodically refreshes the Symfony Lock TTL
+     * and the Pimcore cache marker. Requires the pcntl extension; silently
+     * no-ops if pcntl is unavailable or refresh is disabled. Async-signals are
+     * used so the handler fires between PHP opcodes without per-tick overhead.
+     *
+     * @param object $lock        Symfony Lock object that exposes refresh($ttl)
+     * @param string $guardKey    pre-computed guard key for the Pimcore marker
+     * @param string $clientname  used as a cache tag on marker re-save
+     */
+    private function installLockRefresher($lock, string $guardKey, string $clientname): void
+    {
+        if ($this->inProgressRefreshInterval < 1) {
+            return;
+        }
+        if (!function_exists('pcntl_async_signals')
+            || !function_exists('pcntl_alarm')
+            || !function_exists('pcntl_signal')
+            || !defined('SIGALRM')) {
+            return;
+        }
+
+        try {
+            pcntl_async_signals(true);
+
+            $ttl = $this->inProgressTtl;
+            $interval = $this->inProgressRefreshInterval;
+            $markerKey = $this->lockKeyFor($guardKey);
+            $tags = ['datahub_inprogress', $clientname];
+
+            $handler = static function () use ($lock, $markerKey, $tags, $ttl, $interval): void {
+                try {
+                    if (method_exists($lock, 'refresh')) {
+                        $lock->refresh($ttl);
+                    }
+                    \Pimcore\Cache::save(1, $markerKey, $tags, $ttl, 1, true);
+                } catch (\Throwable $e) {
+                    // best-effort; a missed refresh just shrinks the safety margin
+                }
+                pcntl_alarm($interval);
+            };
+
+            pcntl_signal(SIGALRM, $handler);
+            pcntl_alarm($interval);
+            $this->pcntlRefresherInstalled = true;
+        } catch (\Throwable $e) {
+            // Never let refresher setup break the request flow
+            $this->pcntlRefresherInstalled = false;
+        }
+    }
+
+    /**
+     * Cancel any pending SIGALRM and detach the handler. Idempotent: safe to
+     * call from every release path (save, listener, deleteInProgressLock).
+     */
+    private function uninstallLockRefresher(): void
+    {
+        if (!$this->pcntlRefresherInstalled) {
+            return;
+        }
+
+        try {
+            if (function_exists('pcntl_alarm')) {
+                pcntl_alarm(0);
+            }
+            if (function_exists('pcntl_signal') && defined('SIGALRM')) {
+                pcntl_signal(SIGALRM, SIG_IGN);
+            }
+        } catch (\Throwable $e) {
+            // best-effort
+        }
+        $this->pcntlRefresherInstalled = false;
     }
 
     private function buildInProgressResponse(): JsonResponse
