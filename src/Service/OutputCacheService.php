@@ -97,6 +97,20 @@ class OutputCacheService
     private static int $activeInterval = 0;
 
     /**
+     * Cached Redis-backed LockFactory built lazily from REDIS_DSN. Kept on
+     * the instance so each request only pays the connection setup once.
+     *
+     * @var object|null
+     */
+    private $herdLockFactory = null;
+
+    /**
+     * Whether we already attempted Redis factory construction this request.
+     * Distinguishes "not tried yet" from "tried and got null".
+     */
+    private bool $herdLockFactoryResolved = false;
+
+    /**
      * HTTP status code used when rejecting duplicates.
      */
     private $inProgressHttpStatus = 503;
@@ -501,26 +515,62 @@ class OutputCacheService
     }
 
     /**
-     * Resolve a Symfony LockFactory if available.
+     * Resolve a Symfony LockFactory if available. Prefers a Redis-backed
+     * factory built from REDIS_DSN so the herd guard pays sub-ms refresh
+     * cost and gets native TTL auto-eviction; falls back to whatever
+     * Pimcore wires as the default (typically DoctrineDbalStore-backed),
+     * and finally to null when Lock isn't installed at all.
+     *
+     * Result is cached on the instance so we only build the Redis
+     * connection once per request.
      *
      * @return object|null
      */
     private function getLockFactory()
     {
-        // Resolve lazily to avoid hard dependency if the component is not installed
+        if ($this->herdLockFactoryResolved) {
+            return $this->herdLockFactory;
+        }
+        $this->herdLockFactoryResolved = true;
+
+        if (!class_exists('Symfony\\Component\\Lock\\LockFactory')) {
+            return null;
+        }
+
+        // Preferred path: Redis-backed store. Short-lived TTL-based locks belong
+        // in Redis — auto-expiry, no row-leak, faster than DBAL UPDATEs each
+        // refresh tick.
         try {
-            if (class_exists('Symfony\\Component\\Lock\\LockFactory')) {
-                $container = \Pimcore::getContainer();
-                if ($container && $container->has('lock.factory')) {
-                    return $container->get('lock.factory');
-                }
-                // Some apps alias the factory by class name
-                if ($container && $container->has('Symfony\\Component\\Lock\\LockFactory')) {
-                    return $container->get('Symfony\\Component\\Lock\\LockFactory');
-                }
+            $dsn = getenv('REDIS_DSN') ?: ($_ENV['REDIS_DSN'] ?? null);
+            if (is_string($dsn) && $dsn !== ''
+                && class_exists('Symfony\\Component\\Lock\\Store\\StoreFactory')) {
+                $store = \Symfony\Component\Lock\Store\StoreFactory::createStore($dsn);
+                $this->herdLockFactory = new \Symfony\Component\Lock\LockFactory($store);
+
+                return $this->herdLockFactory;
             }
         } catch (\Throwable $e) {
-            // ignore and fallback
+            Logger::warning(
+                'DataHub in-progress: Redis-backed lock factory unavailable, '
+                . 'falling back to Pimcore default: ' . $e->getMessage()
+            );
+        }
+
+        // Fallback: Pimcore's default lock factory (DBAL or whatever is wired).
+        try {
+            $container = \Pimcore::getContainer();
+            if ($container && $container->has('lock.factory')) {
+                $this->herdLockFactory = $container->get('lock.factory');
+
+                return $this->herdLockFactory;
+            }
+            if ($container && $container->has('Symfony\\Component\\Lock\\LockFactory')) {
+                $this->herdLockFactory = $container->get('Symfony\\Component\\Lock\\LockFactory');
+
+                return $this->herdLockFactory;
+            }
+        } catch (\Throwable $e) {
+            // ignore
         }
 
         return null;
@@ -617,6 +667,14 @@ class OutputCacheService
             pcntl_alarm($this->inProgressRefreshInterval);
 
             $this->pcntlRefresherInstalled = true;
+
+            Logger::debug(sprintf(
+                'In-progress: refresher armed (pid=%d, guardKey=%s, ttl=%ds, interval=%ds)',
+                function_exists('getmypid') ? (int) getmypid() : -1,
+                $guardKey,
+                $this->inProgressTtl,
+                $this->inProgressRefreshInterval
+            ));
         } catch (\Throwable $e) {
             // Never let refresher setup break the request flow
             self::clearRefresherState();
@@ -643,11 +701,17 @@ class OutputCacheService
             return;
         }
 
+        $pid = function_exists('getmypid') ? (int) getmypid() : -1;
+
         try {
             // If the Lock has been released externally (listener, destructor,
             // explicit save()), stop refreshing immediately. isAcquired() goes
             // through the store and reflects current Redis state.
             if (method_exists($lock, 'isAcquired') && !$lock->isAcquired()) {
+                Logger::debug(sprintf(
+                    'In-progress: refresher self-clear (pid=%d, lock no longer acquired)',
+                    $pid
+                ));
                 self::clearRefresherState();
 
                 return;
@@ -666,6 +730,11 @@ class OutputCacheService
                     true
                 );
             }
+            Logger::debug(sprintf(
+                'In-progress: refresh tick (pid=%d, marker=%s)',
+                $pid,
+                self::$activeMarkerKey ?? '?'
+            ));
         } catch (\Throwable $e) {
             // best-effort; a missed refresh just shrinks the safety margin.
             // Re-arm anyway — the next tick might succeed.
@@ -684,6 +753,8 @@ class OutputCacheService
      */
     public static function clearRefresherState(): void
     {
+        $wasArmed = self::$activeLock !== null;
+
         self::$activeLock = null;
         self::$activeMarkerKey = null;
         self::$activeMarkerTags = [];
@@ -701,6 +772,13 @@ class OutputCacheService
                 pcntl_signal(SIGALRM, SIG_IGN);
             } catch (\Throwable $e) {
             }
+        }
+
+        if ($wasArmed) {
+            Logger::debug(sprintf(
+                'In-progress: refresher cleared (pid=%d)',
+                function_exists('getmypid') ? (int) getmypid() : -1
+            ));
         }
     }
 
