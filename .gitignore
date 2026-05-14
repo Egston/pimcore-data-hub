@@ -13,6 +13,9 @@ Thumbs.db
 /.php_cs
 /.php-cs-fixer.cache
 
+# PHPUnit
+/.phpunit.result.cache
+
 # composer
 /composer.lock
 

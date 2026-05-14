@@ -2,9 +2,22 @@
 
 declare(strict_types=1);
 
+/**
+ * Pimcore
+ *
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
+ */
+
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
-use Codeception\Test\Unit;
+use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
@@ -17,13 +30,16 @@ use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
 
-final class PersistentCacheRefreshOnTerminateListenerTest extends Unit
+final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
 {
     private function makeFakeController(callable $callback): WebserviceController
     {
         // Build a lightweight subclass that calls the provided callback instead of full controller logic
         return new class($callback) extends WebserviceController {
-            public function __construct(private $cb) {}
+            public function __construct(private $cb)
+            {
+            }
+
             public function webonyxAction(
                 \Pimcore\Bundle\DataHubBundle\GraphQL\Service $service,
                 \Pimcore\Localization\LocaleServiceInterface $localeService,
@@ -35,10 +51,12 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends Unit
                 // Simulate a freshly computed response and call provided callback (e.g., asserting a save)
                 $response = new \Symfony\Component\HttpFoundation\JsonResponse(['ok' => true]);
                 ($this->cb)($request, $response);
+
                 return $response;
             }
         };
     }
+
     private function makeListener(array $graphqlConfig, WebserviceController $controller = null): PersistentCacheRefreshOnTerminateListener
     {
         $controller = $controller ?: $this->createMock(WebserviceController::class);
@@ -47,9 +65,17 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends Unit
         $factory = $this->createMock(Factory::class);
         $longRunningHelper = $this->createMock(LongRunningHelper::class);
         $responseService = new class implements ResponseServiceInterface {
-            public function removeCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void {}
-            public function addCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void {}
-            public function addHitMissHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response, bool $isCacheHit): void {}
+            public function removeCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void
+            {
+            }
+
+            public function addCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void
+            {
+            }
+
+            public function addHitMissHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response, bool $isCacheHit): void
+            {
+            }
         };
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn(['graphql' => $graphqlConfig]);
@@ -69,6 +95,7 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends Unit
     {
         $kernel = $this->createMock(HttpKernelInterface::class);
         $response = new Response('ok');
+
         return new TerminateEvent($kernel, $request, $response);
     }
 

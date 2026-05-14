@@ -2,9 +2,22 @@
 
 declare(strict_types=1);
 
+/**
+ * Pimcore
+ *
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
+ */
+
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use Codeception\Test\Unit;
+use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapterInterface;
@@ -22,7 +35,7 @@ use Symfony\Component\HttpFoundation\Request;
  * Each test in this class would have failed against the broken implementation
  * on any of those axes.
  */
-final class PersistentOutputCacheServiceBackendTest extends Unit
+final class PersistentOutputCacheServiceBackendTest extends TestCase
 {
     private function makeService(array $graphql = []): ArrayBackedPersistentOutputCacheService
     {
@@ -34,6 +47,7 @@ final class PersistentOutputCacheServiceBackendTest extends Unit
         ];
         $c = $this->createMock(ContainerBagInterface::class);
         $c->method('get')->willReturn(['graphql' => $graphql + $defaults]);
+
         return new ArrayBackedPersistentOutputCacheService($c);
     }
 
@@ -46,15 +60,24 @@ final class PersistentOutputCacheServiceBackendTest extends Unit
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         $req = Request::create('/datahub/graphql', 'POST', [], [], [], ['CONTENT_TYPE' => 'application/json'], $body);
         $req->attributes->set('clientname', $client);
+
         return $req;
     }
 
     private function makeResponseService(): ResponseServiceInterface
     {
         return new class implements ResponseServiceInterface {
-            public function removeCorsHeaders(JsonResponse $response): void {}
-            public function addCorsHeaders(JsonResponse $response): void {}
-            public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void {}
+            public function removeCorsHeaders(JsonResponse $response): void
+            {
+            }
+
+            public function addCorsHeaders(JsonResponse $response): void
+            {
+            }
+
+            public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void
+            {
+            }
         };
     }
 
@@ -261,6 +284,7 @@ final class ArrayBackedPersistentOutputCacheService extends PersistentOutputCach
     protected function cacheLoad(string $key)
     {
         $item = $this->pool->getItem($key);
+
         return $item->isHit() ? $item->get() : null;
     }
 
