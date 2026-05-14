@@ -27,5 +27,4 @@ interface ResponseServiceInterface
     public function addCorsHeaders(JsonResponse $response): void;
 
     public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void;
-
 }

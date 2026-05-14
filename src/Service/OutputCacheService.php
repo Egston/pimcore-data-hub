@@ -17,9 +17,9 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
+use GraphQL\Language\AST\DocumentNode;
 use GraphQL\Language\Parser;
 use GraphQL\Language\Printer;
-use GraphQL\Language\AST\DocumentNode;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
@@ -70,6 +70,7 @@ class OutputCacheService
 
     /**
      * Strategy for guard key: 'request' (query+variables) or 'operation' (operationName only).
+     *
      * @var string
      */
     private $inProgressKeyStrategy = 'request';
@@ -219,16 +220,16 @@ class OutputCacheService
      */
     protected function saveToCache($key, $item, $tags = []): void
     {
-        # Increase priority to 1 to make it less likely this cache item is evicted from the
-        # queue before actually being written, or better yet, write it immediately.
+        // Increase priority to 1 to make it less likely this cache item is evicted from the
+        // queue before actually being written, or better yet, write it immediately.
         \Pimcore\Cache::save($item, $key, $tags, $this->lifetime, 1, true);
+
         try {
             Logger::debug(sprintf('Output cache SAVED (key=%s, ttl=%d, tags=%s)', $key, (int) $this->lifetime, implode(',', $tags)));
         } catch (\Throwable $e) {
             // ignore logging failures
         }
     }
-
 
     /**
      * Canonicalize the incoming JSON body for cache/lock keys:
@@ -238,7 +239,6 @@ class OutputCacheService
      * - Recursively ksort all associative arrays
      * - Encode with stable json_encode flags
      *
-     * @param Request $request
      */
     private function canonicalizePayloadForCache(Request $request): string
     {
@@ -269,6 +269,7 @@ class OutputCacheService
         }
 
         $request->attributes->set('_datahub_canonical_payload', $canonical);
+
         return $canonical;
     }
 
@@ -280,6 +281,7 @@ class OutputCacheService
         try {
             /** @var DocumentNode $ast */
             $ast = Parser::parse($query);
+
             // Printer preserves a canonical formatting; not sorting selections (keeps semantic order)
             return Printer::doPrint($ast);
         } catch (\Throwable $e) {
@@ -299,6 +301,7 @@ class OutputCacheService
                     return true;
                 }
             }
+
             return false;
         };
 
@@ -417,7 +420,11 @@ class OutputCacheService
     {
         $guardKey = $this->computeGuardKey($request);
         $key = $this->lockKeyFor($guardKey);
-        try { \Pimcore\Cache::remove($key); } catch (\Throwable $e) {}
+
+        try {
+            \Pimcore\Cache::remove($key);
+        } catch (\Throwable $e) {
+        }
     }
 
     /** Compute a client-agnostic guard key according to configured strategy. */
@@ -434,6 +441,7 @@ class OutputCacheService
         }
 
         $canonical = $this->canonicalizePayloadForCache($request);
+
         return hash('sha256', 'req:' . $canonical);
     }
 
@@ -482,6 +490,7 @@ class OutputCacheService
             if ($lock->acquire(false)) {
                 // keep reference on request for releasing in save()
                 $request->attributes->set('datahub_inprogress_lock', $lock);
+
                 return $lock;
             }
         } catch (\Throwable $e) {

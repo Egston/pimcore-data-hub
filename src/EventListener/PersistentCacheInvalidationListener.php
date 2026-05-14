@@ -2,6 +2,19 @@
 
 declare(strict_types=1);
 
+/**
+ * Pimcore
+ *
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
+ */
+
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
@@ -45,6 +58,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
     public function mark(): void
     {
         $this->persistentCache->markOutputInvalidated();
+
         // Additionally schedule background refreshes for every persisted entry
         // when async refresh is enabled. INDEX_ALL is iterated so non-guarded
         // operations (persistent_output_cache_guard_only=false) are covered too;

@@ -3,13 +3,16 @@
 declare(strict_types=1);
 
 /**
- * Additional, persistent GraphQL output cache layer (SWR) for Data Hub.
+ * Pimcore
  *
- * - Stores responses independently from Pimcore's 'output' tag cache.
- * - Survives 'output' tag invalidations and serves stale results with a header.
- * - TTL is refreshed on each hit.
- * - Applies to the same guarded queries by default, but is configurable.
- * - Provides tagging for console-based cache clearing, incl. per-operation tags.
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
  */
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
@@ -27,6 +30,7 @@ class PersistentOutputCacheService
     // Tag/key names use '_' instead of ':' — PSR-6 reserves '{}()/\@:' and
     // CacheItem validation throws on any of them in either a key or a tag.
     public const TAG_COMMON = 'datahub_graphql_persistent';
+
     /**
      * Dedicated tag for the singleton invalidation watermark; kept separate from
      * TAG_COMMON so a blanket clear of cached entries by TAG_COMMON does not
@@ -34,27 +38,39 @@ class PersistentOutputCacheService
      * look FRESH until the next mutation event).
      */
     public const TAG_WATERMARK = 'datahub_graphql_persistent_watermark';
+
     public const TAG_OP_PREFIX = 'datahub_graphql_op_';
+
     public const TAG_CLIENT_PREFIX = 'datahub_graphql_client_';
+
     public const KEY_LAST_INVALIDATION = 'datahub_graphql_output_last_invalidation_ts';
+
     public const PAYLOAD_KEY_PREFIX = 'persistent_output_payload_';
+
     public const META_KEY_PREFIX = 'persistent_output_meta_';
+
     public const ENQUEUE_DEDUPE_PREFIX = 'datahub_enqueue_req_';
 
     public const INDEX_ALL = 'datahub_graphql_persistent_index_all';
+
     public const INDEX_OP_PREFIX = 'datahub_graphql_persistent_index_op_';
+
     public const INDEX_CLIENT_PREFIX = 'datahub_graphql_persistent_index_client_';
 
     /** Soft cap on per-index entry count; prune dead entries before growing past this. */
     private const MAX_INDEX_SIZE = 5000;
 
     private bool $enabled = false;
+
     private int $ttl; // seconds
+
     private bool $guardOnly = true;
+
     private array $guardOperations = [];
+
     private int $payloadTtl = 86400;
 
-    public function __construct(private ContainerBagInterface $container)
+    public function __construct(ContainerBagInterface $container)
     {
         $cfg = $container->get('pimcore_data_hub');
 
@@ -125,6 +141,7 @@ class PersistentOutputCacheService
             $request->attributes->set('_datahub_persistent_refresh', true);
             $request->attributes->set('_datahub_persistent_meta_key', $metaKey);
             $request->attributes->set('_datahub_persistent_payload_key', $payloadKey);
+
             return $response;
         }
 
@@ -185,6 +202,7 @@ class PersistentOutputCacheService
         $lastInvalidation = (int) ($this->cacheLoad(self::KEY_LAST_INVALIDATION) ?: 0);
         $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
         $isStale = $lastInvalidation > 0 && $refreshedAt > 0 && $refreshedAt < $lastInvalidation;
+
         return ['applies' => true, 'status' => $isStale ? 'STALE' : 'HIT'];
     }
 
@@ -219,11 +237,13 @@ class PersistentOutputCacheService
                 $status,
                 (string)$request->attributes->get('clientname')
             ));
+
             return;
         }
         $payload = json_decode($response->getContent() ?: 'null', true);
         if (!is_array($payload) || $payload === []) {
             Logger::warning('DataHub persistent cache: refusing to save empty or non-array payload');
+
             return;
         }
         if (!empty($payload['errors'])) {
@@ -233,6 +253,7 @@ class PersistentOutputCacheService
                 (string)$request->attributes->get('clientname'),
                 json_encode($messages)
             ));
+
             return;
         }
 
@@ -267,6 +288,7 @@ class PersistentOutputCacheService
         if ($operationName) {
             $tags[] = self::TAG_OP_PREFIX . $operationName;
         }
+
         return $tags;
     }
 
@@ -338,7 +360,6 @@ class PersistentOutputCacheService
     /**
      * Read helper – separated for testability.
      *
-     * @param string $key
      * @return mixed
      */
     protected function cacheLoad(string $key)
@@ -349,9 +370,7 @@ class PersistentOutputCacheService
     /**
      * Write helper – separated for testability.
      *
-     * @param string   $key
      * @param mixed    $value
-     * @param array    $tags
      * @param int|null $ttl  null = no expiry (use for sentinel/index entries);
      *                       int  = seconds. Do NOT pass 0 — Symfony Cache
      *                       interprets that as "expires immediately".
@@ -375,6 +394,7 @@ class PersistentOutputCacheService
     {
         $clientname = (string)$request->attributes->get('clientname', '');
         $canonical = $this->canonicalizePayload($request);
+
         return [$clientname, $canonical];
     }
 
@@ -406,6 +426,7 @@ class PersistentOutputCacheService
         }
 
         $request->attributes->set('_datahub_persistent_canonical', $canonical);
+
         return $canonical;
     }
 
@@ -414,6 +435,7 @@ class PersistentOutputCacheService
         try {
             /** @var DocumentNode $ast */
             $ast = Parser::parse($query);
+
             return Printer::doPrint($ast);
         } catch (\Throwable $e) {
             return trim($query);
@@ -429,6 +451,7 @@ class PersistentOutputCacheService
                     return true;
                 }
             }
+
             return false;
         };
 

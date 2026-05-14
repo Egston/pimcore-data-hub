@@ -33,8 +33,8 @@ use Pimcore\Bundle\DataHubBundle\PimcoreDataHubBundle;
 use Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService;
 use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
-use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Cache\RuntimeCache;
 use Pimcore\Controller\FrontendController;
 use Pimcore\Helper\LongRunningHelper;
@@ -131,6 +131,7 @@ class WebserviceController extends FrontendController
             $response->headers->set('Cache-Status', $cacheStatus);
             $responseService->addCorsHeaders($response);
             $responseService->addHitMissHeaders($response, $outStatus === 'HIT');
+
             return $response;
         }
 
@@ -138,6 +139,7 @@ class WebserviceController extends FrontendController
         if ($pResponse = $this->persistentCacheService->preHandle($request, $responseService)) {
             // Persistent HIT (fresh). Add output-cache header as MISS to clarify layer used
             $responseService->addHitMissHeaders($pResponse, true);
+
             return $pResponse;
         }
 
@@ -168,6 +170,7 @@ class WebserviceController extends FrontendController
             $operationName = $input['operationName'] ?? null;
             Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
             $responseService->addCorsHeaders($inProgressResponse);
+
             return $inProgressResponse;
         }
 

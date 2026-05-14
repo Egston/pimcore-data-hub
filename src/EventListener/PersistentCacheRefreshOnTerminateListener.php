@@ -2,16 +2,29 @@
 
 declare(strict_types=1);
 
+/**
+ * Pimcore
+ *
+ * This source file is available under two different licenses:
+ * - GNU General Public License version 3 (GPLv3)
+ * - Pimcore Commercial License (PCL)
+ * Full copyright and license information is available in
+ * LICENSE.md which is distributed with this source code.
+ *
+ *  @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)
+ *  @license    http://www.pimcore.org/license     GPLv3 and PCL
+ */
+
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
+use Pimcore\Cache as PimcoreCache;
 use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
-use Pimcore\Model\Factory;
-use Pimcore\Cache as PimcoreCache;
 use Pimcore\Logger;
+use Pimcore\Model\Factory;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Symfony\Component\HttpFoundation\Request;
@@ -76,12 +89,14 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             } catch (\Throwable $e) {
                 Logger::error('DataHub persistent refresh: queue dispatch failed: ' . $e->getMessage());
             }
+
             return;
         }
 
         // If an operation is already guarded by herd protection, we don't need an extra refresh lock.
         if ($this->isGuardedByHerd($request)) {
             $this->runRefresh($request);
+
             return;
         }
 
@@ -150,7 +165,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             return false;
         }
         $list = (array)($graphql['in_progress_queries'] ?? []);
-        $list = array_values(array_filter($list, static fn($v) => is_string($v) && $v !== ''));
+        $list = array_values(array_filter($list, static fn ($v) => is_string($v) && $v !== ''));
         if (!$list) {
             return false;
         }
@@ -159,6 +174,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         if (!$op) {
             return false;
         }
+
         return in_array($op, $list, true);
     }
 
@@ -171,6 +187,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         }
         $client = (string)$request->attributes->get('clientname', '');
         $body = (string)$request->getContent();
+
         return 'datahub_persistent_refresh_lock_' . hash('sha256', 'client:' . $client . "\n" . $body);
     }
 
@@ -183,6 +200,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         }
         $client = (string)$request->attributes->get('clientname', '');
         $body = (string)$request->getContent();
+
         return 'datahub_enqueue_req_' . hash('sha256', 'client:' . $client . "\n" . $body);
     }
 }
