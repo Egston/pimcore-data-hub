@@ -57,7 +57,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
 
             foreach ($ops as $op) {
                 if (!is_string($op) || $op === '') { continue; }
-                $indexKey = 'datahub_graphql_persistent_index_op:' . $op;
+                $indexKey = 'datahub_graphql_persistent_index_op_' . $op;
                 $list = \Pimcore\Cache::load($indexKey);
                 if (!is_array($list)) { continue; }
                 foreach ($list as $payloadKey) {

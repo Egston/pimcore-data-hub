@@ -25,13 +25,15 @@ use Symfony\Component\HttpFoundation\Request;
 class PersistentOutputCacheService
 {
     private const TAG_COMMON = 'datahub_graphql_persistent';
-    private const TAG_OP_PREFIX = 'datahub_graphql_op:'; // datahub_graphql_op:<operation>
-    private const TAG_CLIENT_PREFIX = 'datahub_graphql_client:'; // datahub_graphql_client:<client>
+    // Tag/key names use '_' instead of ':' — PSR-6 (Symfony Cache CacheItem)
+    // reserves '{}()/\@:' for both keys and tags and throws on validation.
+    private const TAG_OP_PREFIX = 'datahub_graphql_op_'; // datahub_graphql_op_<operation>
+    private const TAG_CLIENT_PREFIX = 'datahub_graphql_client_'; // datahub_graphql_client_<client>
     private const KEY_LAST_INVALIDATION = 'datahub_graphql_output_last_invalidation_ts';
 
     private const INDEX_ALL = 'datahub_graphql_persistent_index_all';
-    private const INDEX_OP_PREFIX = 'datahub_graphql_persistent_index_op:'; // + <operation>
-    private const INDEX_CLIENT_PREFIX = 'datahub_graphql_persistent_index_client:'; // + <client>
+    private const INDEX_OP_PREFIX = 'datahub_graphql_persistent_index_op_'; // + <operation>
+    private const INDEX_CLIENT_PREFIX = 'datahub_graphql_persistent_index_client_'; // + <client>
 
     private bool $enabled = false;
     private int $ttl; // seconds
@@ -179,7 +181,8 @@ class PersistentOutputCacheService
     public function markOutputInvalidated(?int $ts = null): void
     {
         $ts = $ts ?? time();
-        $this->cacheSave(self::KEY_LAST_INVALIDATION, $ts, [self::TAG_COMMON], 0);
+        // null TTL = no expiry; Symfony's CacheItem::expiresAfter(0) means "expires now".
+        $this->cacheSave(self::KEY_LAST_INVALIDATION, $ts, [self::TAG_COMMON], null);
     }
 
     /** Persist a fresh response for the given request. */
@@ -247,7 +250,7 @@ class PersistentOutputCacheService
         }
         if (!in_array($memberKey, $list, true)) {
             $list[] = $memberKey;
-            $this->cacheSave($indexKey, $list, [self::TAG_COMMON], 0);
+            $this->cacheSave($indexKey, $list, [self::TAG_COMMON], null);
         }
     }
 
@@ -297,12 +300,14 @@ class PersistentOutputCacheService
     /**
      * Write helper – separated for testability.
      *
-     * @param string $key
-     * @param mixed  $value
-     * @param array  $tags
-     * @param int    $ttl
+     * @param string   $key
+     * @param mixed    $value
+     * @param array    $tags
+     * @param int|null $ttl  null = no expiry (use for sentinel/index entries);
+     *                       int  = seconds. Do NOT pass 0 — Symfony Cache
+     *                       interprets that as "expires immediately".
      */
-    protected function cacheSave(string $key, $value, array $tags, int $ttl): void
+    protected function cacheSave(string $key, $value, array $tags, ?int $ttl): void
     {
         // priority=1, force write immediately
         \Pimcore\Cache::save($value, $key, $tags, $ttl, 1, true);

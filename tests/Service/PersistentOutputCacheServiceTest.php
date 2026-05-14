@@ -197,7 +197,7 @@ final class PersistentOutputCacheServiceTest extends Unit
             ->getMock();
 
         $saved = [];
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
             $saved[] = compact('key', 'value', 'tags', 'ttl');
             return null;
         });
@@ -215,15 +215,15 @@ final class PersistentOutputCacheServiceTest extends Unit
                 $foundPayload = true;
                 $this->assertSame(3456, $call['ttl']);
                 $this->assertContains('datahub_graphql_persistent', $call['tags']);
-                $this->assertContains('datahub_graphql_op:TestOp', $call['tags']);
-                $this->assertContains('datahub_graphql_client:c1', $call['tags']);
+                $this->assertContains('datahub_graphql_op_TestOp', $call['tags']);
+                $this->assertContains('datahub_graphql_client_c1', $call['tags']);
             }
             if (str_starts_with($call['key'], 'persistent_output_meta_')) {
                 $foundMeta = true;
                 $this->assertSame(12, $call['ttl']);
                 $this->assertContains('datahub_graphql_persistent', $call['tags']);
-                $this->assertContains('datahub_graphql_op:TestOp', $call['tags']);
-                $this->assertContains('datahub_graphql_client:c1', $call['tags']);
+                $this->assertContains('datahub_graphql_op_TestOp', $call['tags']);
+                $this->assertContains('datahub_graphql_client_c1', $call['tags']);
             }
         }
         $this->assertTrue($foundPayload, 'Payload save not observed');
@@ -285,7 +285,7 @@ final class PersistentOutputCacheServiceTest extends Unit
             ->onlyMethods(['cacheSave'])
             ->getMock();
 
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
             $saved[] = compact('key', 'value', 'tags', 'ttl');
         });
 
@@ -396,7 +396,7 @@ final class PersistentOutputCacheServiceTest extends Unit
             ->onlyMethods(['cacheSave'])
             ->getMock();
 
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$saved) {
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
             $saved[] = compact('key', 'value', 'tags', 'ttl');
         });
 
@@ -410,13 +410,14 @@ final class PersistentOutputCacheServiceTest extends Unit
 
         $keys = array_column($saved, 'key');
         $this->assertContains('datahub_graphql_persistent_index_all', $keys);
-        $this->assertContains('datahub_graphql_persistent_index_client:clientA', $keys);
-        $this->assertContains('datahub_graphql_persistent_index_op:IdxOp', $keys);
+        $this->assertContains('datahub_graphql_persistent_index_client_clientA', $keys);
+        $this->assertContains('datahub_graphql_persistent_index_op_IdxOp', $keys);
 
-        // index entries use TTL 0 (infinite)
+        // index entries use TTL null (no expiry); Symfony's CacheItem::expiresAfter(0)
+        // means "expires now", which is why null is correct here, not 0.
         foreach ($saved as $call) {
             if (str_starts_with($call['key'], 'datahub_graphql_persistent_index_')) {
-                $this->assertSame(0, $call['ttl']);
+                $this->assertNull($call['ttl']);
                 $this->assertContains('datahub_graphql_persistent', $call['tags']);
             }
         }
@@ -432,7 +433,7 @@ final class PersistentOutputCacheServiceTest extends Unit
             ->getMock();
 
         $observed = [];
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, int $ttl) use (&$observed) {
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$observed) {
             $observed = compact('key', 'value', 'tags', 'ttl');
         });
 
@@ -440,7 +441,7 @@ final class PersistentOutputCacheServiceTest extends Unit
 
         $this->assertSame('datahub_graphql_output_last_invalidation_ts', $observed['key']);
         $this->assertSame(123456, $observed['value']);
-        $this->assertSame(0, $observed['ttl']);
+        $this->assertNull($observed['ttl']);
         $this->assertContains('datahub_graphql_persistent', $observed['tags']);
     }
 
