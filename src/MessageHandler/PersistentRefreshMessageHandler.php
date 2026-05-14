@@ -10,6 +10,7 @@ use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
+use Pimcore\Logger;
 use Pimcore\Model\Factory;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\HttpFoundation\Request;
@@ -57,8 +58,15 @@ final class PersistentRefreshMessageHandler
                 if (!$opLock->acquire(false)) {
                     throw new RecoverableMessageHandlingException('Operation refresh is in progress, retry later');
                 }
+            } catch (RecoverableMessageHandlingException $e) {
+                // signal Messenger to retry; do NOT fall through to the lockless path
+                throw $e;
             } catch (\Throwable $e) {
-                // If locking fails unexpectedly, proceed without op lock to avoid losing refresh; no exception
+                Logger::warning(sprintf(
+                    'DataHub persistent refresh: op-lock acquisition failed (op=%s); proceeding without op-lock. %s',
+                    (string)$operation,
+                    $e->getMessage()
+                ));
                 $opLock = null;
             }
         }
@@ -75,10 +83,11 @@ final class PersistentRefreshMessageHandler
                 try {
                     $reqLock = $this->lockFactory->createLock($reqResource, $opLockTtl, false);
                     if (!$reqLock->acquire(false)) {
-                        // Another worker is refreshing this exact request; drop message
+                        Logger::debug('DataHub persistent refresh: dropped — another worker holds the request-lock');
                         return;
                     }
                 } catch (\Throwable $e) {
+                    Logger::warning('DataHub persistent refresh: request-lock acquisition failed: ' . $e->getMessage());
                     $reqLock = null;
                 }
             }
@@ -93,10 +102,18 @@ final class PersistentRefreshMessageHandler
             );
         } finally {
             if ($opLock) {
-                try { $opLock->release(); } catch (\Throwable $e) {}
+                try {
+                    $opLock->release();
+                } catch (\Throwable $e) {
+                    Logger::warning('DataHub persistent refresh: op-lock release failed: ' . $e->getMessage());
+                }
             }
             if ($reqLock) {
-                try { $reqLock->release(); } catch (\Throwable $e) {}
+                try {
+                    $reqLock->release();
+                } catch (\Throwable $e) {
+                    Logger::warning('DataHub persistent refresh: request-lock release failed: ' . $e->getMessage());
+                }
             }
         }
     }

@@ -120,11 +120,9 @@ class WebserviceController extends FrontendController
             $outStatus = $this->cacheService->probeStatus($request);
             $persistProbe = $this->persistentCacheService->probeStatus($request);
             $response = new JsonResponse(null, 204);
-            $response->setData(null);
             $cacheStatus = sprintf('pimcore-output; %s', strtolower($outStatus));
             if ($persistProbe['applies']) {
                 $cacheStatus .= sprintf(', pimcore-persistent; %s', strtolower($persistProbe['status']));
-                // Also expose persistent header for compatibility
                 $response->headers->set('X-Pimcore-DataHub-Persistent-Cache', $persistProbe['status']);
                 if ($persistProbe['status'] === 'STALE') {
                     $response->headers->set('Warning', '110 - "Response is Stale"');
@@ -302,10 +300,7 @@ class WebserviceController extends FrontendController
             $this->cacheService->save($request, $response);
         }
 
-        // Persistent cache post-handle: save/refresh, possibly return stale response
-        if ($override = $this->persistentCacheService->postHandle($request, $response)) {
-            return $override;
-        }
+        $this->persistentCacheService->postHandle($request, $response);
         $responseService->addCorsHeaders($response);
         $responseService->addHitMissHeaders($response, false);
 

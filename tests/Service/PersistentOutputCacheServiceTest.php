@@ -48,7 +48,8 @@ final class PersistentOutputCacheServiceTest extends Unit
         $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
 
         $this->assertNull($service->preHandle($request, $this->makeResponseService()));
-        $this->assertNull($service->postHandle($request, new JsonResponse(['ok' => true])));
+        // postHandle is void; assert it does not throw on disabled config
+        $service->postHandle($request, new JsonResponse(['ok' => true]));
     }
 
     public function testFreshHitReturnsImmediatelyAndRefreshes(): void
@@ -442,7 +443,7 @@ final class PersistentOutputCacheServiceTest extends Unit
         $this->assertSame('datahub_graphql_output_last_invalidation_ts', $observed['key']);
         $this->assertSame(123456, $observed['value']);
         $this->assertNull($observed['ttl']);
-        $this->assertContains('datahub_graphql_persistent', $observed['tags']);
+        $this->assertContains('datahub_graphql_persistent_watermark', $observed['tags']);
     }
 
     public function testShouldUseSkipsNonPost(): void
@@ -455,6 +456,6 @@ final class PersistentOutputCacheServiceTest extends Unit
         $req = Request::create('/datahub/graphql', 'GET');
         $req->attributes->set('clientname', 'c1');
         $this->assertNull($service->preHandle($req, $this->makeResponseService()));
-        $this->assertNull($service->postHandle($req, new JsonResponse(['x' => 1])));
+        $service->postHandle($req, new JsonResponse(['x' => 1]));
     }
 }

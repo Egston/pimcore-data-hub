@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 /**
  * Pimcore
  *
@@ -431,8 +433,7 @@ class OutputCacheService
             }
         }
 
-        // Default: full canonical request (client-agnostic)
-        $canonical = $this->canonicalizePayloadForCache($request, /*clientAware*/ false);
+        $canonical = $this->canonicalizePayloadForCache($request);
         return hash('sha256', 'req:' . $canonical);
     }
 

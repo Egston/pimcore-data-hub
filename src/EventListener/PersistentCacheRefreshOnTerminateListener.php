@@ -11,8 +11,10 @@ use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
 use Pimcore\Model\Factory;
 use Pimcore\Cache as PimcoreCache;
+use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\KernelEvents;
 
@@ -51,7 +53,8 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         $useQueue = (bool)($graphql['persistent_refresh_queue_enabled'] ?? false);
 
         if ($useQueue) {
-            // Dispatch to Messenger; the handler will perform appropriate locking
+            // Dispatch to Messenger; the handler will perform appropriate locking.
+            // No local fallback — a misconfigured queue is louder this way.
             try {
                 $bus = \Pimcore::getContainer()->get('messenger.default_bus');
                 $payload = (string)$request->getContent();
@@ -61,7 +64,6 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
                 if (isset($in['operationName']) && is_string($in['operationName'])) {
                     $op = $in['operationName'];
                 }
-                // enqueue dedupe to avoid flooding the queue for identical requests
                 $enqueueTtl = max(1, (int)($graphql['persistent_enqueue_dedupe_ttl'] ?? 60));
                 $dedupeKey = $this->buildEnqueueDedupeKey($request);
                 $existingEnqueue = PimcoreCache::load($dedupeKey);
@@ -69,31 +71,17 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
                     return; // already enqueued recently
                 }
                 PimcoreCache::save(1, $dedupeKey, ['datahub_graphql_persistent'], $enqueueTtl, 1, true);
-                $messageClass = 'Pimcore\\Bundle\\DataHubBundle\\Message\\PersistentRefreshMessage';
-                if (class_exists($messageClass)) {
-                    $msg = new $messageClass($client, $payload, $op);
-                    $bus->dispatch($msg);
-                }
+                $msg = new \Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage($client, $payload, $op);
+                $bus->dispatch($msg);
             } catch (\Throwable $e) {
-                // If dispatch fails, we fallback to local execution below
+                Logger::error('DataHub persistent refresh: queue dispatch failed: ' . $e->getMessage());
             }
-            return; // don't do local refresh when queue enabled
+            return;
         }
 
         // If an operation is already guarded by herd protection, we don't need an extra refresh lock.
         if ($this->isGuardedByHerd($request)) {
-            try {
-                $this->controller->webonyxAction(
-                    $this->graphQlService,
-                    $this->localeService,
-                    $this->modelFactory,
-                    $request,
-                    $this->longRunningHelper,
-                    $this->responseService
-                );
-            } catch (\Throwable $e) {
-                // best-effort
-            }
+            $this->runRefresh($request);
             return;
         }
 
@@ -111,20 +99,45 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         }
 
         try {
+            $this->runRefresh($request);
+        } finally {
+            if ($markerKey) {
+                try {
+                    PimcoreCache::remove($markerKey);
+                } catch (\Throwable $e) {
+                    Logger::warning('DataHub persistent refresh: marker cleanup failed: ' . $e->getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Run the SWR refresh against a freshly-built Request. Reusing the
+     * original Request would leak its STALE-path attributes into the inner
+     * call and would let the herd guard 503 the refresh sub-request; the
+     * bypass attribute on the fresh Request prevents that.
+     */
+    private function runRefresh(\Symfony\Component\HttpFoundation\Request $originalRequest): void
+    {
+        $body = (string)$originalRequest->getContent();
+        $client = (string)$originalRequest->attributes->get('clientname', '');
+
+        $fresh = Request::create('/datahub/graphql', 'POST', [], [], [], ['CONTENT_TYPE' => 'application/json'], $body);
+        $fresh->attributes->set('clientname', $client);
+        $fresh->attributes->set('_datahub_persistent_refresh', true);
+        $fresh->attributes->set('_datahub_bypass_in_progress_guard', true);
+
+        try {
             $this->controller->webonyxAction(
                 $this->graphQlService,
                 $this->localeService,
                 $this->modelFactory,
-                $request,
+                $fresh,
                 $this->longRunningHelper,
                 $this->responseService
             );
         } catch (\Throwable $e) {
-            // Do not break terminate; background refresh best-effort
-        } finally {
-            if ($markerKey) {
-                try { PimcoreCache::remove($markerKey); } catch (\Throwable $e) {}
-            }
+            Logger::error('DataHub persistent refresh: controller invocation failed: ' . $e->getMessage());
         }
     }
 
