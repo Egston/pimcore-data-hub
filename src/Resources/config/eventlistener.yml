@@ -22,3 +22,7 @@ services:
     Pimcore\Bundle\DataHubBundle\EventListener\PersistentCacheRefreshOnTerminateListener:
         tags:
             - { name: kernel.event_subscriber }
+
+    Pimcore\Bundle\DataHubBundle\EventListener\InProgressLockReleaseListener:
+        tags:
+            - { name: kernel.event_subscriber }

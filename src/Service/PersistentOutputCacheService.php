@@ -226,10 +226,14 @@ class PersistentOutputCacheService
             return;
         }
 
-        // Refuse to persist failure responses — otherwise a transient downstream
-        // error (DB hiccup, herd-guard 503, schema build crash) gets cached as a
-        // "valid" payload for payloadTtl seconds, and every refresh that hits the
-        // same broken state silently re-poisons the entry.
+        // Refuse to persist transient infrastructure failures (non-2xx, empty
+        // body) — caching those for payloadTtl seconds turns a momentary DB or
+        // herd-guard hiccup into a persistent outage. GraphQL-level errors
+        // (`{errors: [...]}` in a 200 body) are deterministic against the
+        // input — re-running the same query produces the same errors — so
+        // caching them is stabilizing, not poisoning. Mirrors the standard
+        // OutputCacheService::save(), which has cached GraphQL-error payloads
+        // unconditionally for years.
         $status = $response->getStatusCode();
         if ($status < 200 || $status >= 300) {
             Logger::warning(sprintf(
@@ -249,12 +253,10 @@ class PersistentOutputCacheService
         if (!empty($payload['errors'])) {
             $messages = array_column((array)$payload['errors'], 'message');
             Logger::error(sprintf(
-                'DataHub persistent cache: refusing to save GraphQL error payload (client=%s, errors=%s)',
+                'DataHub persistent cache: caching response with GraphQL errors (client=%s, errors=%s) — schema or data may need cleanup',
                 (string)$request->attributes->get('clientname'),
                 json_encode($messages)
             ));
-
-            return;
         }
 
         [$client, $canonical] = $this->clientAndCanonical($request);

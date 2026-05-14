@@ -219,20 +219,23 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
     }
 
     /**
-     * R1.1 — savePersistent must refuse to cache `errors`-bearing payloads.
-     * GraphQL::executeQuery catches exceptions and turns them into
-     * `{"errors":[…]}` with HTTP 200; without this gate they were cached.
+     * R1.1 — savePersistent caches `errors`-bearing 200 responses so a
+     * deterministic schema/query error doesn't trigger a herd-guard storm
+     * on every retry. Transient infra failures are still refused via the
+     * non-2xx guard above (R1 testSavePersistentRefusesNon2xx). Mirrors
+     * the standard OutputCacheService::save(), which has unconditionally
+     * cached error-bearing 200 responses for years.
      */
-    public function testSavePersistentRefusesErroredGraphqlPayload(): void
+    public function testSavePersistentCachesErroredGraphqlPayload(): void
     {
         $svc = $this->makeService();
         $req = $this->makeRequest('c1', 'Op');
 
         $svc->savePersistent($req, new JsonResponse([
-            'errors' => [['message' => 'Query is currently being processed.']],
+            'errors' => [['message' => 'type definition ResourceLibraryTag not found']],
         ]));
 
-        $this->assertSame('MISS', $svc->probeStatus($req)['status']);
+        $this->assertSame('HIT', $svc->probeStatus($req)['status']);
     }
 
     /**
