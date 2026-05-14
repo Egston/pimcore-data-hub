@@ -265,6 +265,80 @@ class OutputCacheServiceTest extends TestCase
         $sut2->save($reqA, new JsonResponse(['data' => ['ok' => true]]));
     }
 
+    public function testMaybeRejectOrAcquireSetsGuardKeyAttribute()
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => ['Op'],
+                'in_progress_key_strategy' => 'operation',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
+            'query' => 'query Acquire($id: ID!){node(id:$id){id}}',
+            'variables' => ['id' => 1],
+            'operationName' => 'Acquire',
+        ]));
+        $req->attributes->set('clientname', 'client-x');
+
+        $result = $sut->maybeRejectOrAcquire($req);
+
+        $this->assertNull($result, 'First caller should not be rejected');
+        $this->assertTrue(
+            $req->attributes->has('datahub_inprogress_guard_key'),
+            'Guard key must be stored on request so the safety-net listener can delete the marker if save() never runs'
+        );
+
+        // Cleanup: call save() to release the marker
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut2->method('saveToCache')->willReturnCallback(function () {
+        });
+        $sut2->save($req, new JsonResponse(['data' => ['ok' => true]]));
+    }
+
+    public function testSaveReleasesGuardKeyAttributeEvenWhenCacheDisabled()
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => ['output_cache_enabled' => false],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut->expects($this->never())->method('saveToCache');
+
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
+            'query' => 'query Op($id: ID!){node(id:$id){id}}',
+            'variables' => ['id' => 1],
+            'operationName' => 'Op',
+        ]));
+        $req->attributes->set('clientname', 'client-y');
+        // Simulate the guard key attribute set by maybeRejectOrAcquire()
+        $req->attributes->set('datahub_inprogress_guard_key', md5('op_Op'));
+
+        $sut->save($req, new JsonResponse(['data' => ['ok' => true]]));
+
+        $this->assertFalse(
+            $req->attributes->has('datahub_inprogress_guard_key'),
+            'save() must clear the guard key attribute even when cache is disabled, so the safety-net listener is a no-op on TERMINATE'
+        );
+    }
+
     public function testBypassGuardForBackgroundRefresh()
     {
         $container = $this->createMock(ContainerBagInterface::class);

@@ -19,6 +19,7 @@ namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
+use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Cache as PimcoreCache;
 use Pimcore\Helper\LongRunningHelper;
@@ -30,6 +31,7 @@ use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\KernelEvents;
+use Symfony\Component\Lock\LockFactory;
 
 /**
  * After the response has been sent, refresh stale persistent cache in background.
@@ -43,7 +45,8 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         private Factory $modelFactory,
         private LongRunningHelper $longRunningHelper,
         private ResponseServiceInterface $responseService,
-        private ContainerBagInterface $container
+        private ContainerBagInterface $container,
+        private ?LockFactory $lockFactory = null
     ) {
     }
 
@@ -93,7 +96,9 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             return;
         }
 
-        // If an operation is already guarded by herd protection, we don't need an extra refresh lock.
+        // When herd protection is active for this operation, the in-progress guard already
+        // serialises concurrent refreshes on the caller path; a second refresh lock here
+        // would add no safety and would block the sub-request's own marker cleanup.
         if ($this->isGuardedByHerd($request)) {
             $this->runRefresh($request);
 
@@ -103,19 +108,47 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         $lockEnabled = (bool)($graphql['persistent_refresh_lock_enabled'] ?? true);
         $lockTtl = max(1, (int)($graphql['persistent_refresh_lock_ttl'] ?? 120));
 
+        $lock = null;
         $markerKey = null;
         if ($lockEnabled) {
-            $markerKey = $this->buildRefreshMarkerKey($request);
-            $existing = PimcoreCache::load($markerKey);
-            if ($existing !== false && $existing !== null) {
-                return; // another refresh is in progress
+            if ($this->lockFactory !== null) {
+                $lockKey = $this->buildRefreshMarkerKey($request);
+
+                try {
+                    $lock = $this->lockFactory->createLock($lockKey, $lockTtl, false);
+                    if (!$lock->acquire(false)) {
+                        return;
+                    }
+                    // Keep the lock alive while the (possibly long) refresh query runs.
+                    LockSignalRefresher::arm($lock, $lockTtl, max(1, (int) floor($lockTtl / 2)));
+                } catch (\Throwable $e) {
+                    Logger::warning('DataHub persistent refresh: lock acquire failed: ' . $e->getMessage());
+                    $lock = null;
+                }
             }
-            PimcoreCache::save(1, $markerKey, ['datahub_graphql_persistent'], $lockTtl, 1, true);
+            if ($lock === null) {
+                // Fallback: cache marker is not atomic and not renewable.
+                $markerKey = $this->buildRefreshMarkerKey($request);
+                $existing = PimcoreCache::load($markerKey);
+                if ($existing !== false && $existing !== null) {
+                    return;
+                }
+                PimcoreCache::save(1, $markerKey, ['datahub_graphql_persistent'], $lockTtl, 1, true);
+            }
         }
 
         try {
             $this->runRefresh($request);
         } finally {
+            if ($lock !== null) {
+                LockSignalRefresher::disarm();
+
+                try {
+                    $lock->release();
+                } catch (\Throwable $e) {
+                    Logger::warning('DataHub persistent refresh: lock release failed: ' . $e->getMessage());
+                }
+            }
             if ($markerKey) {
                 try {
                     PimcoreCache::remove($markerKey);

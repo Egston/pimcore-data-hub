@@ -23,6 +23,7 @@ use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
+use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
@@ -54,9 +55,41 @@ class OutputCacheService
     private $inProgressQueries = [];
 
     /**
-     * TTL (seconds) for the in-progress marker/lock.
+     * TTL (seconds) for the in-progress marker/lock. Bounds the leak window when
+     * a request dies between acquire and release without an exception (SIGKILL,
+     * OOM, FPM worker recycle). Periodic refresh keeps the lock alive during
+     * legitimate long-running requests, so this can be set much smaller than the
+     * worst-case execution time.
      */
     private $inProgressTtl = 60;
+
+    /**
+     * Seconds between background refresh ticks for the in-progress lock and
+     * marker. Must be < $inProgressTtl. 0 = disabled (legacy behaviour: TTL
+     * alone bounds both the leak window and the longest supported request).
+     * Auto-defaulted to floor($inProgressTtl / 2) when left at 0.
+     */
+    private $inProgressRefreshInterval = 0;
+
+    /**
+     * Process-wide latch: SIGALRM handler is currently armed. Guards uninstall
+     * from running pcntl calls when nothing was ever installed.
+     */
+    private $pcntlRefresherInstalled = false;
+
+    /**
+     * Cached Redis-backed LockFactory built lazily from REDIS_DSN. Kept on
+     * the instance so each request only pays the connection setup once.
+     *
+     * @var object|null
+     */
+    private $herdLockFactory = null;
+
+    /**
+     * Whether we already attempted Redis factory construction this request.
+     * Distinguishes "not tried yet" from "tried and got null".
+     */
+    private bool $herdLockFactoryResolved = false;
 
     /**
      * HTTP status code used when rejecting duplicates.
@@ -105,6 +138,16 @@ class OutputCacheService
             }
             if (isset($dataHubConfig['graphql']['in_progress_ttl'])) {
                 $this->inProgressTtl = max(1, intval($dataHubConfig['graphql']['in_progress_ttl']));
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_refresh_interval'])) {
+                $this->inProgressRefreshInterval = max(0, intval($dataHubConfig['graphql']['in_progress_refresh_interval']));
+            }
+            if ($this->inProgressRefreshInterval === 0 && $this->inProgressTtl > 1) {
+                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
+            }
+            if ($this->inProgressRefreshInterval >= $this->inProgressTtl) {
+                // Refresh must fire before the TTL elapses or the lock leaks for a full TTL window.
+                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
             }
             if (isset($dataHubConfig['graphql']['in_progress_http_status'])) {
                 $this->inProgressHttpStatus = intval($dataHubConfig['graphql']['in_progress_http_status']);
@@ -185,6 +228,11 @@ class OutputCacheService
      */
     public function save(Request $request, JsonResponse $response, $extraTags = []): void
     {
+        // Release concurrency guards unconditionally — they protect against thundering herd
+        // regardless of whether the response ends up in the cache.
+        $this->deleteInProgressLock($request);
+        $this->releaseAtomicLockIfAny($request);
+
         if ($this->useCache($request)) {
             $clientname = $request->attributes->getString('clientname');
             $extraTags = array_merge(['output', 'datahub', $clientname], $extraTags);
@@ -195,10 +243,6 @@ class OutputCacheService
             $this->eventDispatcher->dispatch($event, OutputCacheEvents::PRE_SAVE);
 
             $this->saveToCache($cacheKey, $response, $extraTags);
-
-            // Clear in-progress lock once the response is stored
-            $this->deleteInProgressLock($request);
-            $this->releaseAtomicLockIfAny($request);
         }
     }
 
@@ -367,6 +411,8 @@ class OutputCacheService
             }
         } else {
             $this->saveInProgressLock($guardKey, $request);
+            // Store so the safety-net listener can delete the marker if save() never runs.
+            $request->attributes->set('datahub_inprogress_guard_key', $guardKey);
         }
 
         return null;
@@ -415,9 +461,11 @@ class OutputCacheService
         \Pimcore\Cache::save(1, $key, $tags, $this->inProgressTtl, 1, true);
     }
 
-    /** Remove the in-progress marker. */
+    /** Remove the in-progress marker and clear the request attribute so the safety-net listener is a no-op. */
     private function deleteInProgressLock(Request $request): void
     {
+        $this->uninstallLockRefresher();
+
         $guardKey = $this->computeGuardKey($request);
         $key = $this->lockKeyFor($guardKey);
 
@@ -425,6 +473,8 @@ class OutputCacheService
             \Pimcore\Cache::remove($key);
         } catch (\Throwable $e) {
         }
+
+        $request->attributes->remove('datahub_inprogress_guard_key');
     }
 
     /** Compute a client-agnostic guard key according to configured strategy. */
@@ -446,26 +496,62 @@ class OutputCacheService
     }
 
     /**
-     * Resolve a Symfony LockFactory if available.
+     * Resolve a Symfony LockFactory if available. Prefers a Redis-backed
+     * factory built from REDIS_DSN so the herd guard pays sub-ms refresh
+     * cost and gets native TTL auto-eviction; falls back to whatever
+     * Pimcore wires as the default (typically DoctrineDbalStore-backed),
+     * and finally to null when Lock isn't installed at all.
+     *
+     * Result is cached on the instance so we only build the Redis
+     * connection once per request.
      *
      * @return object|null
      */
     private function getLockFactory()
     {
-        // Resolve lazily to avoid hard dependency if the component is not installed
+        if ($this->herdLockFactoryResolved) {
+            return $this->herdLockFactory;
+        }
+        $this->herdLockFactoryResolved = true;
+
+        if (!class_exists('Symfony\\Component\\Lock\\LockFactory')) {
+            return null;
+        }
+
+        // Preferred path: Redis-backed store. Short-lived TTL-based locks belong
+        // in Redis — auto-expiry, no row-leak, faster than DBAL UPDATEs each
+        // refresh tick.
         try {
-            if (class_exists('Symfony\\Component\\Lock\\LockFactory')) {
-                $container = \Pimcore::getContainer();
-                if ($container && $container->has('lock.factory')) {
-                    return $container->get('lock.factory');
-                }
-                // Some apps alias the factory by class name
-                if ($container && $container->has('Symfony\\Component\\Lock\\LockFactory')) {
-                    return $container->get('Symfony\\Component\\Lock\\LockFactory');
-                }
+            $dsn = getenv('REDIS_DSN') ?: ($_ENV['REDIS_DSN'] ?? null);
+            if (is_string($dsn) && $dsn !== ''
+                && class_exists('Symfony\\Component\\Lock\\Store\\StoreFactory')) {
+                $store = \Symfony\Component\Lock\Store\StoreFactory::createStore($dsn);
+                $this->herdLockFactory = new \Symfony\Component\Lock\LockFactory($store);
+
+                return $this->herdLockFactory;
             }
         } catch (\Throwable $e) {
-            // ignore and fallback
+            Logger::warning(
+                'DataHub in-progress: Redis-backed lock factory unavailable, '
+                . 'falling back to Pimcore default: ' . $e->getMessage()
+            );
+        }
+
+        // Fallback: Pimcore's default lock factory (DBAL or whatever is wired).
+        try {
+            $container = \Pimcore::getContainer();
+            if ($container && $container->has('lock.factory')) {
+                $this->herdLockFactory = $container->get('lock.factory');
+
+                return $this->herdLockFactory;
+            }
+            if ($container && $container->has('Symfony\\Component\\Lock\\LockFactory')) {
+                $this->herdLockFactory = $container->get('Symfony\\Component\\Lock\\LockFactory');
+
+                return $this->herdLockFactory;
+            }
+        } catch (\Throwable $e) {
+            // ignore
         }
 
         return null;
@@ -486,10 +572,20 @@ class OutputCacheService
         $resource = 'datahub_inprogress:' . $this->computeGuardKey($request);
 
         try {
-            $lock = $factory->createLock($resource, $this->inProgressTtl, false);
+            // autoRelease=true so the Lock destructor releases on graceful PHP
+            // shutdown even if save() and the safety-net listener both fail to run.
+            $lock = $factory->createLock($resource, $this->inProgressTtl, true);
             if ($lock->acquire(false)) {
                 // keep reference on request for releasing in save()
                 $request->attributes->set('datahub_inprogress_lock', $lock);
+                LockSignalRefresher::arm(
+                    $lock,
+                    $this->inProgressTtl,
+                    $this->inProgressRefreshInterval,
+                    $this->lockKeyFor($this->computeGuardKey($request)),
+                    ['datahub_inprogress', $request->attributes->getString('clientname')]
+                );
+                $this->pcntlRefresherInstalled = true;
 
                 return $lock;
             }
@@ -506,6 +602,8 @@ class OutputCacheService
      */
     private function releaseAtomicLockIfAny(Request $request): void
     {
+        $this->uninstallLockRefresher();
+
         $lock = $request->attributes->get('datahub_inprogress_lock');
         if ($lock) {
             try {
@@ -517,6 +615,20 @@ class OutputCacheService
             }
             $request->attributes->remove('datahub_inprogress_lock');
         }
+    }
+
+    /**
+     * Cancel any pending SIGALRM and detach the handler. Idempotent: safe to
+     * call from every release path (save, listener, deleteInProgressLock).
+     */
+    private function uninstallLockRefresher(): void
+    {
+        if (!$this->pcntlRefresherInstalled) {
+            return;
+        }
+
+        LockSignalRefresher::disarm();
+        $this->pcntlRefresherInstalled = false;
     }
 
     private function buildInProgressResponse(): JsonResponse
