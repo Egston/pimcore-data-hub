@@ -15,6 +15,7 @@
             -->
             <file>tests/Service/PersistentOutputCacheServiceTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceBackendTest.php</file>
+            <file>tests/EventListener/InProgressLockReleaseListenerTest.php</file>
         </testsuite>
     </testsuites>
     <coverage>

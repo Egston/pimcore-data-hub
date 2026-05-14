@@ -418,7 +418,7 @@ class OutputCacheService
         \Pimcore\Cache::save(1, $key, $tags, $this->inProgressTtl, 1, true);
     }
 
-    /** Remove the in-progress marker. */
+    /** Remove the in-progress marker and clear the request attribute so the safety-net listener is a no-op. */
     private function deleteInProgressLock(Request $request): void
     {
         $guardKey = $this->computeGuardKey($request);
@@ -428,6 +428,8 @@ class OutputCacheService
             \Pimcore\Cache::remove($key);
         } catch (\Throwable $e) {
         }
+
+        $request->attributes->remove('datahub_inprogress_guard_key');
     }
 
     /** Compute a client-agnostic guard key according to configured strategy. */
