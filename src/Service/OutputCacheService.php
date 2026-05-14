@@ -185,6 +185,11 @@ class OutputCacheService
      */
     public function save(Request $request, JsonResponse $response, $extraTags = []): void
     {
+        // Release concurrency guards unconditionally — they protect against thundering herd
+        // regardless of whether the response ends up in the cache.
+        $this->deleteInProgressLock($request);
+        $this->releaseAtomicLockIfAny($request);
+
         if ($this->useCache($request)) {
             $clientname = $request->attributes->getString('clientname');
             $extraTags = array_merge(['output', 'datahub', $clientname], $extraTags);
@@ -195,10 +200,6 @@ class OutputCacheService
             $this->eventDispatcher->dispatch($event, OutputCacheEvents::PRE_SAVE);
 
             $this->saveToCache($cacheKey, $response, $extraTags);
-
-            // Clear in-progress lock once the response is stored
-            $this->deleteInProgressLock($request);
-            $this->releaseAtomicLockIfAny($request);
         }
     }
 
@@ -367,6 +368,8 @@ class OutputCacheService
             }
         } else {
             $this->saveInProgressLock($guardKey, $request);
+            // Store so the safety-net listener can delete the marker if save() never runs.
+            $request->attributes->set('datahub_inprogress_guard_key', $guardKey);
         }
 
         return null;

@@ -24,19 +24,14 @@ use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\KernelEvents;
 
 /**
- * Net catching the in-progress lock attached to a DataHub GraphQL request
- * (`datahub_inprogress_lock` attribute, set by OutputCacheService::maybeRejectOrAcquire).
+ * Safety-net that releases both the Symfony Lock and the Pimcore cache marker
+ * set by OutputCacheService::maybeRejectOrAcquire() when save() never ran —
+ * controller exception or skipOutputCache path. Without this, a failed request
+ * leaks the marker for the full inProgressTtl, turning one error into 503s for
+ * every same-operation request during that window.
  *
- * In the happy path OutputCacheService::save() releases the lock and removes the
- * attribute itself; this listener only fires when save() never ran — controller
- * exception bubbled up to Symfony's exception handler, or useCache() turned the
- * standard output cache off for this request. Without this safety net a
- * controller-throw leaks the lock for the full inProgressTtl (default 60s,
- * configurable up to 600s+), blocking every subsequent same-operation request
- * with the herd-guard 503.
- *
- * Idempotent — removing the attribute on the happy-path save() prevents a
- * double release here.
+ * Idempotent: save() removes both attributes on the happy path, so this
+ * listener exits immediately for normal requests.
  */
 class InProgressLockReleaseListener implements EventSubscriberInterface
 {
@@ -60,24 +55,47 @@ class InProgressLockReleaseListener implements EventSubscriberInterface
 
     private function releaseIfAny(\Symfony\Component\HttpFoundation\Request $request): void
     {
-        $lock = $request->attributes->get('datahub_inprogress_lock');
-        if (!$lock) {
+        $hasWork = $request->attributes->has('datahub_inprogress_lock')
+            || $request->attributes->has('datahub_inprogress_guard_key');
+
+        if (!$hasWork) {
             return;
         }
 
-        try {
-            if (method_exists($lock, 'release')) {
-                $lock->release();
-                Logger::warning(
-                    'DataHub in-progress lock released by safety-net listener — '
-                    . 'controller did not reach OutputCacheService::save(). '
-                    . 'This usually means the controller threw an unhandled '
-                    . 'exception. Check earlier log entries for the root cause.'
-                );
+        $leaked = false;
+
+        // Release Symfony Lock (present only when LockFactory is configured).
+        $lock = $request->attributes->get('datahub_inprogress_lock');
+        if ($lock) {
+            try {
+                if (method_exists($lock, 'release')) {
+                    $lock->release();
+                    $leaked = true;
+                }
+            } catch (\Throwable) {
+                // best-effort; must not break the response
             }
-        } catch (\Throwable $e) {
-            // best-effort release; logging failures must not break the response
+            $request->attributes->remove('datahub_inprogress_lock');
         }
-        $request->attributes->remove('datahub_inprogress_lock');
+
+        // Delete the Pimcore cache marker (always present when the guard ran).
+        $guardKey = $request->attributes->get('datahub_inprogress_guard_key');
+        if ($guardKey) {
+            try {
+                \Pimcore\Cache::remove('datahub_inprogress_' . $guardKey);
+                $leaked = true;
+            } catch (\Throwable) {
+                // best-effort
+            }
+            $request->attributes->remove('datahub_inprogress_guard_key');
+        }
+
+        if ($leaked) {
+            Logger::warning(
+                'DataHub in-progress guard released by safety-net listener — '
+                . 'OutputCacheService::save() did not run for this request. '
+                . 'Check earlier log entries for the root cause.'
+            );
+        }
     }
 }
