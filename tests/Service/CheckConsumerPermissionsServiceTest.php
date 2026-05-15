@@ -119,6 +119,42 @@ class CheckConsumerPermissionsServiceTest extends Unit
         $this->assertTrue($result);
     }
 
+    public function testSecurityCheckPassesForPersistentRefreshAttribute()
+    {
+        // Background SWR refresh requests carry no apikey but inherit auth via
+        // the _datahub_persistent_refresh attribute.
+        $configuration = $this->createMock(Configuration::class);
+        $configuration->method('getSecurityConfig')
+            ->willReturn([
+                'method' => Configuration::SECURITYCONFIG_AUTH_APIKEY,
+                'apikey' => self::CORRECT_API_KEY,
+            ]);
+        $request = new Request();
+        $request->attributes->set('_datahub_persistent_refresh', true);
+
+        $sut = new \Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService();
+
+        $this->assertTrue($sut->performSecurityCheck($request, $configuration));
+    }
+
+    public function testPersistentRefreshAttributeTakesPrecedenceOverWrongApiKey()
+    {
+        // The attribute bypass fires before apikey evaluation — a wrong apikey
+        // must not cause a refresh sub-request to be rejected.
+        $configuration = $this->createMock(Configuration::class);
+        $configuration->method('getSecurityConfig')
+            ->willReturn([
+                'method' => Configuration::SECURITYCONFIG_AUTH_APIKEY,
+                'apikey' => self::CORRECT_API_KEY,
+            ]);
+        $request = new Request(['apikey' => 'wrong_key']);
+        $request->attributes->set('_datahub_persistent_refresh', true);
+
+        $sut = new \Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService();
+
+        $this->assertTrue($sut->performSecurityCheck($request, $configuration));
+    }
+
     public function testSecurityCheckPrioritizesHeaderOverQueryParam()
     {
         // Arrange
