@@ -57,7 +57,7 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         };
     }
 
-    private function makeListener(array $graphqlConfig, WebserviceController $controller = null): PersistentCacheRefreshOnTerminateListener
+    private function makeListener(array $graphqlConfig, WebserviceController $controller = null, ?\Symfony\Component\Lock\LockFactory $lockFactory = null): PersistentCacheRefreshOnTerminateListener
     {
         $controller = $controller ?: $this->createMock(WebserviceController::class);
         $graphQlService = $this->createMock(GraphQLService::class);
@@ -87,7 +87,8 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
             $factory,
             $longRunningHelper,
             $responseService,
-            $container
+            $container,
+            $lockFactory
         );
     }
 
@@ -109,11 +110,14 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
             'in_progress_queries' => ['OpA'],
         ];
 
+        $lockFactory = $this->createMock(\Symfony\Component\Lock\LockFactory::class);
+        $lockFactory->expects($this->never())->method('createLock');
+
         $controller = $this->createMock(WebserviceController::class);
         $controller->expects($this->once())
             ->method('webonyxAction');
 
-        $listener = $this->makeListener($graphql, $controller);
+        $listener = $this->makeListener($graphql, $controller, $lockFactory);
 
         $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
             'query' => '{ __typename }',
@@ -124,6 +128,40 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
 
         $event = $this->makeTerminateEvent($req);
         $listener->onKernelTerminate($event);
+    }
+
+    public function testOnTerminateLockReleasedWhenControllerThrows(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => false,
+            'persistent_refresh_lock_enabled' => true,
+            'persistent_refresh_lock_ttl' => 60,
+            'in_progress_protection_enabled' => false,
+        ];
+
+        $lockStore = new \Symfony\Component\Lock\Store\InMemoryStore();
+        $lockFactory = new \Symfony\Component\Lock\LockFactory($lockStore);
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->method('webonyxAction')
+            ->willThrowException(new \RuntimeException('Controller failure'));
+
+        $listener = $this->makeListener($graphql, $controller, $lockFactory);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'Any',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+
+        // Lock must be released even when the controller throws; a second invocation must be able to acquire it.
+        $controller2 = $this->createMock(WebserviceController::class);
+        $controller2->expects($this->once())->method('webonyxAction');
+        $this->makeListener($graphql, $controller2, $lockFactory)
+            ->onKernelTerminate($this->makeTerminateEvent($req));
     }
 
     public function testOnTerminateSkipsWhenFlagNotSet(): void
@@ -199,5 +237,70 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         $listener->onKernelTerminate($event);
 
         $this->assertTrue($called, 'Controller did not invoke save path callback');
+    }
+
+    public function testOnTerminateUsesLockFactoryAndReleasesOnFinish(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => false,
+            'persistent_refresh_lock_enabled' => true,
+            'persistent_refresh_lock_ttl' => 60,
+            'in_progress_protection_enabled' => false,
+        ];
+
+        $lockStore = new \Symfony\Component\Lock\Store\InMemoryStore();
+        $lockFactory = new \Symfony\Component\Lock\LockFactory($lockStore);
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->once())->method('webonyxAction');
+
+        $listener = $this->makeListener($graphql, $controller, $lockFactory);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'Any',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+
+        // Lock must be released — a second listener invocation can re-acquire and run again.
+        $controller2 = $this->createMock(WebserviceController::class);
+        $controller2->expects($this->once())->method('webonyxAction');
+        $this->makeListener($graphql, $controller2, $lockFactory)
+            ->onKernelTerminate($this->makeTerminateEvent($req));
+    }
+
+    public function testOnTerminateBowsOutWhenLockContended(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => false,
+            'persistent_refresh_lock_enabled' => true,
+            'persistent_refresh_lock_ttl' => 60,
+            'in_progress_protection_enabled' => false,
+        ];
+
+        $lockFactory = new \Symfony\Component\Lock\LockFactory(new \Symfony\Component\Lock\Store\InMemoryStore());
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'Any',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        // Mirror PersistentCacheRefreshOnTerminateListener::buildRefreshMarkerKey for the no-attrs path.
+        $bodyHash = hash('sha256', 'client:c1' . "\n" . (string)$req->getContent());
+        $blocking = $lockFactory->createLock('datahub_persistent_refresh_lock_' . $bodyHash, 60, false);
+        $this->assertTrue($blocking->acquire(false));
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->never())->method('webonyxAction');
+
+        $this->makeListener($graphql, $controller, $lockFactory)
+            ->onKernelTerminate($this->makeTerminateEvent($req));
+
+        $blocking->release();
     }
 }

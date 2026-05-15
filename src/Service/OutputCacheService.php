@@ -23,6 +23,7 @@ use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
+use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
@@ -75,26 +76,6 @@ class OutputCacheService
      * from running pcntl calls when nothing was ever installed.
      */
     private $pcntlRefresherInstalled = false;
-
-    /**
-     * Per-worker SIGALRM refresher state. Kept as class statics (not closure
-     * captures) so external callers — notably InProgressLockReleaseListener
-     * on the kernel.exception / kernel.terminate path — can clear it without
-     * needing service injection. Capturing the Lock inside a closure would
-     * also keep the object alive past request boundaries, defeating the
-     * Lock destructor's autoRelease.
-     *
-     * @var object|null Symfony Lock currently being refreshed
-     */
-    private static $activeLock = null;
-
-    private static ?string $activeMarkerKey = null;
-
-    private static array $activeMarkerTags = [];
-
-    private static int $activeTtl = 0;
-
-    private static int $activeInterval = 0;
 
     /**
      * Cached Redis-backed LockFactory built lazily from REDIS_DSN. Kept on
@@ -597,11 +578,14 @@ class OutputCacheService
             if ($lock->acquire(false)) {
                 // keep reference on request for releasing in save()
                 $request->attributes->set('datahub_inprogress_lock', $lock);
-                $this->installLockRefresher(
+                LockSignalRefresher::arm(
                     $lock,
-                    $this->computeGuardKey($request),
-                    $request->attributes->getString('clientname')
+                    $this->inProgressTtl,
+                    $this->inProgressRefreshInterval,
+                    $this->lockKeyFor($this->computeGuardKey($request)),
+                    ['datahub_inprogress', $request->attributes->getString('clientname')]
                 );
+                $this->pcntlRefresherInstalled = true;
 
                 return $lock;
             }
@@ -634,155 +618,6 @@ class OutputCacheService
     }
 
     /**
-     * Arm a SIGALRM handler that periodically refreshes the Symfony Lock TTL
-     * and the Pimcore cache marker. Requires the pcntl extension; silently
-     * no-ops if pcntl is unavailable or refresh is disabled. Async-signals are
-     * used so the handler fires between PHP opcodes without per-tick overhead.
-     *
-     * @param object $lock        Symfony Lock object that exposes refresh($ttl)
-     * @param string $guardKey    pre-computed guard key for the Pimcore marker
-     * @param string $clientname  used as a cache tag on marker re-save
-     */
-    private function installLockRefresher($lock, string $guardKey, string $clientname): void
-    {
-        if ($this->inProgressRefreshInterval < 1) {
-            return;
-        }
-        if (!function_exists('pcntl_async_signals')
-            || !function_exists('pcntl_alarm')
-            || !function_exists('pcntl_signal')
-            || !defined('SIGALRM')) {
-            return;
-        }
-
-        try {
-            self::$activeLock = $lock;
-            self::$activeMarkerKey = $this->lockKeyFor($guardKey);
-            self::$activeMarkerTags = ['datahub_inprogress', $clientname];
-            self::$activeTtl = $this->inProgressTtl;
-            self::$activeInterval = $this->inProgressRefreshInterval;
-
-            pcntl_async_signals(true);
-            pcntl_signal(SIGALRM, [self::class, 'handleRefreshSignal']);
-            pcntl_alarm($this->inProgressRefreshInterval);
-
-            $this->pcntlRefresherInstalled = true;
-
-            Logger::debug(sprintf(
-                'In-progress: refresher armed (pid=%d, guardKey=%s, ttl=%ds, interval=%ds)',
-                function_exists('getmypid') ? (int) getmypid() : -1,
-                $guardKey,
-                $this->inProgressTtl,
-                $this->inProgressRefreshInterval
-            ));
-        } catch (\Throwable $e) {
-            // Never let refresher setup break the request flow
-            self::clearRefresherState();
-            $this->pcntlRefresherInstalled = false;
-        }
-    }
-
-    /**
-     * SIGALRM handler. Refreshes the Lock TTL + Pimcore marker if the Lock is
-     * still acquired. Self-clears + stops re-arming the alarm once the Lock
-     * has been released externally (save(), listener, destructor), so a
-     * post-release race can't keep zombie-refreshing forever.
-     *
-     * Called via pcntl_signal callable [self::class, __FUNCTION__], so it has
-     * no captured state and reads everything from class statics. This is what
-     * makes external clearing (listener) effective.
-     *
-     * @internal pcntl_signal handler; not for direct invocation.
-     */
-    public static function handleRefreshSignal(): void
-    {
-        $lock = self::$activeLock;
-        if ($lock === null) {
-            return;
-        }
-
-        $pid = function_exists('getmypid') ? (int) getmypid() : -1;
-
-        try {
-            // If the Lock has been released externally (listener, destructor,
-            // explicit save()), stop refreshing immediately. isAcquired() goes
-            // through the store and reflects current Redis state.
-            if (method_exists($lock, 'isAcquired') && !$lock->isAcquired()) {
-                Logger::debug(sprintf(
-                    'In-progress: refresher self-clear (pid=%d, lock no longer acquired)',
-                    $pid
-                ));
-                self::clearRefresherState();
-
-                return;
-            }
-
-            if (method_exists($lock, 'refresh')) {
-                $lock->refresh(self::$activeTtl);
-            }
-            if (self::$activeMarkerKey !== null) {
-                \Pimcore\Cache::save(
-                    1,
-                    self::$activeMarkerKey,
-                    self::$activeMarkerTags,
-                    self::$activeTtl,
-                    1,
-                    true
-                );
-            }
-            Logger::debug(sprintf(
-                'In-progress: refresh tick (pid=%d, marker=%s)',
-                $pid,
-                self::$activeMarkerKey ?? '?'
-            ));
-        } catch (\Throwable $e) {
-            // best-effort; a missed refresh just shrinks the safety margin.
-            // Re-arm anyway — the next tick might succeed.
-        }
-
-        if (self::$activeInterval > 0 && function_exists('pcntl_alarm')) {
-            pcntl_alarm(self::$activeInterval);
-        }
-    }
-
-    /**
-     * Drop all per-request refresher state and stop the alarm. Public so the
-     * safety-net listener can clear without needing OutputCacheService
-     * injected. Idempotent — safe to call from any release path or before any
-     * acquire ever ran.
-     */
-    public static function clearRefresherState(): void
-    {
-        $wasArmed = self::$activeLock !== null;
-
-        self::$activeLock = null;
-        self::$activeMarkerKey = null;
-        self::$activeMarkerTags = [];
-        self::$activeTtl = 0;
-        self::$activeInterval = 0;
-
-        if (function_exists('pcntl_alarm')) {
-            try {
-                pcntl_alarm(0);
-            } catch (\Throwable $e) {
-            }
-        }
-        if (function_exists('pcntl_signal') && defined('SIGALRM')) {
-            try {
-                pcntl_signal(SIGALRM, SIG_IGN);
-            } catch (\Throwable $e) {
-            }
-        }
-
-        if ($wasArmed) {
-            Logger::debug(sprintf(
-                'In-progress: refresher cleared (pid=%d)',
-                function_exists('getmypid') ? (int) getmypid() : -1
-            ));
-        }
-    }
-
-    /**
      * Cancel any pending SIGALRM and detach the handler. Idempotent: safe to
      * call from every release path (save, listener, deleteInProgressLock).
      */
@@ -792,7 +627,7 @@ class OutputCacheService
             return;
         }
 
-        self::clearRefresherState();
+        LockSignalRefresher::disarm();
         $this->pcntlRefresherInstalled = false;
     }
 
