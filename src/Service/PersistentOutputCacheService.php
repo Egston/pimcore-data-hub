@@ -219,6 +219,23 @@ class PersistentOutputCacheService
         $this->cacheSave(self::KEY_LAST_INVALIDATION, $ts, [self::TAG_WATERMARK], null);
     }
 
+    /**
+     * Drop every persistent-cache entry for this bundle (payloads, meta,
+     * indices, per-op/per-client tag indices), bypassing the SWR flow.
+     *
+     * The `TAG_WATERMARK`-tagged `KEY_LAST_INVALIDATION` entry is preserved —
+     * clearing it would make every freshly-written entry look FRESH again
+     * until the next external invalidation, which defeats the whole point.
+     *
+     * Use this when `markOutputInvalidated()` is not enough — e.g. when the
+     * SWR refresh path itself is broken or when errors-only payloads must be
+     * evicted immediately.
+     */
+    public function clearAll(): bool
+    {
+        return $this->cacheClearTag(self::TAG_COMMON);
+    }
+
     /** Persist a fresh response for the given request. */
     public function savePersistent(Request $request, JsonResponse $response): void
     {
@@ -229,11 +246,13 @@ class PersistentOutputCacheService
         // Refuse to persist transient infrastructure failures (non-2xx, empty
         // body) — caching those for payloadTtl seconds turns a momentary DB or
         // herd-guard hiccup into a persistent outage. GraphQL-level errors
-        // (`{errors: [...]}` in a 200 body) are deterministic against the
-        // input — re-running the same query produces the same errors — so
-        // caching them is stabilizing, not poisoning. Mirrors the standard
-        // OutputCacheService::save(), which has cached GraphQL-error payloads
-        // unconditionally for years.
+        // co-existing with non-empty `data` (partial success) are still cached:
+        // the data is useful and the errors are deterministic against the
+        // input. Errors-only responses (no `data`, null `data`, or empty `data`)
+        // are NOT cached — they typically come from a transient broken-schema
+        // state (orphan class references during deploy, a misconfigured
+        // workspace, etc.) and persisting them outlasts the broken window so
+        // clients see stale errors even after the upstream is fixed.
         $status = $response->getStatusCode();
         if ($status < 200 || $status >= 300) {
             Logger::warning(sprintf(
@@ -250,10 +269,23 @@ class PersistentOutputCacheService
 
             return;
         }
-        if (!empty($payload['errors'])) {
+        $hasErrors = !empty($payload['errors']);
+        $data = $payload['data'] ?? null;
+        $hasNonEmptyDataArray = \is_array($data) && $data !== [];
+        if ($hasErrors && !$hasNonEmptyDataArray) {
             $messages = array_column((array)$payload['errors'], 'message');
-            Logger::error(sprintf(
-                'DataHub persistent cache: caching response with GraphQL errors (client=%s, errors=%s) — schema or data may need cleanup',
+            Logger::warning(sprintf(
+                'DataHub persistent cache: refusing to save errors-only response (client=%s, errors=%s)',
+                (string)$request->attributes->get('clientname'),
+                json_encode($messages)
+            ));
+
+            return;
+        }
+        if ($hasErrors) {
+            $messages = array_column((array)$payload['errors'], 'message');
+            Logger::warning(sprintf(
+                'DataHub persistent cache: caching response with non-empty data array and errors (client=%s, errors=%s)',
                 (string)$request->attributes->get('clientname'),
                 json_encode($messages)
             ));
@@ -380,6 +412,11 @@ class PersistentOutputCacheService
     protected function cacheSave(string $key, $value, array $tags, ?int $ttl): void
     {
         \Pimcore\Cache::save($value, $key, $tags, $ttl, 1, true);
+    }
+
+    protected function cacheClearTag(string $tag): bool
+    {
+        return \Pimcore\Cache::clearTag($tag);
     }
 
     private function keyPayload(string $clientname, string $canonical): string
