@@ -18,6 +18,7 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\DataHubBundle\Command;
 
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Logger;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -53,10 +54,32 @@ HELP);
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $ok = $this->persistent->clearAll();
+        try {
+            $ok = $this->persistent->clearAll();
+        } catch (\Throwable $e) {
+            Logger::error(sprintf(
+                'DataHub persistent cache: exception clearing tag %s: %s',
+                PersistentOutputCacheService::TAG_COMMON,
+                $e->getMessage()
+            ));
+            $output->writeln(sprintf(
+                '<error>Failed to clear persistent-cache tag %s: %s</error>',
+                PersistentOutputCacheService::TAG_COMMON,
+                $e->getMessage()
+            ));
+
+            return Command::FAILURE;
+        }
 
         if (!$ok) {
-            $output->writeln('<error>Cache backend reported failure clearing the persistent-cache tag.</error>');
+            Logger::error(sprintf(
+                'DataHub persistent cache: backend reported failure clearing tag %s',
+                PersistentOutputCacheService::TAG_COMMON
+            ));
+            $output->writeln(sprintf(
+                '<error>Cache backend reported failure clearing tag %s.</error>',
+                PersistentOutputCacheService::TAG_COMMON
+            ));
 
             return Command::FAILURE;
         }

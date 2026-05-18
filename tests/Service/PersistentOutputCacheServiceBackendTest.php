@@ -300,7 +300,7 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
         $svc->markOutputInvalidated(123456789);
         $this->assertSame('HIT', $svc->probeStatus($req)['status'], 'precondition: entry is cached');
 
-        $svc->clearAll();
+        $this->assertTrue($svc->clearAll(), 'clearAll must return true on success');
 
         $this->assertSame('MISS', $svc->probeStatus($req)['status'], 'payload should be evicted after clearAll');
         $watermarkItem = $svc->pool->getItem(PersistentOutputCacheService::KEY_LAST_INVALIDATION);

@@ -13,6 +13,7 @@
               bundle's separate codeception suites in CI with a full Pimcore
               install. See tests/_bootstrap.php and tests/Service.suite.dist.yml.
             -->
+            <file>tests/Command/PersistentCacheClearCommandTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceBackendTest.php</file>
             <file>tests/EventListener/InProgressLockReleaseListenerTest.php</file>
