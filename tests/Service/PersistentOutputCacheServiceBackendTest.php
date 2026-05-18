@@ -219,20 +219,37 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
     }
 
     /**
-     * R1.1 — savePersistent caches `errors`-bearing 200 responses so a
-     * deterministic schema/query error doesn't trigger a herd-guard storm
-     * on every retry. Transient infra failures are still refused via the
-     * non-2xx guard above (R1 testSavePersistentRefusesNon2xx). Mirrors
-     * the standard OutputCacheService::save(), which has unconditionally
-     * cached error-bearing 200 responses for years.
+     * Errors-only 200 responses (no `data`, null `data`, empty `data`) are NOT
+     * cached — they typically come from a transient broken-schema window and
+     * persisting them outlasts the recovery. Partial-success responses (non-empty
+     * `data` AND `errors`) are still cached — see
+     * `testSavePersistentCachesPartialSuccessWithErrors`.
      */
-    public function testSavePersistentCachesErroredGraphqlPayload(): void
+    public function testSavePersistentRefusesErrorsOnlyPayload(): void
     {
         $svc = $this->makeService();
         $req = $this->makeRequest('c1', 'Op');
 
         $svc->savePersistent($req, new JsonResponse([
             'errors' => [['message' => 'type definition ResourceLibraryTag not found']],
+        ]));
+
+        $this->assertSame('MISS', $svc->probeStatus($req)['status']);
+    }
+
+    /**
+     * Partial-success responses (`data` non-empty AND `errors` present) are still
+     * cached: the errors are deterministic against the input and refusing them
+     * would create a herd-guard storm on every retry.
+     */
+    public function testSavePersistentCachesPartialSuccessWithErrors(): void
+    {
+        $svc = $this->makeService();
+        $req = $this->makeRequest('c1', 'Op');
+
+        $svc->savePersistent($req, new JsonResponse([
+            'data' => ['someField' => 'value', 'failingField' => null],
+            'errors' => [['message' => 'failingField could not be resolved']],
         ]));
 
         $this->assertSame('HIT', $svc->probeStatus($req)['status']);
@@ -264,6 +281,31 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
         $this->assertIsInt($wm);
         $this->assertGreaterThan(0, $wm);
         $this->assertGreaterThanOrEqual(time() - 5, $wm);
+    }
+
+    /**
+     * clearAll() evicts every payload, meta, and index entry tagged with
+     * TAG_COMMON but leaves the watermark entry (KEY_LAST_INVALIDATION,
+     * tagged with TAG_WATERMARK) intact — clearing the watermark would
+     * make every freshly-written entry look FRESH again until the next
+     * external invalidation event.
+     */
+    public function testClearAllEvictsEntriesAndPreservesWatermark(): void
+    {
+        $svc = $this->makeService();
+        $req = $this->makeRequest('c1', 'Op');
+
+        // Seed: one cached payload + a watermark.
+        $svc->savePersistent($req, new JsonResponse(['data' => ['ok' => true]]));
+        $svc->markOutputInvalidated(123456789);
+        $this->assertSame('HIT', $svc->probeStatus($req)['status'], 'precondition: entry is cached');
+
+        $svc->clearAll();
+
+        $this->assertSame('MISS', $svc->probeStatus($req)['status'], 'payload should be evicted after clearAll');
+        $watermarkItem = $svc->pool->getItem(PersistentOutputCacheService::KEY_LAST_INVALIDATION);
+        $this->assertTrue($watermarkItem->isHit(), 'watermark must survive clearAll');
+        $this->assertSame(123456789, $watermarkItem->get(), 'watermark value must be unchanged');
     }
 }
 
@@ -298,5 +340,10 @@ final class ArrayBackedPersistentOutputCacheService extends PersistentOutputCach
         $item->expiresAfter($ttl);
         $item->tag($tags);
         $this->pool->save($item);
+    }
+
+    protected function cacheClearTag(string $tag): bool
+    {
+        return $this->pool->invalidateTags([$tag]);
     }
 }
