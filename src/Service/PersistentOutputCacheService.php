@@ -644,12 +644,37 @@ class PersistentOutputCacheService
 
     private function keyPayload(string $clientname, string $canonical): string
     {
-        return self::PAYLOAD_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+        return self::keyPayloadFor($clientname, $canonical);
     }
 
     private function keyMeta(string $clientname, string $canonical): string
     {
+        return self::keyMetaFor($clientname, $canonical);
+    }
+
+    public static function keyPayloadFor(string $clientname, string $canonical): string
+    {
+        return self::PAYLOAD_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+    }
+
+    public static function keyMetaFor(string $clientname, string $canonical): string
+    {
         return self::META_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+    }
+
+    /**
+     * SWR-refresh-lock resource shape for the per-query-hash space, computed
+     * from the raw request inputs the message handler observes. Byte-equal to
+     * the listener's legacy `buildRefreshMarkerKey` shape when meta+payload
+     * sidecar attributes are present — that is the contract.
+     */
+    public static function computeSwrRefreshLockKey(string $client, string $bodyJson): string
+    {
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $metaKey = self::keyMetaFor($client, $canonical);
+        $payloadKey = self::keyPayloadFor($client, $canonical);
+
+        return 'datahub_persistent_refresh_lock_' . md5($metaKey . '|' . $payloadKey);
     }
 
     private function clientAndCanonical(Request $request): array
@@ -667,32 +692,40 @@ class PersistentOutputCacheService
             return $cached;
         }
 
-        $payload = json_decode($request->getContent(), true);
-        if (!is_array($payload)) {
-            $payload = [];
-        }
-
-        if (!empty($payload['query']) && is_string($payload['query'])) {
-            $payload['query'] = $this->normalizeQueryAst($payload['query']);
-        }
-
-        $payload = $this->ksortRecursive($payload);
-
-        $canonical = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
-        );
-
-        if (!is_string($canonical)) {
-            $canonical = '{}';
-        }
+        $canonical = self::canonicalizePayloadString((string)$request->getContent());
 
         $request->attributes->set('_datahub_persistent_canonical', $canonical);
 
         return $canonical;
     }
 
-    private function normalizeQueryAst(string $query): string
+    /**
+     * Stateless canonicalization used by both the per-request memoised path
+     * and the static SWR-refresh-lock-key helper consumed by the queue
+     * handler (which has no Request to memoise against).
+     */
+    public static function canonicalizePayloadString(string $body): string
+    {
+        $payload = json_decode($body, true);
+        if (!is_array($payload)) {
+            $payload = [];
+        }
+
+        if (!empty($payload['query']) && is_string($payload['query'])) {
+            $payload['query'] = self::normalizeQueryAstStatic($payload['query']);
+        }
+
+        $payload = self::ksortRecursiveStatic($payload);
+
+        $canonical = json_encode(
+            $payload,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
+        );
+
+        return is_string($canonical) ? $canonical : '{}';
+    }
+
+    private static function normalizeQueryAstStatic(string $query): string
     {
         try {
             /** @var DocumentNode $ast */
@@ -704,7 +737,12 @@ class PersistentOutputCacheService
         }
     }
 
-    private function ksortRecursive(array $value): array
+    /**
+     * @param array<mixed> $value
+     *
+     * @return array<mixed>
+     */
+    private static function ksortRecursiveStatic(array $value): array
     {
         $isAssoc = static function (array $a): bool {
             $i = 0;
@@ -723,7 +761,7 @@ class PersistentOutputCacheService
 
         foreach ($value as $k => $v) {
             if (is_array($v)) {
-                $value[$k] = $this->ksortRecursive($v);
+                $value[$k] = self::ksortRecursiveStatic($v);
             }
         }
 

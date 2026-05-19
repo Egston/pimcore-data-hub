@@ -15,11 +15,13 @@ declare(strict_types=1);
  *  @license    http://www.pimcore.org/license     GPLv3 and PCL
  */
 
-namespace Pimcore\Bundle\DataHubBundle\EventListener;
+namespace Pimcore\Bundle\DataHubBundle\Tests\EventListener;
 
 use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
+use Pimcore\Bundle\DataHubBundle\EventListener\PersistentCacheRefreshOnTerminateListener;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
+use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
@@ -30,12 +32,14 @@ use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\KernelEvents;
+use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\MessageBusInterface;
 
 final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
 {
     private function makeFakeController(callable $callback): WebserviceController
     {
-        // Build a lightweight subclass that calls the provided callback instead of full controller logic
+        // Lightweight subclass that calls the provided callback instead of full controller logic.
         return new class($callback) extends WebserviceController {
             public function __construct(private $cb)
             {
@@ -49,7 +53,6 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
                 \Pimcore\Helper\LongRunningHelper $longRunningHelper,
                 \Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface $responseService
             ) {
-                // Simulate a freshly computed response and call provided callback (e.g., asserting a save)
                 $response = new \Symfony\Component\HttpFoundation\JsonResponse(['ok' => true]);
                 ($this->cb)($request, $response);
 
@@ -58,13 +61,24 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         };
     }
 
-    private function makeListener(array $graphqlConfig, WebserviceController $controller = null, ?\Symfony\Component\Lock\LockFactory $lockFactory = null): PersistentCacheRefreshOnTerminateListener
-    {
+    /**
+     * @param array<string, mixed> $graphqlConfig
+     */
+    private function makeListener(
+        array $graphqlConfig,
+        ?WebserviceController $controller = null,
+        ?\Symfony\Component\Lock\LockFactory $lockFactory = null,
+        ?MessageBusInterface $bus = null
+    ): PersistentCacheRefreshOnTerminateListener {
         $controller = $controller ?: $this->createMock(WebserviceController::class);
         $graphQlService = $this->createMock(GraphQLService::class);
         $localeService = $this->createMock(LocaleServiceInterface::class);
-        $factory = $this->createMock(Factory::class);
-        $longRunningHelper = $this->createMock(LongRunningHelper::class);
+        // Pimcore\Model\Factory + LongRunningHelper are `final`; PHPUnit's mock
+        // engine cannot double them. They're passed straight to the mocked
+        // controller and never observed, so a no-arg constructorless instance
+        // is sufficient for the unit-test surface.
+        $factory = (new \ReflectionClass(Factory::class))->newInstanceWithoutConstructor();
+        $longRunningHelper = (new \ReflectionClass(LongRunningHelper::class))->newInstanceWithoutConstructor();
         $responseService = new class implements ResponseServiceInterface {
             public function removeCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void
             {
@@ -89,7 +103,8 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
             $longRunningHelper,
             $responseService,
             $container,
-            $lockFactory
+            $lockFactory,
+            $bus
         );
     }
 
@@ -202,8 +217,8 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
     {
         $graphql = [
             'persistent_refresh_queue_enabled' => false,
-            'persistent_refresh_lock_enabled' => false, // avoid relying on Pimcore\Cache in test
-            'in_progress_protection_enabled' => false,  // non-guarded path
+            'persistent_refresh_lock_enabled' => false,
+            'in_progress_protection_enabled' => false,
         ];
 
         $controller = $this->createMock(WebserviceController::class);
@@ -231,7 +246,6 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
 
         $called = false;
         $fakeController = $this->makeFakeController(function (Request $req, \Symfony\Component\HttpFoundation\JsonResponse $res) use (&$called) {
-            // In a real controller, PersistentOutputCacheService::postHandle would be called here
             $called = true;
         });
 
@@ -301,7 +315,6 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         $req->attributes->set('clientname', 'c1');
         $req->attributes->set('_datahub_persistent_refresh', true);
 
-        // Mirror PersistentCacheRefreshOnTerminateListener::buildRefreshMarkerKey for the no-attrs path.
         $bodyHash = hash('sha256', 'client:c1' . "\n" . (string)$req->getContent());
         $blocking = $lockFactory->createLock('datahub_persistent_refresh_lock_' . $bodyHash, 60, false);
         $this->assertTrue($blocking->acquire(false));
@@ -313,5 +326,249 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
             ->onKernelTerminate($this->makeTerminateEvent($req));
 
         $blocking->release();
+    }
+
+    public function testOnTerminateDispatchesToBusWhenQueueEnabled(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => true,
+            'persistent_enqueue_dedupe_ttl' => 60,
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects($this->once())
+            ->method('dispatch')
+            ->willReturnCallback(function (object $msg) use (&$dispatched) {
+                $dispatched[] = $msg;
+
+                return new Envelope($msg);
+            });
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->never())->method('webonyxAction');
+
+        // The dedupe sentinel goes through \Pimcore\Cache, which raises without
+        // a booted kernel; the listener swallows that and bows out silently.
+        // Use the test-seam subclass so cacheLoad returns null and the dispatch
+        // path runs to completion.
+        $listener = $this->makeDedupeListener($graphql, $controller, $bus);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'OpQueue',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+
+        self::assertCount(1, $dispatched);
+        self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
+        self::assertSame('OpQueue', $dispatched[0]->operationName);
+        self::assertSame('c1', $dispatched[0]->client);
+    }
+
+    public function testOnTerminateDispatchEnqueueDedupesWithinTtl(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => true,
+            'persistent_enqueue_dedupe_ttl' => 60,
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->never())->method('webonyxAction');
+
+        // In-memory cache seam: overrides the protected cacheLoad/cacheSave so
+        // the dedupe sentinel persists between invocations under unit-test
+        // bootstrap (no Pimcore container, so the real static facade is a no-op).
+        $listener = $this->makeDedupeListener($graphql, $controller, $bus);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'OpDedupe',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+
+        self::assertCount(1, $dispatched);
+        self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
+        self::assertSame('OpDedupe', $dispatched[0]->operationName);
+    }
+
+    public function testOnTerminateBusThrowDoesNotFallThroughToInline(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => true,
+            'persistent_enqueue_dedupe_ttl' => 60,
+        ];
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willThrowException(new \RuntimeException('transport down'));
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->never())->method('webonyxAction');
+
+        $listener = $this->makeDedupeListener($graphql, $controller, $bus);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'OpBusThrow',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+    }
+
+    public function testOnTerminateQueueEnabledWithoutBusDoesNotFallThroughToInline(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => true,
+            'persistent_enqueue_dedupe_ttl' => 60,
+        ];
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->never())->method('webonyxAction');
+
+        // $bus = null: queue enabled but no Messenger bus wired
+        $listener = $this->makeListener($graphql, $controller, null, null);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'OpNoBus',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+    }
+
+    public function testEnqueueDedupePassesPositiveTtlToCache(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => true,
+            'persistent_enqueue_dedupe_ttl' => 45,
+        ];
+
+        $savedTtls = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) {
+            return new Envelope($msg);
+        });
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->never())->method('webonyxAction');
+
+        $graphQlService = $this->createMock(GraphQLService::class);
+        $localeService = $this->createMock(LocaleServiceInterface::class);
+        $factory = (new \ReflectionClass(Factory::class))->newInstanceWithoutConstructor();
+        $longRunningHelper = (new \ReflectionClass(LongRunningHelper::class))->newInstanceWithoutConstructor();
+        $responseService = new class implements ResponseServiceInterface {
+            public function removeCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void
+            {
+            }
+
+            public function addCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void
+            {
+            }
+
+            public function addHitMissHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response, bool $isCacheHit): void
+            {
+            }
+        };
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn(['graphql' => $graphql]);
+
+        $listener = new class($controller, $graphQlService, $localeService, $factory, $longRunningHelper, $responseService, $container, null, $bus) extends PersistentCacheRefreshOnTerminateListener {
+            /** @var array<string, mixed> */
+            private array $store = [];
+
+            /** @var int[] */
+            public array $recordedTtls = [];
+
+            protected function cacheLoad(string $key)
+            {
+                return $this->store[$key] ?? null;
+            }
+
+            protected function cacheSave($value, string $key, array $tags, int $ttl): void
+            {
+                $this->recordedTtls[] = $ttl;
+                $this->store[$key] = $value;
+            }
+        };
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'OpTtlCheck',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+
+        self::assertCount(1, $listener->recordedTtls, 'cacheSave must be called once for the dedupe sentinel');
+        self::assertGreaterThan(0, $listener->recordedTtls[0], 'dedupe sentinel TTL must be > 0');
+        self::assertSame(45, $listener->recordedTtls[0], 'dedupe sentinel TTL must equal persistent_enqueue_dedupe_ttl');
+    }
+
+    /**
+     * @param array<string, mixed> $graphqlConfig
+     */
+    private function makeDedupeListener(
+        array $graphqlConfig,
+        WebserviceController $controller,
+        MessageBusInterface $bus
+    ): PersistentCacheRefreshOnTerminateListener {
+        $graphQlService = $this->createMock(GraphQLService::class);
+        $localeService = $this->createMock(LocaleServiceInterface::class);
+        // Pimcore\Model\Factory + LongRunningHelper are `final`; PHPUnit's mock
+        // engine cannot double them. They're passed straight to the mocked
+        // controller and never observed, so a no-arg constructorless instance
+        // is sufficient for the unit-test surface.
+        $factory = (new \ReflectionClass(Factory::class))->newInstanceWithoutConstructor();
+        $longRunningHelper = (new \ReflectionClass(LongRunningHelper::class))->newInstanceWithoutConstructor();
+        $responseService = new class implements ResponseServiceInterface {
+            public function removeCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void
+            {
+            }
+
+            public function addCorsHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response): void
+            {
+            }
+
+            public function addHitMissHeaders(\Symfony\Component\HttpFoundation\JsonResponse $response, bool $isCacheHit): void
+            {
+            }
+        };
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn(['graphql' => $graphqlConfig]);
+
+        return new class($controller, $graphQlService, $localeService, $factory, $longRunningHelper, $responseService, $container, null, $bus) extends PersistentCacheRefreshOnTerminateListener {
+            /** @var array<string, mixed> */
+            private array $store = [];
+
+            protected function cacheLoad(string $key)
+            {
+                return $this->store[$key] ?? null;
+            }
+
+            protected function cacheSave($value, string $key, array $tags, int $ttl): void
+            {
+                $this->store[$key] = $value;
+            }
+        };
     }
 }

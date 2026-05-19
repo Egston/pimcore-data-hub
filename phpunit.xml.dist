@@ -27,7 +27,9 @@
             <file>tests/EventListener/ObjectLoadListenerTest.php</file>
             <file>tests/EventListener/DependencyCollectorResetListenerTest.php</file>
             <file>tests/EventListener/PersistentCacheInvalidationListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerTest.php</file>
             <file>tests/Lock/LockSignalRefresherTest.php</file>
+            <file>tests/MessageHandler/PersistentRefreshMessageHandlerTest.php</file>
             <file>tests/DependencyInjection/ConfigurationTest.php</file>
             <file>tests/Functional/CoverageProbeTest.php</file>
         </testsuite>

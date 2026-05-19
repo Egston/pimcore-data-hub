@@ -26,6 +26,10 @@ services:
         autowire: true
         autoconfigure: true
 
+    Pimcore\Bundle\DataHubBundle\MessageHandler\:
+        resource: '../../MessageHandler'
+        public: false
+
     Pimcore\Bundle\DataHubBundle\Installer:
         public: true
         arguments:
