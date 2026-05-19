@@ -86,6 +86,11 @@ class OperationClassifier
         return isset($this->tiers[$operationName]);
     }
 
+    public function hasAnyOperations(): bool
+    {
+        return $this->priorityWeights !== [];
+    }
+
     public function getTier(string $operationName): Tier
     {
         return $this->tiers[$operationName] ?? Tier::NEITHER;

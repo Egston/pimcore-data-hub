@@ -451,6 +451,19 @@ class OutputCacheServiceTest extends TestCase
         );
     }
 
+    public function testComputeOperationLockKeyMatchesAtomicLockResourceShape(): void
+    {
+        // The lock resource for an operation-strategy HERD_GUARDED query MUST
+        // be byte-equal in the controller (acquireAtomicLock) and in the queue
+        // handler (PersistentRefreshMessageHandler). The controller builds
+        // 'datahub_inprogress:' . md5('op_' . $operationName); this assertion
+        // pins that contract against the helper so drift is caught immediately.
+        self::assertSame(
+            'datahub_inprogress:' . md5('op_GetSomething'),
+            OutputCacheService::computeOperationLockKey('GetSomething'),
+        );
+    }
+
     public function testProbeStatusDisabledHitMiss()
     {
         // disabled

@@ -27,7 +27,14 @@
             <file>tests/EventListener/ObjectLoadListenerTest.php</file>
             <file>tests/EventListener/DependencyCollectorResetListenerTest.php</file>
             <file>tests/EventListener/PersistentCacheInvalidationListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerPriorityTest.php</file>
             <file>tests/Lock/LockSignalRefresherTest.php</file>
+            <file>tests/MessageHandler/PersistentRefreshMessageHandlerTest.php</file>
+            <file>tests/Messenger/PriorityRedisTransportFactoryTest.php</file>
+            <file>tests/Messenger/PriorityRedisTransportTest.php</file>
+            <file>tests/Messenger/PriorityRedisTransportScoreTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServicePriorityTest.php</file>
             <file>tests/DependencyInjection/ConfigurationTest.php</file>
             <file>tests/Functional/CoverageProbeTest.php</file>
         </testsuite>

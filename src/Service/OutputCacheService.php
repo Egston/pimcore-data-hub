@@ -444,6 +444,22 @@ class OutputCacheService
         return 'datahub_inprogress_' . $guardKey;
     }
 
+    /**
+     * Lock resource string for the operationName-keyed herd-guard atomic lock
+     * space (Symfony Lock, not Pimcore Cache).
+     *
+     * The refresh queue handler ({@see \Pimcore\Bundle\DataHubBundle\MessageHandler\PersistentRefreshMessageHandler})
+     * MUST acquire on this exact resource string to serialise per-op refreshes
+     * against the controller's {@see acquireAtomicLock()} call. Note the `:`
+     * separator — the `_` separator belongs to the cache-marker space used by
+     * {@see lockKeyFor()}, which is a separate subsystem (Pimcore Cache markers,
+     * not Symfony Lock resources).
+     */
+    public static function computeOperationLockKey(string $operationName): string
+    {
+        return 'datahub_inprogress:' . md5('op_' . $operationName);
+    }
+
     /** Check if in-progress marker is present. */
     private function inProgressLockExists(string $guardKey): bool
     {
@@ -507,7 +523,17 @@ class OutputCacheService
             return null;
         }
 
-        $resource = 'datahub_inprogress:' . $this->computeGuardKey($request);
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = ($this->inProgressKeyStrategy === 'operation' && !empty($input['operationName']))
+            ? $input['operationName']
+            : '';
+
+        if ($operationName !== '') {
+            $resource = self::computeOperationLockKey($operationName);
+        } else {
+            $canonical = $this->canonicalizePayloadForCache($request);
+            $resource = 'datahub_inprogress:' . hash('sha256', 'req:' . $canonical);
+        }
 
         try {
             // autoRelease=true so the Lock destructor releases on graceful PHP
