@@ -29,4 +29,16 @@ enum Tier: string
     case HERD_GUARDED = 'herd_guarded';
     case SWR_ONLY = 'swr_only';
     case NEITHER = 'neither';
+
+    /**
+     * Whether this tier engages the herd-guard duplicate-request barrier.
+     * Colocated here so adding a new case forces an explicit answer at definition time.
+     */
+    public function engagesHerdGuard(): bool
+    {
+        return match ($this) {
+            self::HERD_GUARDED => true,
+            self::SWR_ONLY, self::NEITHER => false,
+        };
+    }
 }

@@ -82,10 +82,6 @@ class PersistentOutputCacheService
 
     private int $ttl; // seconds
 
-    private bool $guardOnly = true;
-
-    private array $guardOperations = [];
-
     private int $payloadTtl = 86400;
 
     private ?OperationClassifier $operationClassifier;
@@ -113,10 +109,6 @@ class PersistentOutputCacheService
             $ttl = $graphql['output_cache_lifetime'] ?? 30;
         }
         $this->ttl = max(1, (int)$ttl);
-        $this->guardOnly = (bool)($graphql['persistent_output_cache_guard_only'] ?? true);
-        $this->guardOperations = array_values(array_filter((array)($graphql['in_progress_queries'] ?? []), static function ($v) {
-            return is_string($v) && $v !== '';
-        }));
         $this->payloadTtl = max(1, (int)($graphql['persistent_output_cache_payload_ttl'] ?? 86400));
         $this->operationClassifier = $operationClassifier;
         $this->lockFactoryResolver = $lockFactoryResolver ?? new LockFactoryResolver();
@@ -592,35 +584,23 @@ class PersistentOutputCacheService
             return false;
         }
 
-        if ($this->guardOnly) {
-            $input = json_decode($request->getContent(), true) ?: [];
-            $operationName = $input['operationName'] ?? null;
-            if (!$operationName || !is_string($operationName)) {
-                return false;
-            }
-            // Two membership surfaces engage the SWR layer: the legacy
-            // in_progress_queries list (folded by Configuration into operations
-            // with tier=herd_guarded, granularity=list) and the post-fold
-            // operations: tree (covers both HERD_GUARDED and SWR_ONLY). Either
-            // gate true engages the layer; required for SWR_ONLY operations
-            // declared only via operations: to participate at all.
-            if (in_array($operationName, $this->guardOperations, true)) {
-                return true;
-            }
-            if ($this->operationClassifier !== null
-                && $this->operationClassifier->hasOperation($operationName)) {
-                return true;
-            }
-
-            Logger::debug(sprintf(
-                'DataHub persistent cache: gate skipped — operation not in in_progress_queries or operations tree (operationName=%s)',
-                $operationName
-            ));
-
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = $input['operationName'] ?? null;
+        if (!$operationName || !is_string($operationName)) {
             return false;
         }
 
-        return true;
+        if ($this->operationClassifier !== null
+            && $this->operationClassifier->hasOperation($operationName)) {
+            return true;
+        }
+
+        Logger::debug(sprintf(
+            'DataHub persistent cache: gate skipped — operation not in operations tree (operationName=%s)',
+            $operationName
+        ));
+
+        return false;
     }
 
     /**

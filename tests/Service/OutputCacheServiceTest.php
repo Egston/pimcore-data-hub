@@ -31,6 +31,14 @@ class OutputCacheServiceTest extends TestCase
 
     protected $sut;
 
+    private function makeClassifier(array $operations): OperationClassifier
+    {
+        $c = $this->createMock(ContainerBagInterface::class);
+        $c->method('get')->willReturn(['graphql' => ['operations' => $operations]]);
+
+        return new OperationClassifier($c);
+    }
+
     protected function setUp(): void
     {
         $this->container = $this->createMock(ContainerBagInterface::class);
@@ -215,13 +223,12 @@ class OutputCacheServiceTest extends TestCase
 
     public function testGuardRequestStrategyCanonicalizesPayload()
     {
-        // Configure guard to use 'request' strategy
+        // Configure guard to use 'request' strategy — keeps deprecated in_progress_protection_enabled alias
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn([
             'graphql' => [
                 'output_cache_enabled' => true,
                 'in_progress_protection_enabled' => true,
-                'in_progress_queries' => ['Op'],
                 'in_progress_key_strategy' => 'request',
                 'in_progress_ttl' => 5,
             ],
@@ -229,7 +236,10 @@ class OutputCacheServiceTest extends TestCase
         $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
         $eventDispatcher->method('dispatch')->willReturnArgument(0);
 
-        $sut = new OutputCacheService($container, $eventDispatcher);
+        $classifier = $this->makeClassifier([
+            'Op' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+        ]);
+        $sut = new OutputCacheService($container, $eventDispatcher, null, $classifier);
 
         $clientname = 'client-b';
         $queryA = 'query Op(
@@ -257,7 +267,7 @@ class OutputCacheServiceTest extends TestCase
 
         // Cleanup: release guard by saving the first request (releases lock + removes marker)
         $sut2 = $this->getMockBuilder(OutputCacheService::class)
-            ->setConstructorArgs([$container, $eventDispatcher])
+            ->setConstructorArgs([$container, $eventDispatcher, null, $classifier])
             ->onlyMethods(['saveToCache'])
             ->getMock();
         $sut2->method('saveToCache')->willReturnCallback(function () {
@@ -267,12 +277,12 @@ class OutputCacheServiceTest extends TestCase
 
     public function testMaybeRejectOrAcquireSetsGuardKeyAttribute()
     {
+        // Keeps deprecated in_progress_protection_enabled alias — pins the BC fold path
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn([
             'graphql' => [
                 'output_cache_enabled' => true,
                 'in_progress_protection_enabled' => true,
-                'in_progress_queries' => ['Op'],
                 'in_progress_key_strategy' => 'operation',
                 'in_progress_ttl' => 5,
             ],
@@ -280,7 +290,10 @@ class OutputCacheServiceTest extends TestCase
         $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
         $eventDispatcher->method('dispatch')->willReturnArgument(0);
 
-        $sut = new OutputCacheService($container, $eventDispatcher);
+        $classifier = $this->makeClassifier([
+            'Acquire' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+        ]);
+        $sut = new OutputCacheService($container, $eventDispatcher, null, $classifier);
 
         $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
             'query' => 'query Acquire($id: ID!){node(id:$id){id}}',
@@ -299,7 +312,7 @@ class OutputCacheServiceTest extends TestCase
 
         // Cleanup: call save() to release the marker
         $sut2 = $this->getMockBuilder(OutputCacheService::class)
-            ->setConstructorArgs([$container, $eventDispatcher])
+            ->setConstructorArgs([$container, $eventDispatcher, null, $classifier])
             ->onlyMethods(['saveToCache'])
             ->getMock();
         $sut2->method('saveToCache')->willReturnCallback(function () {
@@ -341,20 +354,23 @@ class OutputCacheServiceTest extends TestCase
 
     public function testBypassGuardForBackgroundRefresh()
     {
+        // Uses canonical herd_guard_enabled key — pins the renamed-key path
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn([
             'graphql' => [
                 'output_cache_enabled' => true,
-                'in_progress_protection_enabled' => true,
-                'in_progress_queries' => ['Op'],
-                'in_progress_key_strategy' => 'request',
-                'in_progress_ttl' => 5,
+                'herd_guard_enabled' => true,
+                'herd_guard_key_strategy' => 'request',
+                'herd_guard_ttl' => 5,
             ],
         ]);
         $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
         $eventDispatcher->method('dispatch')->willReturnArgument(0);
 
-        $sut = new OutputCacheService($container, $eventDispatcher);
+        $classifier = $this->makeClassifier([
+            'Op' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+        ]);
+        $sut = new OutputCacheService($container, $eventDispatcher, null, $classifier);
 
         $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
             'query' => 'query Op($id: ID!){node(id:$id){id}}',
@@ -369,22 +385,22 @@ class OutputCacheServiceTest extends TestCase
 
     public function testShouldGuardRequestReturnsTrueForHerdGuardedTierAttributeEvenWhenOperationAbsentFromInProgressQueries()
     {
-        // Protection enabled but the legacy in_progress_queries list is empty.
-        // The HERD_GUARDED tier attribute alone must engage the guard.
+        // Uses canonical herd_guard_enabled key — the HERD_GUARDED tier attribute
+        // alone must engage the guard regardless of classifier membership.
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn([
             'graphql' => [
                 'output_cache_enabled' => true,
-                'in_progress_protection_enabled' => true,
-                'in_progress_queries' => [],
-                'in_progress_key_strategy' => 'operation',
-                'in_progress_ttl' => 5,
+                'herd_guard_enabled' => true,
+                'herd_guard_key_strategy' => 'operation',
+                'herd_guard_ttl' => 5,
             ],
         ]);
         $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
         $eventDispatcher->method('dispatch')->willReturnArgument(0);
 
-        $sut = new OutputCacheService($container, $eventDispatcher);
+        $classifier = $this->makeClassifier([]);
+        $sut = new OutputCacheService($container, $eventDispatcher, null, $classifier);
 
         $body = json_encode([
             'query' => 'query TierGuarded($id: ID!){node(id:$id){id}}',
@@ -408,8 +424,9 @@ class OutputCacheServiceTest extends TestCase
         $this->assertSame(503, $second->getStatusCode());
 
         // Cleanup
+        $classifier2 = $this->makeClassifier([]);
         $sut2 = $this->getMockBuilder(OutputCacheService::class)
-            ->setConstructorArgs([$container, $eventDispatcher])
+            ->setConstructorArgs([$container, $eventDispatcher, null, $classifier2])
             ->onlyMethods(['saveToCache'])
             ->getMock();
         $sut2->method('saveToCache')->willReturnCallback(function () {
@@ -417,22 +434,23 @@ class OutputCacheServiceTest extends TestCase
         $sut2->save($req1, new JsonResponse(['data' => ['ok' => true]]));
     }
 
-    public function testTierAttributeNeitherDoesNotEngageGuardWhenInProgressQueriesEmpty()
+    public function testTierAttributeNeitherDoesNotEngageGuardWhenClassifierEmpty()
     {
+        // Uses canonical herd_guard_enabled key
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn([
             'graphql' => [
                 'output_cache_enabled' => true,
-                'in_progress_protection_enabled' => true,
-                'in_progress_queries' => [],
-                'in_progress_key_strategy' => 'operation',
-                'in_progress_ttl' => 5,
+                'herd_guard_enabled' => true,
+                'herd_guard_key_strategy' => 'operation',
+                'herd_guard_ttl' => 5,
             ],
         ]);
         $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
         $eventDispatcher->method('dispatch')->willReturnArgument(0);
 
-        $sut = new OutputCacheService($container, $eventDispatcher);
+        $classifier = $this->makeClassifier([]);
+        $sut = new OutputCacheService($container, $eventDispatcher, null, $classifier);
 
         $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
             'query' => 'query Anon{__typename}',
@@ -443,7 +461,7 @@ class OutputCacheServiceTest extends TestCase
 
         $this->assertNull(
             $sut->maybeRejectOrAcquire($req),
-            'NEITHER tier with empty in_progress_queries must not engage the guard'
+            'NEITHER tier with empty classifier must not engage the guard'
         );
         $this->assertFalse(
             $req->attributes->has('datahub_inprogress_guard_key'),
@@ -536,5 +554,55 @@ class OutputCacheServiceTest extends TestCase
 
         $sut2->method('loadFromCache')->willReturnOnConsecutiveCalls(null, null); // MISS probe path, then not used further
         $this->assertSame('MISS', $sut2->probeStatus($req));
+    }
+
+    public function testHerdGuardMembershipViaClassifier(): void
+    {
+        // Pins Option A: OutputCacheService injects OperationClassifier; the membership
+        // check for shouldGuardRequest uses classifier->getTier() === HERD_GUARDED rather
+        // than the dropped $inProgressQueries list.
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'herd_guard_enabled' => true,
+                'herd_guard_key_strategy' => 'operation',
+                'herd_guard_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $classifier = $this->makeClassifier([
+            'GuardedOp' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+        ]);
+        $sut = new OutputCacheService($container, $eventDispatcher, null, $classifier);
+
+        $body = json_encode([
+            'query' => 'query GuardedOp{__typename}',
+            'operationName' => 'GuardedOp',
+        ]);
+
+        $req1 = Request::create('/api', 'POST', [], [], [], [], $body);
+        $req1->attributes->set('clientname', 'client-classifier');
+
+        $first = $sut->maybeRejectOrAcquire($req1);
+        $this->assertNull($first, 'classifier-classified HERD_GUARDED op: first caller must acquire');
+
+        $req2 = Request::create('/api', 'POST', [], [], [], [], $body);
+        $req2->attributes->set('clientname', 'client-classifier');
+
+        $second = $sut->maybeRejectOrAcquire($req2);
+        $this->assertInstanceOf(JsonResponse::class, $second, 'classifier-classified HERD_GUARDED op: duplicate request must be rejected');
+        $this->assertSame(503, $second->getStatusCode());
+
+        // Cleanup
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher, null, $classifier])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut2->method('saveToCache')->willReturnCallback(function () {
+        });
+        $sut2->save($req1, new JsonResponse(['data' => ['ok' => true]]));
     }
 }

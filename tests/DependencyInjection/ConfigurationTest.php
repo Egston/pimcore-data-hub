@@ -273,4 +273,161 @@ final class ConfigurationTest extends TestCase
             'persistent_refresh_priority_strategy' => 'bogus_strategy',
         ]);
     }
+
+    public function testHerdGuardEnabledCanonicalKey(): void
+    {
+        $graphql = $this->process(['herd_guard_enabled' => true]);
+        self::assertTrue($graphql['herd_guard_enabled']);
+    }
+
+    public function testInProgressProtectionEnabledFoldsToHerdGuardEnabled(): void
+    {
+        $graphql = $this->process(['in_progress_protection_enabled' => true]);
+        self::assertTrue($graphql['herd_guard_enabled']);
+    }
+
+    public function testInProgressTtlFoldsToHerdGuardTtl(): void
+    {
+        $graphql = $this->process(['in_progress_ttl' => 45]);
+        self::assertSame(45, $graphql['herd_guard_ttl']);
+    }
+
+    public function testInProgressRefreshIntervalFoldsToHerdGuardRefreshInterval(): void
+    {
+        $graphql = $this->process(['in_progress_refresh_interval' => 10]);
+        self::assertSame(10, $graphql['herd_guard_refresh_interval']);
+    }
+
+    public function testInProgressHttpStatusFoldsToHerdGuardHttpStatus(): void
+    {
+        $graphql = $this->process(['in_progress_http_status' => 429]);
+        self::assertSame(429, $graphql['herd_guard_http_status']);
+    }
+
+    public function testInProgressRetryAfterFoldsToHerdGuardRetryAfter(): void
+    {
+        $graphql = $this->process(['in_progress_retry_after' => 30]);
+        self::assertSame(30, $graphql['herd_guard_retry_after']);
+    }
+
+    public function testInProgressKeyStrategyFoldsToHerdGuardKeyStrategy(): void
+    {
+        $graphql = $this->process(['in_progress_key_strategy' => 'operation']);
+        self::assertSame('operation', $graphql['herd_guard_key_strategy']);
+    }
+
+    public function testCanonicalHerdGuardKeyWinsOverAliasWhenBothSet(): void
+    {
+        $graphql = $this->process([
+            'herd_guard_enabled' => true,
+            'in_progress_protection_enabled' => false,
+        ]);
+        self::assertTrue($graphql['herd_guard_enabled']);
+    }
+
+    public function testCanonicalHerdGuardTtlWinsOverAliasWhenBothSet(): void
+    {
+        $graphql = $this->process([
+            'herd_guard_ttl' => 90,
+            'in_progress_ttl' => 30,
+        ]);
+        self::assertSame(90, $graphql['herd_guard_ttl']);
+    }
+
+    public function testCanonicalHerdGuardRefreshIntervalWinsOverAliasWhenBothSet(): void
+    {
+        $graphql = $this->process([
+            'herd_guard_refresh_interval' => 20,
+            'in_progress_refresh_interval' => 5,
+        ]);
+        self::assertSame(20, $graphql['herd_guard_refresh_interval']);
+    }
+
+    public function testCanonicalHerdGuardHttpStatusWinsOverAliasWhenBothSet(): void
+    {
+        $graphql = $this->process([
+            'herd_guard_http_status' => 429,
+            'in_progress_http_status' => 503,
+        ]);
+        self::assertSame(429, $graphql['herd_guard_http_status']);
+    }
+
+    public function testCanonicalHerdGuardRetryAfterWinsOverAliasWhenBothSet(): void
+    {
+        $graphql = $this->process([
+            'herd_guard_retry_after' => 60,
+            'in_progress_retry_after' => 10,
+        ]);
+        self::assertSame(60, $graphql['herd_guard_retry_after']);
+    }
+
+    public function testCanonicalHerdGuardKeyStrategyWinsOverAliasWhenBothSet(): void
+    {
+        $graphql = $this->process([
+            'herd_guard_key_strategy' => 'operation',
+            'in_progress_key_strategy' => 'request',
+        ]);
+        self::assertSame('operation', $graphql['herd_guard_key_strategy']);
+    }
+
+    public function testAliasConflictSentinelStoredWhenBothCanonicalAndAliasSet(): void
+    {
+        $graphql = $this->process([
+            'herd_guard_ttl' => 90,
+            'in_progress_ttl' => 30,
+        ]);
+        self::assertCount(1, $graphql['_herd_guard_alias_conflicts']);
+        self::assertStringContainsString('herd_guard_ttl', $graphql['_herd_guard_alias_conflicts'][0]);
+    }
+
+    public function testAliasConflictSentinelAbsentWhenOnlyCanonicalSet(): void
+    {
+        $graphql = $this->process(['herd_guard_ttl' => 90]);
+        self::assertArrayNotHasKey('_herd_guard_alias_conflicts', $graphql);
+    }
+
+    public function testAliasConflictSentinelAbsentWhenOnlyAliasSet(): void
+    {
+        $graphql = $this->process(['in_progress_ttl' => 30]);
+        self::assertArrayNotHasKey('_herd_guard_alias_conflicts', $graphql);
+    }
+
+    public function testPersistentOutputCacheGuardOnlyRejectedWithWarning(): void
+    {
+        // The key is accepted (no InvalidConfigurationException) but stripped by the
+        // validator closure; a sentinel is stored so boot() can emit a log warning.
+        $graphql = $this->process(['persistent_output_cache_guard_only' => true]);
+        self::assertArrayNotHasKey('persistent_output_cache_guard_only', $graphql);
+        self::assertTrue($graphql['_persistent_output_cache_guard_only_set'] ?? false);
+    }
+
+    public function testNormalizeGraphqlNodeHandlesPartialConfigWithMissingAliasKeys(): void
+    {
+        // Only the canonical key is set; alias keys default to null via the config tree.
+        // The validator must not raise an undefined-index notice on missing alias keys.
+        $graphql = $this->process(['herd_guard_ttl' => 120]);
+        self::assertSame(120, $graphql['herd_guard_ttl']);
+        self::assertArrayNotHasKey('_herd_guard_alias_conflicts', $graphql);
+    }
+
+    public function testNormalizeGraphqlNodeHandlesPartialConfigWithMissingCanonicalKeys(): void
+    {
+        // Only the alias key is set; canonical defaults to null via the config tree.
+        $graphql = $this->process(['in_progress_ttl' => 45]);
+        self::assertSame(45, $graphql['herd_guard_ttl']);
+        self::assertArrayNotHasKey('_herd_guard_alias_conflicts', $graphql);
+    }
+
+    public function testEmptyStringCanonicalDoesNotBypassAliasFold(): void
+    {
+        // An unresolved envvar can produce an empty-string canonical; it must be
+        // treated as absent so the alias value folds in instead of being silently
+        // overridden by the empty string.
+        $graphql = $this->process([
+            'herd_guard_key_strategy' => '',
+            'in_progress_key_strategy' => 'operation',
+        ]);
+        self::assertSame('operation', $graphql['herd_guard_key_strategy']);
+        self::assertArrayNotHasKey('_herd_guard_alias_conflicts', $graphql);
+    }
 }

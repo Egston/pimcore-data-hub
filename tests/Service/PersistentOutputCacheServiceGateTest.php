@@ -56,7 +56,6 @@ final class PersistentOutputCacheServiceGateTest extends TestCase
         $graphql = array_merge([
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 30,
-            'persistent_output_cache_guard_only' => true,
         ], $graphqlExtras);
 
         $service = $this->getMockBuilder(PersistentOutputCacheService::class)
@@ -98,20 +97,25 @@ final class PersistentOutputCacheServiceGateTest extends TestCase
         return $req;
     }
 
-    public function testShouldUseForRequestTrueForLegacyInProgressQueriesOperation(): void
+    public function testGateEngagesForOperationsTreeOnlyOp(): void
     {
+        // Pins the post-P5 single-membership surface: only the operations: tree
+        // is consulted — an op in the operations tree engages the gate regardless
+        // of whether it was also in the deprecated in_progress_queries list.
         $service = $this->makeService(
-            ['in_progress_queries' => ['legacyOp']],
-            $this->makeClassifier([])
+            [],
+            $this->makeClassifier([
+                'classifiedOp' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+            ])
         );
 
-        $request = $this->makeRequest('legacyOp');
+        $request = $this->makeRequest('classifiedOp');
         $response = $service->preHandle($request, $this->makeResponseService());
 
         self::assertNull($response, 'MISS expected since cacheLoad returns null');
         self::assertTrue(
             (bool)$request->attributes->get('_datahub_persistent_applies'),
-            'gate should engage for legacy in_progress_queries member'
+            'gate must engage for operation declared in operations: tree'
         );
     }
 
