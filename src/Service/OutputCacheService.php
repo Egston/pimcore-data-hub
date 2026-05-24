@@ -17,9 +17,6 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use GraphQL\Language\AST\DocumentNode;
-use GraphQL\Language\Parser;
-use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
@@ -269,97 +266,31 @@ class OutputCacheService
     }
 
     /**
-     * Canonicalize the incoming JSON body for cache/lock keys:
-     * - Parse JSON
-     * - Optionally AST-normalize the GraphQL 'query'
-     * - Harmonize variables (treat missing vs null equivalently for declared vars)
-     * - Recursively ksort all associative arrays
-     * - Encode with stable json_encode flags
-     *
+     * Canonicalise the request body once per request. The AST parse + reprint
+     * in {@see GraphQLRequestCanonicalizer::canonicalize} is the expensive step;
+     * the standard-cache path touches it from three call sites (key, guard key,
+     * atomic-lock resource) so the result is memoised on the request attribute
+     * bag. Mirrors {@see PersistentOutputCacheService::canonicalizePayload}.
      */
-    private function canonicalizePayloadForCache(Request $request): string
+    private function canonicalizePayload(Request $request): string
     {
         $cached = $request->attributes->get('_datahub_canonical_payload');
         if (is_string($cached)) {
             return $cached;
         }
 
-        $payload = json_decode($request->getContent(), true);
-        if (!is_array($payload)) {
-            $payload = [];
-        }
-
-        if (!empty($payload['query']) && is_string($payload['query'])) {
-            $payload['query'] = $this->normalizeQueryAst($payload['query']);
-        }
-
-        $payload = $this->ksortRecursive($payload);
-
-        $canonical = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
-        );
-
-        // Guard against rare encode failures returning false
-        if (!is_string($canonical)) {
-            $canonical = '{}';
-        }
+        $canonical = GraphQLRequestCanonicalizer::canonicalize((string) $request->getContent());
 
         $request->attributes->set('_datahub_canonical_payload', $canonical);
 
         return $canonical;
     }
 
-    /**
-     * Parse and re-print the GraphQL query to a canonical form.
-     */
-    private function normalizeQueryAst(string $query): string
-    {
-        try {
-            /** @var DocumentNode $ast */
-            $ast = Parser::parse($query);
-
-            // Printer preserves a canonical formatting; not sorting selections (keeps semantic order)
-            return Printer::doPrint($ast);
-        } catch (\Throwable $e) {
-            // The query is already invalid; we cannot parse it. However, we still need some
-            // reproducible canonical form for caching/locking.
-            return trim($query);
-        }
-    }
-
-    /** Recursively ksort associative arrays; leave list arrays as-is (order significant). */
-    private function ksortRecursive(array $value): array
-    {
-        $isAssoc = static function (array $a): bool {
-            $i = 0;
-            foreach ($a as $k => $_) {
-                if ($k !== $i++) {
-                    return true;
-                }
-            }
-
-            return false;
-        };
-
-        if ($isAssoc($value)) {
-            ksort($value);
-        }
-
-        foreach ($value as $k => $v) {
-            if (is_array($v)) {
-                $value[$k] = $this->ksortRecursive($v);
-            }
-        }
-
-        return $value;
-    }
-
     /** Compute a cache key for the given request. */
     private function computeKey(Request $request): string
     {
         $clientname = (string) $request->attributes->get('clientname', '');
-        $payload    = $this->canonicalizePayloadForCache($request);
+        $payload    = $this->canonicalizePayload($request);
 
         return 'output_' . hash('sha256', 'client:' . $clientname . "\n" . $payload);
     }
@@ -506,7 +437,7 @@ class OutputCacheService
             }
         }
 
-        $canonical = $this->canonicalizePayloadForCache($request);
+        $canonical = $this->canonicalizePayload($request);
 
         return hash('sha256', 'req:' . $canonical);
     }
@@ -531,7 +462,7 @@ class OutputCacheService
         if ($operationName !== '') {
             $resource = self::computeOperationLockKey($operationName);
         } else {
-            $canonical = $this->canonicalizePayloadForCache($request);
+            $canonical = $this->canonicalizePayload($request);
             $resource = 'datahub_inprogress:' . hash('sha256', 'req:' . $canonical);
         }
 

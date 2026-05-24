@@ -17,9 +17,6 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use GraphQL\Language\AST\DocumentNode;
-use GraphQL\Language\Parser;
-use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
@@ -712,71 +709,27 @@ class PersistentOutputCacheService
     }
 
     /**
-     * Stateless canonicalization used by both the per-request memoised path
-     * and the static SWR-refresh-lock-key helper consumed by the queue
-     * handler (which has no Request to memoise against).
+     * Thin pass-through to {@see GraphQLRequestCanonicalizer::canonicalize}.
+     * Kept as a public static so external callers (functional-suite fixtures,
+     * the SWR-refresh-lock-key helper) keep working without re-grep.
      */
     public static function canonicalizePayloadString(string $body): string
     {
-        $payload = json_decode($body, true);
-        if (!is_array($payload)) {
-            $payload = [];
-        }
-
-        if (!empty($payload['query']) && is_string($payload['query'])) {
-            $payload['query'] = self::normalizeQueryAstStatic($payload['query']);
-        }
-
-        $payload = self::ksortRecursiveStatic($payload);
-
-        $canonical = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
-        );
-
-        return is_string($canonical) ? $canonical : '{}';
-    }
-
-    private static function normalizeQueryAstStatic(string $query): string
-    {
-        try {
-            /** @var DocumentNode $ast */
-            $ast = Parser::parse($query);
-
-            return Printer::doPrint($ast);
-        } catch (\Throwable $e) {
-            return trim($query);
-        }
+        return GraphQLRequestCanonicalizer::canonicalize($body);
     }
 
     /**
-     * @param array<mixed> $value
-     *
-     * @return array<mixed>
+     * Enqueue-dedupe sentinel resource shape for the per-canonical-request
+     * space, computed from raw inputs. Byte-equal to the listener's legacy
+     * `buildEnqueueDedupeKey` shape when meta+payload sidecar attributes are
+     * present — that is the contract.
      */
-    private static function ksortRecursiveStatic(array $value): array
+    public static function computeEnqueueDedupeKey(string $client, string $bodyJson): string
     {
-        $isAssoc = static function (array $a): bool {
-            $i = 0;
-            foreach ($a as $k => $_) {
-                if ($k !== $i++) {
-                    return true;
-                }
-            }
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $metaKey = self::keyMetaFor($client, $canonical);
+        $payloadKey = self::keyPayloadFor($client, $canonical);
 
-            return false;
-        };
-
-        if ($isAssoc($value)) {
-            ksort($value);
-        }
-
-        foreach ($value as $k => $v) {
-            if (is_array($v)) {
-                $value[$k] = self::ksortRecursiveStatic($v);
-            }
-        }
-
-        return $value;
+        return self::ENQUEUE_DEDUPE_PREFIX . md5($metaKey . '|' . $payloadKey);
     }
 }

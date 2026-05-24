@@ -22,6 +22,7 @@ use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
+use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Cache as PimcoreCache;
 use Pimcore\Helper\LongRunningHelper;
@@ -284,27 +285,17 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
 
     private function buildRefreshMarkerKey(Request $request): string
     {
-        $metaKey = (string)$request->attributes->get('_datahub_persistent_meta_key');
-        $payloadKey = (string)$request->attributes->get('_datahub_persistent_payload_key');
-        if ($metaKey !== '' && $payloadKey !== '') {
-            return 'datahub_persistent_refresh_lock_' . md5($metaKey . '|' . $payloadKey);
-        }
         $client = (string)$request->attributes->get('clientname', '');
         $body = (string)$request->getContent();
 
-        return 'datahub_persistent_refresh_lock_' . hash('sha256', 'client:' . $client . "\n" . $body);
+        return PersistentOutputCacheService::computeSwrRefreshLockKey($client, $body);
     }
 
     private function buildEnqueueDedupeKey(Request $request): string
     {
-        $metaKey = (string)$request->attributes->get('_datahub_persistent_meta_key');
-        $payloadKey = (string)$request->attributes->get('_datahub_persistent_payload_key');
-        if ($metaKey !== '' && $payloadKey !== '') {
-            return 'datahub_enqueue_req_' . md5($metaKey . '|' . $payloadKey);
-        }
         $client = (string)$request->attributes->get('clientname', '');
         $body = (string)$request->getContent();
 
-        return 'datahub_enqueue_req_' . hash('sha256', 'client:' . $client . "\n" . $body);
+        return PersistentOutputCacheService::computeEnqueueDedupeKey($client, $body);
     }
 }

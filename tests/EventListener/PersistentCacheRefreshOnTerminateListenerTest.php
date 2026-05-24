@@ -318,8 +318,8 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         $req->attributes->set('clientname', 'c1');
         $req->attributes->set('_datahub_persistent_refresh', true);
 
-        $bodyHash = hash('sha256', 'client:c1' . "\n" . (string)$req->getContent());
-        $blocking = $lockFactory->createLock('datahub_persistent_refresh_lock_' . $bodyHash, 60, false);
+        $lockKey = \Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService::computeSwrRefreshLockKey('c1', (string)$req->getContent());
+        $blocking = $lockFactory->createLock($lockKey, 60, false);
         $this->assertTrue($blocking->acquire(false));
 
         $controller = $this->createMock(WebserviceController::class);

@@ -464,6 +464,56 @@ class OutputCacheServiceTest extends TestCase
         );
     }
 
+    public function testCanonicalPayloadMemoizedOnRequestAttribute()
+    {
+        $sut = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$this->container, $this->eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut->method('saveToCache')->willReturnCallback(function () {
+        });
+
+        $this->assertFalse(
+            $this->request->attributes->has('_datahub_canonical_payload'),
+            'precondition: request carries no canonical memo before the cache path runs'
+        );
+
+        $sut->save($this->request, new JsonResponse(['data' => ['ok' => true]]));
+
+        $this->assertIsString(
+            $this->request->attributes->get('_datahub_canonical_payload'),
+            'canonicalisation result must be memoised on the request so the AST reprint runs once, not once per call site'
+        );
+    }
+
+    public function testComputeKeyReadsCanonicalPayloadMemo()
+    {
+        $keys = [];
+        $sut = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$this->container, $this->eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut->method('saveToCache')->willReturnCallback(function ($key) use (&$keys) {
+            $keys[] = $key;
+        });
+
+        $clientname = 'client-memo';
+        $sentinel = 'SENTINEL_CANONICAL_BODY';
+        $req = Request::create('/api', 'POST', [], [], [], [], '{"query":"{ totally different }"}');
+        $req->attributes->set('clientname', $clientname);
+        // Pre-seed the memo with a value the raw body would never canonicalise to.
+        $req->attributes->set('_datahub_canonical_payload', $sentinel);
+
+        $sut->save($req, new JsonResponse(['data' => ['ok' => true]]));
+
+        $this->assertCount(1, $keys);
+        $this->assertSame(
+            'output_' . hash('sha256', 'client:' . $clientname . "\n" . $sentinel),
+            $keys[0],
+            'computeKey must consult the per-request canonical memo, not re-canonicalise the body'
+        );
+    }
+
     public function testProbeStatusDisabledHitMiss()
     {
         // disabled
