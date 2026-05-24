@@ -30,12 +30,18 @@ final class PersistentOutputCacheServicePriorityTest extends TestCase
         $container->method('get')->willReturn(['graphql' => [
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 10,
-            'persistent_output_cache_guard_only' => true,
-            'in_progress_queries' => ['TestOp'],
         ]]);
 
+        $classifierContainer = $this->createMock(ContainerBagInterface::class);
+        $classifierContainer->method('get')->willReturn(['graphql' => [
+            'operations' => [
+                'TestOp' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+            ],
+        ]]);
+        $classifier = new OperationClassifier($classifierContainer);
+
         $service = $this->getMockBuilder(PersistentOutputCacheService::class)
-            ->setConstructorArgs([$container])
+            ->setConstructorArgs([$container, $classifier])
             ->onlyMethods(['cacheLoad', 'cacheSave'])
             ->getMock();
 

@@ -22,7 +22,9 @@ use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
+use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
+use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Pimcore\Cache as PimcoreCache;
 use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
@@ -259,18 +261,14 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         }
     }
 
-    /**
-     * @param array<string, mixed> $graphql
-     */
     private function isGuardedByHerd(Request $request, array $graphql): bool
     {
-        $enabled = (bool)($graphql['in_progress_protection_enabled'] ?? false);
+        $enabled = (bool)(
+            $graphql['herd_guard_enabled']
+            ?? $graphql['in_progress_protection_enabled']
+            ?? false
+        );
         if (!$enabled) {
-            return false;
-        }
-        $list = (array)($graphql['in_progress_queries'] ?? []);
-        $list = array_values(array_filter($list, static fn ($v) => is_string($v) && $v !== ''));
-        if (!$list) {
             return false;
         }
         $input = json_decode($request->getContent(), true) ?: [];
@@ -279,32 +277,22 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             return false;
         }
 
-        return in_array($op, $list, true);
+        return $this->classifier->getTier($op) === Tier::HERD_GUARDED;
     }
 
     private function buildRefreshMarkerKey(Request $request): string
     {
-        $metaKey = (string)$request->attributes->get('_datahub_persistent_meta_key');
-        $payloadKey = (string)$request->attributes->get('_datahub_persistent_payload_key');
-        if ($metaKey !== '' && $payloadKey !== '') {
-            return 'datahub_persistent_refresh_lock_' . md5($metaKey . '|' . $payloadKey);
-        }
         $client = (string)$request->attributes->get('clientname', '');
         $body = (string)$request->getContent();
 
-        return 'datahub_persistent_refresh_lock_' . hash('sha256', 'client:' . $client . "\n" . $body);
+        return PersistentOutputCacheService::computeSwrRefreshLockKey($client, $body);
     }
 
     private function buildEnqueueDedupeKey(Request $request): string
     {
-        $metaKey = (string)$request->attributes->get('_datahub_persistent_meta_key');
-        $payloadKey = (string)$request->attributes->get('_datahub_persistent_payload_key');
-        if ($metaKey !== '' && $payloadKey !== '') {
-            return 'datahub_enqueue_req_' . md5($metaKey . '|' . $payloadKey);
-        }
         $client = (string)$request->attributes->get('clientname', '');
         $body = (string)$request->getContent();
 
-        return 'datahub_enqueue_req_' . hash('sha256', 'client:' . $client . "\n" . $body);
+        return PersistentOutputCacheService::computeEnqueueDedupeKey($client, $body);
     }
 }

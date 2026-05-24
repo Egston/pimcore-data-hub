@@ -91,7 +91,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 3456,
-            'persistent_output_cache_guard_only' => false,
+
             'operations' => [
                 'TagOp' => ['tier' => 'swr_only', 'granularity' => 'single'],
             ],
@@ -129,7 +129,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 3456,
-            'persistent_output_cache_guard_only' => false,
+
             'operations' => [
                 'ListOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
             ],
@@ -164,7 +164,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 3456,
-            'persistent_output_cache_guard_only' => false,
+
             'operations' => [
                 'TagOp' => ['tier' => 'swr_only', 'granularity' => 'single'],
             ],
@@ -206,7 +206,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 60,
-            'persistent_output_cache_guard_only' => false,
+
             'operations' => [
                 'TtlOp' => [
                     'tier' => 'swr_only',
@@ -236,7 +236,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 60,
-            'persistent_output_cache_guard_only' => false,
+
             'operations' => [
                 'EmptyOp' => ['tier' => 'swr_only', 'granularity' => 'single'],
             ],
@@ -271,7 +271,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 60,
-            'persistent_output_cache_guard_only' => false,
+
             'operations' => [
                 'EmptyListOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
             ],
@@ -293,22 +293,25 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
 
     public function testSavePersistentFallsBackToConfiguredTtlWhenClassifierReturnsNull(): void
     {
-        // An operation NOT classified — classifier returns null. The fallback
-        // (?? $this->payloadTtl) must engage, otherwise Symfony Cache rejects
-        // null TTL.
+        // When the classifier has no ttl_override and the granularity-TTL map resolves to
+        // the per-granularity default, the scalar persistent_output_cache_payload_ttl acts
+        // as the outer fallback (via ?? $this->payloadTtl in savePersistent). This pins
+        // that the fallback is non-null so Symfony Cache never receives TTL=null.
         $graphql = [
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 1234,
-            'persistent_output_cache_guard_only' => false,
-            'operations' => [],
+            'persistent_output_cache_payload_ttl_by_granularity' => ['single' => 1234, 'list' => 1234],
+            'operations' => [
+                'ClassifiedOp' => ['tier' => 'swr_only', 'granularity' => 'single'],
+            ],
         ];
 
         $collector = new DependencyCollector();
         $saved = [];
         $service = $this->makeService($graphql, $collector, $this->makeClassifier($graphql), $saved);
 
-        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'UnknownOp']);
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'ClassifiedOp']);
         $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
 
         $payloadCalls = array_values(array_filter($saved, fn ($c) => str_starts_with($c['key'], 'persistent_output_payload_')));
@@ -322,7 +325,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 3456,
-            'persistent_output_cache_guard_only' => false,
+
             'operations' => [
                 'TagOp' => ['tier' => 'swr_only', 'granularity' => 'single'],
             ],
@@ -360,17 +363,18 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
         self::assertCount(1, $reverseIndex, 'reverse-index must not accumulate duplicate pairs for the same payloadKey');
     }
 
-    public function testCollectorTagsDoNotAppearInPayloadWhenOperationIsUnclassified(): void
+    public function testCollectorObjectTagsDoNotAppearInPayloadForListGranularity(): void
     {
-        // When the operation is unknown to the classifier (e.g. not declared in operations:),
-        // collectorTagsForOperation() returns [] because granularity cannot be determined.
-        // The payload tags must then contain only the base categorical tags.
+        // For list-granularity operations, collectorTagsForOperation() emits class-level
+        // tags but NOT per-object tags (to avoid unbounded tag fan-out on listing results).
         $graphql = [
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
             'persistent_output_cache_payload_ttl' => 3456,
-            'persistent_output_cache_guard_only' => false,
-            'operations' => [],
+
+            'operations' => [
+                'ListGranOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+            ],
         ];
 
         $collector = new DependencyCollector();
@@ -380,7 +384,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
         $saved = [];
         $service = $this->makeService($graphql, $collector, $this->makeClassifier($graphql), $saved);
 
-        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'UnknownOp']);
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'ListGranOp']);
         $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
 
         $payloadCalls = array_values(array_filter($saved, fn ($c) => str_starts_with($c['key'], 'persistent_output_payload_')));
@@ -389,12 +393,7 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             self::assertStringStartsNotWith(
                 PersistentOutputCacheService::TAG_OBJECT_PREFIX,
                 $tag,
-                'unclassified operation must not receive collector object tags'
-            );
-            self::assertStringStartsNotWith(
-                PersistentOutputCacheService::TAG_CLASS_PREFIX,
-                $tag,
-                'unclassified operation must not receive collector class tags'
+                'list-granularity operation must not receive collector per-object tags'
             );
         }
     }

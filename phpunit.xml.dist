@@ -16,6 +16,8 @@
             <file>tests/Command/PersistentCacheClearCommandTest.php</file>
             <file>tests/Controller/WebserviceControllerTierGateTest.php</file>
             <file>tests/Controller/WebserviceControllerSwrColdMissTest.php</file>
+            <file>tests/Service/GraphQLRequestCanonicalizerTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceCanonicalizationParityTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceBackendTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceGateTest.php</file>
@@ -28,6 +30,7 @@
             <file>tests/EventListener/DependencyCollectorResetListenerTest.php</file>
             <file>tests/EventListener/PersistentCacheInvalidationListenerTest.php</file>
             <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerKeyParityTest.php</file>
             <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerPriorityTest.php</file>
             <file>tests/Lock/LockSignalRefresherTest.php</file>
             <file>tests/MessageHandler/PersistentRefreshMessageHandlerTest.php</file>
@@ -36,6 +39,8 @@
             <file>tests/Messenger/PriorityRedisTransportScoreTest.php</file>
             <file>tests/Service/PersistentOutputCacheServicePriorityTest.php</file>
             <file>tests/DependencyInjection/ConfigurationTest.php</file>
+            <file>tests/Service/TierTest.php</file>
+            <file>tests/PimcoreDataHubBundleBootTest.php</file>
             <file>tests/Functional/Fixtures/KernelTestCaseSentinelTest.php</file>
         </testsuite>
         <!--

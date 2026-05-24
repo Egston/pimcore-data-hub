@@ -17,9 +17,6 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use GraphQL\Language\AST\DocumentNode;
-use GraphQL\Language\Parser;
-use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
@@ -85,10 +82,6 @@ class PersistentOutputCacheService
 
     private int $ttl; // seconds
 
-    private bool $guardOnly = true;
-
-    private array $guardOperations = [];
-
     private int $payloadTtl = 86400;
 
     private ?OperationClassifier $operationClassifier;
@@ -116,10 +109,6 @@ class PersistentOutputCacheService
             $ttl = $graphql['output_cache_lifetime'] ?? 30;
         }
         $this->ttl = max(1, (int)$ttl);
-        $this->guardOnly = (bool)($graphql['persistent_output_cache_guard_only'] ?? true);
-        $this->guardOperations = array_values(array_filter((array)($graphql['in_progress_queries'] ?? []), static function ($v) {
-            return is_string($v) && $v !== '';
-        }));
         $this->payloadTtl = max(1, (int)($graphql['persistent_output_cache_payload_ttl'] ?? 86400));
         $this->operationClassifier = $operationClassifier;
         $this->lockFactoryResolver = $lockFactoryResolver ?? new LockFactoryResolver();
@@ -595,35 +584,23 @@ class PersistentOutputCacheService
             return false;
         }
 
-        if ($this->guardOnly) {
-            $input = json_decode($request->getContent(), true) ?: [];
-            $operationName = $input['operationName'] ?? null;
-            if (!$operationName || !is_string($operationName)) {
-                return false;
-            }
-            // Two membership surfaces engage the SWR layer: the legacy
-            // in_progress_queries list (folded by Configuration into operations
-            // with tier=herd_guarded, granularity=list) and the post-fold
-            // operations: tree (covers both HERD_GUARDED and SWR_ONLY). Either
-            // gate true engages the layer; required for SWR_ONLY operations
-            // declared only via operations: to participate at all.
-            if (in_array($operationName, $this->guardOperations, true)) {
-                return true;
-            }
-            if ($this->operationClassifier !== null
-                && $this->operationClassifier->hasOperation($operationName)) {
-                return true;
-            }
-
-            Logger::debug(sprintf(
-                'DataHub persistent cache: gate skipped — operation not in in_progress_queries or operations tree (operationName=%s)',
-                $operationName
-            ));
-
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = $input['operationName'] ?? null;
+        if (!$operationName || !is_string($operationName)) {
             return false;
         }
 
-        return true;
+        if ($this->operationClassifier !== null
+            && $this->operationClassifier->hasOperation($operationName)) {
+            return true;
+        }
+
+        Logger::debug(sprintf(
+            'DataHub persistent cache: gate skipped — operation not in operations tree (operationName=%s)',
+            $operationName
+        ));
+
+        return false;
     }
 
     /**
@@ -712,71 +689,27 @@ class PersistentOutputCacheService
     }
 
     /**
-     * Stateless canonicalization used by both the per-request memoised path
-     * and the static SWR-refresh-lock-key helper consumed by the queue
-     * handler (which has no Request to memoise against).
+     * Thin pass-through to {@see GraphQLRequestCanonicalizer::canonicalize}.
+     * Kept as a public static so external callers (functional-suite fixtures,
+     * the SWR-refresh-lock-key helper) keep working without re-grep.
      */
     public static function canonicalizePayloadString(string $body): string
     {
-        $payload = json_decode($body, true);
-        if (!is_array($payload)) {
-            $payload = [];
-        }
-
-        if (!empty($payload['query']) && is_string($payload['query'])) {
-            $payload['query'] = self::normalizeQueryAstStatic($payload['query']);
-        }
-
-        $payload = self::ksortRecursiveStatic($payload);
-
-        $canonical = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
-        );
-
-        return is_string($canonical) ? $canonical : '{}';
-    }
-
-    private static function normalizeQueryAstStatic(string $query): string
-    {
-        try {
-            /** @var DocumentNode $ast */
-            $ast = Parser::parse($query);
-
-            return Printer::doPrint($ast);
-        } catch (\Throwable $e) {
-            return trim($query);
-        }
+        return GraphQLRequestCanonicalizer::canonicalize($body);
     }
 
     /**
-     * @param array<mixed> $value
-     *
-     * @return array<mixed>
+     * Enqueue-dedupe sentinel resource shape for the per-canonical-request
+     * space, computed from raw inputs. Byte-equal to the listener's legacy
+     * `buildEnqueueDedupeKey` shape when meta+payload sidecar attributes are
+     * present — that is the contract.
      */
-    private static function ksortRecursiveStatic(array $value): array
+    public static function computeEnqueueDedupeKey(string $client, string $bodyJson): string
     {
-        $isAssoc = static function (array $a): bool {
-            $i = 0;
-            foreach ($a as $k => $_) {
-                if ($k !== $i++) {
-                    return true;
-                }
-            }
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $metaKey = self::keyMetaFor($client, $canonical);
+        $payloadKey = self::keyPayloadFor($client, $canonical);
 
-            return false;
-        };
-
-        if ($isAssoc($value)) {
-            ksort($value);
-        }
-
-        foreach ($value as $k => $v) {
-            if (is_array($v)) {
-                $value[$k] = self::ksortRecursiveStatic($v);
-            }
-        }
-
-        return $value;
+        return self::ENQUEUE_DEDUPE_PREFIX . md5($metaKey . '|' . $payloadKey);
     }
 }

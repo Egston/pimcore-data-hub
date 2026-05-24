@@ -136,7 +136,9 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
             'persistent_refresh_lock_enabled' => true,
             'in_progress_protection_enabled' => true,
             'in_progress_key_strategy' => 'operation',
-            'in_progress_queries' => ['OpA'],
+            'operations' => [
+                'OpA' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+            ],
         ];
 
         $lockFactory = $this->createMock(\Symfony\Component\Lock\LockFactory::class);
@@ -318,8 +320,8 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         $req->attributes->set('clientname', 'c1');
         $req->attributes->set('_datahub_persistent_refresh', true);
 
-        $bodyHash = hash('sha256', 'client:c1' . "\n" . (string)$req->getContent());
-        $blocking = $lockFactory->createLock('datahub_persistent_refresh_lock_' . $bodyHash, 60, false);
+        $lockKey = \Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService::computeSwrRefreshLockKey('c1', (string)$req->getContent());
+        $blocking = $lockFactory->createLock($lockKey, 60, false);
         $this->assertTrue($blocking->acquire(false));
 
         $controller = $this->createMock(WebserviceController::class);
@@ -575,5 +577,39 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
                 $this->store[$key] = $value;
             }
         };
+    }
+
+    public function testIsGuardedByHerdReturnsTrueForClassifierHerdGuardedOp(): void
+    {
+        // Pins the B4 parked-defect resolution: isGuardedByHerd must use the
+        // already-injected classifier instead of re-reading in_progress_queries.
+        $graphql = [
+            'persistent_refresh_queue_enabled' => false,
+            'persistent_refresh_lock_enabled' => true,
+            'in_progress_protection_enabled' => true,
+            'in_progress_key_strategy' => 'operation',
+            'operations' => [
+                'HerdOp' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+            ],
+        ];
+
+        $lockFactory = $this->createMock(\Symfony\Component\Lock\LockFactory::class);
+        // If isGuardedByHerd returns true, no lock is created (guard path runs directly)
+        $lockFactory->expects($this->never())->method('createLock');
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects($this->once())->method('webonyxAction');
+
+        $listener = $this->makeListener($graphql, $controller, $lockFactory);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'HerdOp',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+
+        $event = $this->makeTerminateEvent($req);
+        $listener->onKernelTerminate($event);
     }
 }

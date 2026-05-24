@@ -37,18 +37,34 @@ use Symfony\Component\HttpFoundation\Request;
  */
 final class PersistentOutputCacheServiceBackendTest extends TestCase
 {
-    private function makeService(array $graphql = []): ArrayBackedPersistentOutputCacheService
+    private function makeClassifier(array $operations = []): OperationClassifier
+    {
+        $c = $this->createMock(ContainerBagInterface::class);
+        $c->method('get')->willReturn(['graphql' => ['operations' => $operations]]);
+
+        return new OperationClassifier($c);
+    }
+
+    private function makeService(array $graphql = [], ?OperationClassifier $classifier = null): ArrayBackedPersistentOutputCacheService
     {
         $defaults = [
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 10,
             'persistent_output_cache_payload_ttl' => 60,
-            'persistent_output_cache_guard_only' => false,
         ];
         $c = $this->createMock(ContainerBagInterface::class);
         $c->method('get')->willReturn(['graphql' => $graphql + $defaults]);
 
-        return new ArrayBackedPersistentOutputCacheService($c);
+        if ($classifier === null) {
+            $classifier = $this->makeClassifier([
+                'TestOp' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+                'Op' => ['tier' => 'swr_only', 'granularity' => 'single'],
+                'OpA' => ['tier' => 'swr_only', 'granularity' => 'single'],
+                'OpB' => ['tier' => 'swr_only', 'granularity' => 'single'],
+            ]);
+        }
+
+        return new ArrayBackedPersistentOutputCacheService($c, $classifier);
     }
 
     private function makeRequest(string $client, string $op, array $variables = []): Request
@@ -320,9 +336,9 @@ final class ArrayBackedPersistentOutputCacheService extends PersistentOutputCach
 {
     public TagAwareAdapterInterface $pool;
 
-    public function __construct(ContainerBagInterface $c)
+    public function __construct(ContainerBagInterface $c, ?OperationClassifier $classifier = null)
     {
-        parent::__construct($c);
+        parent::__construct($c, $classifier);
         $this->pool = new TagAwareAdapter(new ArrayAdapter(storeSerialized: true));
     }
 

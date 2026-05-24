@@ -17,9 +17,6 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use GraphQL\Language\AST\DocumentNode;
-use GraphQL\Language\Parser;
-use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
@@ -46,31 +43,26 @@ class OutputCacheService
     private $lifetime = 30;
 
     /**
-     * Enable/disable in-progress protection.
+     * Enable/disable herd guard protection.
      */
-    private $inProgressProtectionEnabled = false;
+    private $herdGuardEnabled = false;
 
     /**
-     * List of GraphQL operation names to protect.
-     */
-    private $inProgressQueries = [];
-
-    /**
-     * TTL (seconds) for the in-progress marker/lock. Bounds the leak window when
+     * TTL (seconds) for the herd-guard marker/lock. Bounds the leak window when
      * a request dies between acquire and release without an exception (SIGKILL,
      * OOM, FPM worker recycle). Periodic refresh keeps the lock alive during
      * legitimate long-running requests, so this can be set much smaller than the
      * worst-case execution time.
      */
-    private $inProgressTtl = 60;
+    private $herdGuardTtl = 60;
 
     /**
-     * Seconds between background refresh ticks for the in-progress lock and
-     * marker. Must be < $inProgressTtl. 0 = disabled (legacy behaviour: TTL
+     * Seconds between background refresh ticks for the herd-guard lock and
+     * marker. Must be < $herdGuardTtl. 0 = disabled (legacy behaviour: TTL
      * alone bounds both the leak window and the longest supported request).
-     * Auto-defaulted to floor($inProgressTtl / 2) when left at 0.
+     * Auto-defaulted to floor($herdGuardTtl / 2) when left at 0.
      */
-    private $inProgressRefreshInterval = 0;
+    private $herdGuardRefreshInterval = 0;
 
     /**
      * Process-wide latch: SIGALRM handler is currently armed. Guards uninstall
@@ -83,19 +75,21 @@ class OutputCacheService
     /**
      * HTTP status code used when rejecting duplicates.
      */
-    private $inProgressHttpStatus = 503;
+    private $herdGuardHttpStatus = 503;
 
     /**
      * Optional Retry-After header value (seconds).
      */
-    private $inProgressRetryAfter = null;
+    private $herdGuardRetryAfter = null;
 
     /**
      * Strategy for guard key: 'request' (query+variables) or 'operation' (operationName only).
      *
      * @var string
      */
-    private $inProgressKeyStrategy = 'request';
+    private $herdGuardKeyStrategy = 'request';
+
+    private ?OperationClassifier $classifier = null;
 
     /**
      * @var EventDispatcherInterface
@@ -105,10 +99,12 @@ class OutputCacheService
     public function __construct(
         ContainerBagInterface $container,
         EventDispatcherInterface $eventDispatcher,
-        ?LockFactoryResolver $lockFactoryResolver = null
+        ?LockFactoryResolver $lockFactoryResolver = null,
+        ?OperationClassifier $classifier = null
     ) {
         $this->eventDispatcher = $eventDispatcher;
         $this->lockFactoryResolver = $lockFactoryResolver ?? new LockFactoryResolver();
+        $this->classifier = $classifier;
 
         $dataHubConfig = $container->get('pimcore_data_hub');
         if (isset($dataHubConfig['graphql'])) {
@@ -120,39 +116,40 @@ class OutputCacheService
                 $this->lifetime = intval($dataHubConfig['graphql']['output_cache_lifetime']);
             }
 
-            // in-progress protection config
-            if (isset($dataHubConfig['graphql']['in_progress_protection_enabled'])) {
-                $this->inProgressProtectionEnabled = filter_var($dataHubConfig['graphql']['in_progress_protection_enabled'], FILTER_VALIDATE_BOOLEAN);
+            // Configuration validator folds in_progress_* aliases into herd_guard_* at config-tree level.
+            // The raw-array path used in tests bypasses the validator, so also read the alias keys here.
+            $g = $dataHubConfig['graphql'];
+            $enabledVal = $g['herd_guard_enabled'] ?? $g['in_progress_protection_enabled'] ?? null;
+            if ($enabledVal !== null) {
+                $this->herdGuardEnabled = filter_var($enabledVal, FILTER_VALIDATE_BOOLEAN);
             }
-            if (isset($dataHubConfig['graphql']['in_progress_queries']) && is_array($dataHubConfig['graphql']['in_progress_queries'])) {
-                $this->inProgressQueries = array_values(array_filter($dataHubConfig['graphql']['in_progress_queries'], static function ($v) {
-                    return is_string($v) && $v !== '';
-                }));
+            $ttlVal = $g['herd_guard_ttl'] ?? $g['in_progress_ttl'] ?? null;
+            if ($ttlVal !== null) {
+                $this->herdGuardTtl = max(1, intval($ttlVal));
             }
-            if (isset($dataHubConfig['graphql']['in_progress_ttl'])) {
-                $this->inProgressTtl = max(1, intval($dataHubConfig['graphql']['in_progress_ttl']));
+            $refreshVal = $g['herd_guard_refresh_interval'] ?? $g['in_progress_refresh_interval'] ?? null;
+            if ($refreshVal !== null) {
+                $this->herdGuardRefreshInterval = max(0, intval($refreshVal));
             }
-            if (isset($dataHubConfig['graphql']['in_progress_refresh_interval'])) {
-                $this->inProgressRefreshInterval = max(0, intval($dataHubConfig['graphql']['in_progress_refresh_interval']));
+            if ($this->herdGuardRefreshInterval === 0 && $this->herdGuardTtl > 1) {
+                $this->herdGuardRefreshInterval = max(1, (int) floor($this->herdGuardTtl / 2));
             }
-            if ($this->inProgressRefreshInterval === 0 && $this->inProgressTtl > 1) {
-                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
+            if ($this->herdGuardRefreshInterval >= $this->herdGuardTtl) {
+                $this->herdGuardRefreshInterval = max(1, (int) floor($this->herdGuardTtl / 2));
             }
-            if ($this->inProgressRefreshInterval >= $this->inProgressTtl) {
-                // Refresh must fire before the TTL elapses or the lock leaks for a full TTL window.
-                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
+            $httpStatusVal = $g['herd_guard_http_status'] ?? $g['in_progress_http_status'] ?? null;
+            if ($httpStatusVal !== null) {
+                $this->herdGuardHttpStatus = intval($httpStatusVal);
             }
-            if (isset($dataHubConfig['graphql']['in_progress_http_status'])) {
-                $this->inProgressHttpStatus = intval($dataHubConfig['graphql']['in_progress_http_status']);
+            if (array_key_exists('herd_guard_retry_after', $g) && $g['herd_guard_retry_after'] !== null) {
+                $this->herdGuardRetryAfter = intval($g['herd_guard_retry_after']);
+            } elseif (array_key_exists('in_progress_retry_after', $g) && $g['in_progress_retry_after'] !== null) {
+                $this->herdGuardRetryAfter = intval($g['in_progress_retry_after']);
             }
-            if (array_key_exists('in_progress_retry_after', $dataHubConfig['graphql'])) {
-                $v = $dataHubConfig['graphql']['in_progress_retry_after'];
-                $this->inProgressRetryAfter = $v === null ? null : intval($v);
-            }
-            if (isset($dataHubConfig['graphql']['in_progress_key_strategy'])) {
-                $strategy = (string) $dataHubConfig['graphql']['in_progress_key_strategy'];
-                $strategy = in_array($strategy, ['request', 'operation'], true) ? $strategy : 'request';
-                $this->inProgressKeyStrategy = $strategy;
+            $keyStrategyVal = $g['herd_guard_key_strategy'] ?? $g['in_progress_key_strategy'] ?? null;
+            if ($keyStrategyVal !== null) {
+                $strategy = (string) $keyStrategyVal;
+                $this->herdGuardKeyStrategy = in_array($strategy, ['request', 'operation'], true) ? $strategy : 'request';
             }
         }
     }
@@ -269,97 +266,31 @@ class OutputCacheService
     }
 
     /**
-     * Canonicalize the incoming JSON body for cache/lock keys:
-     * - Parse JSON
-     * - Optionally AST-normalize the GraphQL 'query'
-     * - Harmonize variables (treat missing vs null equivalently for declared vars)
-     * - Recursively ksort all associative arrays
-     * - Encode with stable json_encode flags
-     *
+     * Canonicalise the request body once per request. The AST parse + reprint
+     * in {@see GraphQLRequestCanonicalizer::canonicalize} is the expensive step;
+     * the standard-cache path touches it from three call sites (key, guard key,
+     * atomic-lock resource) so the result is memoised on the request attribute
+     * bag. Mirrors {@see PersistentOutputCacheService::canonicalizePayload}.
      */
-    private function canonicalizePayloadForCache(Request $request): string
+    private function canonicalizePayload(Request $request): string
     {
         $cached = $request->attributes->get('_datahub_canonical_payload');
         if (is_string($cached)) {
             return $cached;
         }
 
-        $payload = json_decode($request->getContent(), true);
-        if (!is_array($payload)) {
-            $payload = [];
-        }
-
-        if (!empty($payload['query']) && is_string($payload['query'])) {
-            $payload['query'] = $this->normalizeQueryAst($payload['query']);
-        }
-
-        $payload = $this->ksortRecursive($payload);
-
-        $canonical = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
-        );
-
-        // Guard against rare encode failures returning false
-        if (!is_string($canonical)) {
-            $canonical = '{}';
-        }
+        $canonical = GraphQLRequestCanonicalizer::canonicalize((string) $request->getContent());
 
         $request->attributes->set('_datahub_canonical_payload', $canonical);
 
         return $canonical;
     }
 
-    /**
-     * Parse and re-print the GraphQL query to a canonical form.
-     */
-    private function normalizeQueryAst(string $query): string
-    {
-        try {
-            /** @var DocumentNode $ast */
-            $ast = Parser::parse($query);
-
-            // Printer preserves a canonical formatting; not sorting selections (keeps semantic order)
-            return Printer::doPrint($ast);
-        } catch (\Throwable $e) {
-            // The query is already invalid; we cannot parse it. However, we still need some
-            // reproducible canonical form for caching/locking.
-            return trim($query);
-        }
-    }
-
-    /** Recursively ksort associative arrays; leave list arrays as-is (order significant). */
-    private function ksortRecursive(array $value): array
-    {
-        $isAssoc = static function (array $a): bool {
-            $i = 0;
-            foreach ($a as $k => $_) {
-                if ($k !== $i++) {
-                    return true;
-                }
-            }
-
-            return false;
-        };
-
-        if ($isAssoc($value)) {
-            ksort($value);
-        }
-
-        foreach ($value as $k => $v) {
-            if (is_array($v)) {
-                $value[$k] = $this->ksortRecursive($v);
-            }
-        }
-
-        return $value;
-    }
-
     /** Compute a cache key for the given request. */
     private function computeKey(Request $request): string
     {
         $clientname = (string) $request->attributes->get('clientname', '');
-        $payload    = $this->canonicalizePayloadForCache($request);
+        $payload    = $this->canonicalizePayload($request);
 
         return 'output_' . hash('sha256', 'client:' . $clientname . "\n" . $payload);
     }
@@ -397,7 +328,7 @@ class OutputCacheService
 
         // Fallback or additionally set a lightweight marker in cache for quick checks
         $guardKey = $this->computeGuardKey($request);
-        if ($this->inProgressLockExists($guardKey)) {
+        if ($this->herdGuardLockExists($guardKey)) {
             // Someone already set marker; if we do not own a lock, reject
             if (!$lock) {
                 return $this->buildInProgressResponse();
@@ -414,19 +345,15 @@ class OutputCacheService
     /** Determine if the current request should be protected. */
     private function shouldGuardRequest(Request $request): bool
     {
-        if (!$this->inProgressProtectionEnabled) {
+        if (!$this->herdGuardEnabled) {
             return false;
         }
 
-        // Tier attribute set by the controller from the `operations:` tree, OR
-        // the legacy `in_progress_queries:` membership check below — either
-        // gate engages the guard.
-        if ($request->attributes->get('_datahub_tier') === Tier::HERD_GUARDED->value) {
+        // Attribute path: controller pre-classified this operation; fallback reads classifier directly.
+        $tierRaw = $request->attributes->get('_datahub_tier');
+        $tier = $tierRaw instanceof Tier ? $tierRaw : (is_string($tierRaw) ? Tier::tryFrom($tierRaw) : null);
+        if ($tier !== null && $tier->engagesHerdGuard()) {
             return true;
-        }
-
-        if (empty($this->inProgressQueries)) {
-            return false;
         }
 
         $input = json_decode($request->getContent(), true) ?: [];
@@ -435,7 +362,8 @@ class OutputCacheService
             return false;
         }
 
-        return in_array($operationName, $this->inProgressQueries, true);
+        return $this->classifier !== null
+            && $this->classifier->getTier($operationName)->engagesHerdGuard();
     }
 
     /** Build cache key for the in-progress marker. */
@@ -460,8 +388,8 @@ class OutputCacheService
         return 'datahub_inprogress:' . md5('op_' . $operationName);
     }
 
-    /** Check if in-progress marker is present. */
-    private function inProgressLockExists(string $guardKey): bool
+    /** Check if herd-guard marker is present. */
+    private function herdGuardLockExists(string $guardKey): bool
     {
         return (bool) \Pimcore\Cache::load($this->lockKeyFor($guardKey));
     }
@@ -474,7 +402,7 @@ class OutputCacheService
         $key = $this->lockKeyFor($guardKey);
 
         // value is irrelevant; we only care about existence
-        \Pimcore\Cache::save(1, $key, $tags, $this->inProgressTtl, 1, true);
+        \Pimcore\Cache::save(1, $key, $tags, $this->herdGuardTtl, 1, true);
     }
 
     /** Remove the in-progress marker and clear the request attribute so the safety-net listener is a no-op. */
@@ -498,7 +426,7 @@ class OutputCacheService
     {
         $input = json_decode($request->getContent(), true) ?: [];
 
-        if ($this->inProgressKeyStrategy === 'operation') {
+        if ($this->herdGuardKeyStrategy === 'operation') {
             $operationName = $input['operationName'] ?? '';
             // If operationName is missing, fall back to full request body
             if ($operationName !== '') {
@@ -506,7 +434,7 @@ class OutputCacheService
             }
         }
 
-        $canonical = $this->canonicalizePayloadForCache($request);
+        $canonical = $this->canonicalizePayload($request);
 
         return hash('sha256', 'req:' . $canonical);
     }
@@ -524,28 +452,28 @@ class OutputCacheService
         }
 
         $input = json_decode($request->getContent(), true) ?: [];
-        $operationName = ($this->inProgressKeyStrategy === 'operation' && !empty($input['operationName']))
+        $operationName = ($this->herdGuardKeyStrategy === 'operation' && !empty($input['operationName']))
             ? $input['operationName']
             : '';
 
         if ($operationName !== '') {
             $resource = self::computeOperationLockKey($operationName);
         } else {
-            $canonical = $this->canonicalizePayloadForCache($request);
+            $canonical = $this->canonicalizePayload($request);
             $resource = 'datahub_inprogress:' . hash('sha256', 'req:' . $canonical);
         }
 
         try {
             // autoRelease=true so the Lock destructor releases on graceful PHP
             // shutdown even if save() and the safety-net listener both fail to run.
-            $lock = $factory->createLock($resource, $this->inProgressTtl, true);
+            $lock = $factory->createLock($resource, $this->herdGuardTtl, true);
             if ($lock->acquire(false)) {
                 // keep reference on request for releasing in save()
                 $request->attributes->set('datahub_inprogress_lock', $lock);
                 LockSignalRefresher::arm(
                     $lock,
-                    $this->inProgressTtl,
-                    $this->inProgressRefreshInterval,
+                    $this->herdGuardTtl,
+                    $this->herdGuardRefreshInterval,
                     $this->lockKeyFor($this->computeGuardKey($request)),
                     ['datahub_inprogress', $request->attributes->getString('clientname')]
                 );
@@ -605,9 +533,9 @@ class OutputCacheService
             ],
         ];
 
-        $response = new JsonResponse($payload, $this->inProgressHttpStatus);
-        if ($this->inProgressRetryAfter !== null) {
-            $response->headers->set('Retry-After', (string) max(0, $this->inProgressRetryAfter));
+        $response = new JsonResponse($payload, $this->herdGuardHttpStatus);
+        if ($this->herdGuardRetryAfter !== null) {
+            $response->headers->set('Retry-After', (string) max(0, $this->herdGuardRetryAfter));
         }
 
         return $response;
