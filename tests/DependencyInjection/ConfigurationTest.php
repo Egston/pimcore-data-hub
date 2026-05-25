@@ -222,4 +222,55 @@ final class ConfigurationTest extends TestCase
         self::assertArrayHasKey('testOpSingleSwr', $graphql['operations']);
         self::assertArrayNotHasKey('test_op_single_swr', $graphql['operations']);
     }
+
+    public function testPersistentRefreshPriorityStrategyDefaultsToOldestFirst(): void
+    {
+        $graphql = $this->process([]);
+        self::assertSame('oldest_refreshed_at_first', $graphql['persistent_refresh_priority_strategy']);
+        self::assertSame(600, $graphql['persistent_refresh_priority_visibility_timeout']);
+        self::assertSame(5, $graphql['persistent_refresh_priority_requeue_score_bump']);
+        self::assertSame(60, $graphql['persistent_refresh_priority_weight_band_seconds']);
+    }
+
+    public function testPersistentRefreshPriorityStrategyDisabledAccepted(): void
+    {
+        $graphql = $this->process([
+            'persistent_refresh_priority_strategy' => 'disabled',
+        ]);
+        self::assertSame('disabled', $graphql['persistent_refresh_priority_strategy']);
+    }
+
+    public function testPersistentRefreshPriorityStrategyWithWeightBandsAccepted(): void
+    {
+        $graphql = $this->process([
+            'persistent_refresh_priority_strategy' => 'oldest_refreshed_at_first_with_weight_bands',
+            'persistent_refresh_priority_weight_band_seconds' => 120,
+        ]);
+        self::assertSame('oldest_refreshed_at_first_with_weight_bands', $graphql['persistent_refresh_priority_strategy']);
+        self::assertSame(120, $graphql['persistent_refresh_priority_weight_band_seconds']);
+    }
+
+    public function testPersistentRefreshPriorityWeightBandSecondsZeroAccepted(): void
+    {
+        $graphql = $this->process([
+            'persistent_refresh_priority_weight_band_seconds' => 0,
+        ]);
+        self::assertSame(0, $graphql['persistent_refresh_priority_weight_band_seconds']);
+    }
+
+    public function testPersistentRefreshPriorityWeightBandSecondsNegativeRejects(): void
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->process([
+            'persistent_refresh_priority_weight_band_seconds' => -1,
+        ]);
+    }
+
+    public function testPersistentRefreshPriorityStrategyUnknownRejects(): void
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->process([
+            'persistent_refresh_priority_strategy' => 'bogus_strategy',
+        ]);
+    }
 }

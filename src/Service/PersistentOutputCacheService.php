@@ -173,6 +173,7 @@ class PersistentOutputCacheService
             $request->attributes->set('_datahub_persistent_refresh', true);
             $request->attributes->set('_datahub_persistent_meta_key', $metaKey);
             $request->attributes->set('_datahub_persistent_payload_key', $payloadKey);
+            $request->attributes->set('_datahub_persistent_refreshed_at', $refreshedAt);
 
             return $response;
         }

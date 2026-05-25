@@ -21,6 +21,7 @@ use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Cache as PimcoreCache;
 use Pimcore\Helper\LongRunningHelper;
@@ -54,6 +55,8 @@ use Symfony\Component\Messenger\MessageBusInterface;
  */
 class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterface
 {
+    private bool $emittedEmptyClassifierWarning = false;
+
     public function __construct(
         private WebserviceController $controller,
         private GraphQLService $graphQlService,
@@ -62,6 +65,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         private LongRunningHelper $longRunningHelper,
         private ResponseServiceInterface $responseService,
         private ContainerBagInterface $container,
+        private OperationClassifier $classifier,
         private ?LockFactory $lockFactory = null,
         private ?MessageBusInterface $bus = null
     ) {
@@ -123,7 +127,21 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
                 return;
             }
             $this->cacheSave(1, $dedupeKey, ['datahub_graphql_persistent'], $enqueueTtl);
-            $this->bus->dispatch(new PersistentRefreshMessage($client, $payload, $op));
+            $strategy = (string)($graphql['persistent_refresh_priority_strategy'] ?? 'oldest_refreshed_at_first');
+            if ($strategy === 'oldest_refreshed_at_first_with_weight_bands'
+                && !$this->emittedEmptyClassifierWarning
+                && !$this->classifier->hasAnyOperations()
+            ) {
+                $this->emittedEmptyClassifierWarning = true;
+                Logger::warning('datahub.refresh_dispatch: band-offset strategy active but OperationClassifier has zero loaded operations — verify bundle config');
+            }
+            $refreshedAt = null;
+            $priorityWeight = $op !== null ? $this->classifier->getPriorityWeight($op) : null;
+            if ($strategy === 'oldest_refreshed_at_first' || $strategy === 'oldest_refreshed_at_first_with_weight_bands') {
+                $attr = $request->attributes->get('_datahub_persistent_refreshed_at');
+                $refreshedAt = is_int($attr) && $attr > 0 ? $attr : time();
+            }
+            $this->bus->dispatch(new PersistentRefreshMessage($client, $payload, $op, $refreshedAt, $priorityWeight));
         } catch (\Throwable $e) {
             Logger::error('datahub.refresh_dispatch: queue dispatch failed: ' . $e->getMessage());
         }

@@ -140,6 +140,12 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
     }
 
     /**
+     * Per-tag bus dispatch. The refresh-priority score on each dispatched
+     * message is `time()` because no per-entry refreshedAt context is
+     * available in the invalidation path — every entry is freshly stale, so
+     * the queue treats them as roughly equivalent and ZPOPMIN orders by
+     * insertion time within the same-second bucket.
+     *
      * @param list<string> $tags
      *
      * @return int number of bus dispatches that fired
@@ -209,7 +215,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                 $this->bus->dispatch(new PersistentRefreshMessage(
                     $client,
                     $canonical,
-                    $operation !== '' ? $operation : null
+                    $operation !== '' ? $operation : null,
+                    time()
                 ));
                 ++$dispatchCount;
             }

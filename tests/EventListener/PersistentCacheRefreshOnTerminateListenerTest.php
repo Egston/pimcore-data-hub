@@ -22,6 +22,7 @@ use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
 use Pimcore\Bundle\DataHubBundle\EventListener\PersistentCacheRefreshOnTerminateListener;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
@@ -94,6 +95,7 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         };
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn(['graphql' => $graphqlConfig]);
+        $classifier = new OperationClassifier($container);
 
         return new PersistentCacheRefreshOnTerminateListener(
             $controller,
@@ -103,6 +105,7 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
             $longRunningHelper,
             $responseService,
             $container,
+            $classifier,
             $lockFactory,
             $bus
         );
@@ -490,8 +493,9 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         };
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn(['graphql' => $graphql]);
+        $classifier = new OperationClassifier($container);
 
-        $listener = new class($controller, $graphQlService, $localeService, $factory, $longRunningHelper, $responseService, $container, null, $bus) extends PersistentCacheRefreshOnTerminateListener {
+        $listener = new class($controller, $graphQlService, $localeService, $factory, $longRunningHelper, $responseService, $container, $classifier, null, $bus) extends PersistentCacheRefreshOnTerminateListener {
             /** @var array<string, mixed> */
             private array $store = [];
 
@@ -555,8 +559,9 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         };
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn(['graphql' => $graphqlConfig]);
+        $classifier = new OperationClassifier($container);
 
-        return new class($controller, $graphQlService, $localeService, $factory, $longRunningHelper, $responseService, $container, null, $bus) extends PersistentCacheRefreshOnTerminateListener {
+        return new class($controller, $graphQlService, $localeService, $factory, $longRunningHelper, $responseService, $container, $classifier, null, $bus) extends PersistentCacheRefreshOnTerminateListener {
             /** @var array<string, mixed> */
             private array $store = [];
 

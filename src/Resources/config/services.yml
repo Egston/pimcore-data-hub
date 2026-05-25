@@ -30,6 +30,12 @@ services:
         resource: '../../MessageHandler'
         public: false
 
+    Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransportFactory:
+        arguments:
+            $container: '@parameter_bag'
+        tags:
+            - { name: messenger.transport_factory }
+
     Pimcore\Bundle\DataHubBundle\Installer:
         public: true
         arguments:
