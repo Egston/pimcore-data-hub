@@ -15,12 +15,21 @@
             -->
             <file>tests/Command/PersistentCacheClearCommandTest.php</file>
             <file>tests/Controller/WebserviceControllerTierGateTest.php</file>
+            <file>tests/Controller/WebserviceControllerSwrColdMissTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceBackendTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceGateTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceColdMissLockTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceTagCollectionTest.php</file>
             <file>tests/Service/OperationClassifierTest.php</file>
+            <file>tests/Service/DependencyCollectorTest.php</file>
             <file>tests/EventListener/InProgressLockReleaseListenerTest.php</file>
+            <file>tests/EventListener/ObjectLoadListenerTest.php</file>
+            <file>tests/EventListener/DependencyCollectorResetListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheInvalidationListenerTest.php</file>
             <file>tests/Lock/LockSignalRefresherTest.php</file>
             <file>tests/DependencyInjection/ConfigurationTest.php</file>
+            <file>tests/Functional/CoverageProbeTest.php</file>
         </testsuite>
     </testsuites>
     <coverage>

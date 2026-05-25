@@ -5,6 +5,9 @@ services:
         autoconfigure: true
         public: false
 
+    Pimcore\Bundle\DataHubBundle\Service\DependencyCollector:
+        shared: true
+
     Pimcore\Bundle\DataHubBundle\EventListener\DataChangeListener:
         tags:
             - { name: kernel.event_subscriber }
@@ -24,5 +27,13 @@ services:
             - { name: kernel.event_subscriber }
 
     Pimcore\Bundle\DataHubBundle\EventListener\InProgressLockReleaseListener:
+        tags:
+            - { name: kernel.event_subscriber }
+
+    Pimcore\Bundle\DataHubBundle\EventListener\ObjectLoadListener:
+        tags:
+            - { name: kernel.event_subscriber }
+
+    Pimcore\Bundle\DataHubBundle\EventListener\DependencyCollectorResetListener:
         tags:
             - { name: kernel.event_subscriber }

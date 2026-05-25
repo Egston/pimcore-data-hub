@@ -23,6 +23,7 @@ use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
+use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
@@ -77,19 +78,7 @@ class OutputCacheService
      */
     private $pcntlRefresherInstalled = false;
 
-    /**
-     * Cached Redis-backed LockFactory built lazily from REDIS_DSN. Kept on
-     * the instance so each request only pays the connection setup once.
-     *
-     * @var object|null
-     */
-    private $herdLockFactory = null;
-
-    /**
-     * Whether we already attempted Redis factory construction this request.
-     * Distinguishes "not tried yet" from "tried and got null".
-     */
-    private bool $herdLockFactoryResolved = false;
+    private LockFactoryResolver $lockFactoryResolver;
 
     /**
      * HTTP status code used when rejecting duplicates.
@@ -113,9 +102,13 @@ class OutputCacheService
      */
     public $eventDispatcher;
 
-    public function __construct(ContainerBagInterface $container, EventDispatcherInterface $eventDispatcher)
-    {
+    public function __construct(
+        ContainerBagInterface $container,
+        EventDispatcherInterface $eventDispatcher,
+        ?LockFactoryResolver $lockFactoryResolver = null
+    ) {
         $this->eventDispatcher = $eventDispatcher;
+        $this->lockFactoryResolver = $lockFactoryResolver ?? new LockFactoryResolver();
 
         $dataHubConfig = $container->get('pimcore_data_hub');
         if (isset($dataHubConfig['graphql'])) {
@@ -503,75 +496,13 @@ class OutputCacheService
     }
 
     /**
-     * Resolve a Symfony LockFactory if available. Prefers a Redis-backed
-     * factory built from REDIS_DSN so the herd guard pays sub-ms refresh
-     * cost and gets native TTL auto-eviction; falls back to whatever
-     * Pimcore wires as the default (typically DoctrineDbalStore-backed),
-     * and finally to null when Lock isn't installed at all.
-     *
-     * Result is cached on the instance so we only build the Redis
-     * connection once per request.
-     *
-     * @return object|null
-     */
-    private function getLockFactory()
-    {
-        if ($this->herdLockFactoryResolved) {
-            return $this->herdLockFactory;
-        }
-        $this->herdLockFactoryResolved = true;
-
-        if (!class_exists('Symfony\\Component\\Lock\\LockFactory')) {
-            return null;
-        }
-
-        // Preferred path: Redis-backed store. Short-lived TTL-based locks belong
-        // in Redis — auto-expiry, no row-leak, faster than DBAL UPDATEs each
-        // refresh tick.
-        try {
-            $dsn = getenv('REDIS_DSN') ?: ($_ENV['REDIS_DSN'] ?? null);
-            if (is_string($dsn) && $dsn !== ''
-                && class_exists('Symfony\\Component\\Lock\\Store\\StoreFactory')) {
-                $store = \Symfony\Component\Lock\Store\StoreFactory::createStore($dsn);
-                $this->herdLockFactory = new \Symfony\Component\Lock\LockFactory($store);
-
-                return $this->herdLockFactory;
-            }
-        } catch (\Throwable $e) {
-            Logger::warning(
-                'DataHub in-progress: Redis-backed lock factory unavailable, '
-                . 'falling back to Pimcore default: ' . $e->getMessage()
-            );
-        }
-
-        // Fallback: Pimcore's default lock factory (DBAL or whatever is wired).
-        try {
-            $container = \Pimcore::getContainer();
-            if ($container && $container->has('lock.factory')) {
-                $this->herdLockFactory = $container->get('lock.factory');
-
-                return $this->herdLockFactory;
-            }
-            if ($container && $container->has('Symfony\\Component\\Lock\\LockFactory')) {
-                $this->herdLockFactory = $container->get('Symfony\\Component\\Lock\\LockFactory');
-
-                return $this->herdLockFactory;
-            }
-        } catch (\Throwable $e) {
-            // ignore
-        }
-
-        return null;
-    }
-
-    /**
      * Try to acquire a non-blocking lock for this request.
      *
      * @return object|false|null Returns lock object on success, false if held by others, null if locking unavailable
      */
     private function acquireAtomicLock(Request $request)
     {
-        $factory = $this->getLockFactory();
+        $factory = $this->lockFactoryResolver->resolve();
         if (!$factory) {
             return null;
         }
