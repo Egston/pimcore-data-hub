@@ -180,162 +180,211 @@ class WebserviceController extends FrontendController
         $graphqlCfg = $configAll['graphql'] ?? [];
         $skipOutputCacheForGuarded = (bool)($graphqlCfg['persistent_disable_output_cache_for_guarded'] ?? false);
 
-        // When running a background refresh, bypass the standard output cache layer
-        $isPersistentRefresh = (bool)$request->attributes->get('_datahub_persistent_refresh');
-        $isPersistentApplies = (bool)$request->attributes->get('_datahub_persistent_applies');
-        $skipOutputCache = $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
+        // SWR_ONLY cold-miss path. Winner acquires a Symfony Lock keyed by the
+        // sidecar key pair and runs the resolver inline; losers poll for the
+        // winner's cache write up to swr_cold_miss_lock_wait_ms and fall
+        // through to their own inline resolver after the deadline. The
+        // never-503-for-browsers invariant rides on this fallback — a stuck
+        // winner can't pin all FPM workers indefinitely. SWR_ONLY and
+        // HERD_GUARDED are mutually exclusive per request by construction
+        // (single tier classification per operationName), so this branch
+        // never overlaps with the herd-guard atomic lock above.
+        $lock = null;
+        if ($tier === Tier::SWR_ONLY
+            && !$request->attributes->get('_datahub_persistent_refresh')
+        ) {
+            $waitMs = max(0, (int)($graphqlCfg['swr_cold_miss_lock_wait_ms'] ?? 5000));
+            $lockTtl = max(1, (int)($graphqlCfg['swr_cold_miss_lock_ttl'] ?? 30));
 
-        if (!$skipOutputCache && ($response = $this->cacheService->load($request))) {
-            Logger::debug('Output cache HIT');
+            $lock = $this->persistentCacheService->acquireColdMissLock($request, $lockTtl);
+            if ($lock === null && $waitMs > 0) {
+                $deadline = microtime(true) + ($waitMs / 1000.0);
+                while (microtime(true) < $deadline) {
+                    // SIGALRM from a foreign LockSignalRefresher tick will
+                    // return usleep early; the next iteration just re-probes
+                    // preHandle and re-sleeps with a shorter quantum.
+                    usleep(50_000);
+                    $pResponse = $this->persistentCacheService->preHandle($request, $responseService);
+                    if ($pResponse) {
+                        $responseService->addHitMissHeaders($pResponse, true);
 
-            $responseService->addCorsHeaders($response);
-            $responseService->addHitMissHeaders($response, true);
-
-            return $response;
-        }
-
-        Logger::debug('Output cache MISS');
-
-        // Try to acquire an in-progress marker for selected protected queries to avoid thundering herd.
-        // HERD_GUARDED operations already ran the early-gate above; this fallback handles the legacy
-        // in_progress_queries-only path (operation absent from the new `operations:` tree).
-        if ($tier !== Tier::HERD_GUARDED) {
-            if ($inProgressResponse = $this->cacheService->maybeRejectOrAcquire($request)) {
-                Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
-                $responseService->addCorsHeaders($inProgressResponse);
-
-                return $inProgressResponse;
+                        return $pResponse;
+                    }
+                }
+                // Timeout: a poll iteration may have briefly observed STALE
+                // and set _datahub_persistent_refresh; clear it so postHandle
+                // does not trigger a kernel.terminate refresh against the
+                // response we are about to write inline.
+                $request->attributes->remove('_datahub_persistent_refresh');
             }
         }
-
-        // If we get here and a lock attribute exists, we acquired the protection lock
-        if ($request->attributes->get('datahub_inprogress_lock')) {
-            Logger::debug(sprintf('In-progress: lock ACQUIRED (operationName=%s)', (string)$operationName));
-        } else {
-            Logger::debug('In-progress: no protection (not enabled or query not listed)');
-        }
-
-        // context info, will be passed on to all resolver function
-        $context = ['clientname' => $clientname, 'configuration' => $configuration];
-
-        $config = $this->getParameter('pimcore_data_hub');
-
-        if (isset($config['graphql']) && isset($config['graphql']['not_allowed_policy'])) {
-            PimcoreDataHubBundle::setNotAllowedPolicy($config['graphql']['not_allowed_policy']);
-        }
-
-        $longRunningHelper->addPimcoreRuntimeCacheProtectedItems([PimcoreDataHubBundle::RUNTIME_CONTEXT_KEY]);
-        RuntimeCache::set(PimcoreDataHubBundle::RUNTIME_CONTEXT_KEY, $context);
-
-        ClassTypeDefinitions::build($service, $context);
-
-        $queryType = new QueryType($service, $localeService, $modelFactory, $this->eventDispatcher, [], $context);
-        $mutationType = new MutationType($service, $localeService, $modelFactory, $this->eventDispatcher, [], $context);
 
         try {
-            $schemaConfig = [
-                'query' => $queryType,
-            ];
-            if (!$mutationType->isEmpty()) {
-                $schemaConfig['mutation'] = $mutationType;
+            if ($lock !== null) {
+                $request->attributes->set(PersistentOutputCacheService::REQUEST_ATTR_COLD_MISS_LOCK, $lock);
             }
-            $schema = new \GraphQL\Type\Schema(
-                $schemaConfig
-            );
-        } catch (\Exception $e) {
-            Warning::enable(false);
-            $schema = new \GraphQL\Type\Schema(
-                [
-                    'query' => $queryType,
-                    'mutation' => $mutationType,
-                ]
-            );
-            $schema->assertValid();
-            Logger::error($e);
+            // When running a background refresh, bypass the standard output cache layer
+            $isPersistentRefresh = (bool)$request->attributes->get('_datahub_persistent_refresh');
+            $isPersistentApplies = (bool)$request->attributes->get('_datahub_persistent_applies');
+            $skipOutputCache = $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
 
-            throw $e;
-        }
+            if (!$skipOutputCache && ($response = $this->cacheService->load($request))) {
+                Logger::debug('Output cache HIT');
 
-        $contentType = $request->headers->get('content-type') ?? '';
+                $responseService->addCorsHeaders($response);
+                $responseService->addHitMissHeaders($response, true);
 
-        if (mb_stripos($contentType, 'multipart/form-data') !== false) {
-            $input = $this->uploadService->parseUploadedFiles($request);
-        } else {
-            $input = json_decode($request->getContent(), true);
-        }
-
-        $query = $input['query'] ?? '';
-
-        try {
-            $rootValue = [];
-
-            $validators = null;
-
-            $event = new ExecutorEvent(
-                $request,
-                $query,
-                $schema,
-                $context
-            );
-
-            $this->eventDispatcher->dispatch($event, ExecutorEvents::PRE_EXECUTE);
-
-            if ($event->getRequest() instanceof Request) {
-                $variableValues = $event->getRequest()->request->all('variables');
+                return $response;
             }
 
-            if (!$variableValues) {
-                $variableValues = $input['variables'] ?? null;
+            Logger::debug('Output cache MISS');
+
+            // Try to acquire an in-progress marker for selected protected queries to avoid thundering herd.
+            // HERD_GUARDED operations already ran the early-gate above; this fallback handles the legacy
+            // in_progress_queries-only path (operation absent from the new `operations:` tree).
+            if ($tier !== Tier::HERD_GUARDED) {
+                if ($inProgressResponse = $this->cacheService->maybeRejectOrAcquire($request)) {
+                    Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
+                    $responseService->addCorsHeaders($inProgressResponse);
+
+                    return $inProgressResponse;
+                }
             }
 
-            $configAllowIntrospection = true;
-            if (isset($config['graphql']) && isset($config['graphql']['allow_introspection'])) {
-                $configAllowIntrospection = $config['graphql']['allow_introspection'];
-            }
-
-            $disableIntrospection = !$configAllowIntrospection || (isset($configuration->getSecurityConfig()['disableIntrospection']) && $configuration->getSecurityConfig()['disableIntrospection']);
-
-            DocumentValidator::addRule(new DisableIntrospection((int)$disableIntrospection));
-
-            $result = GraphQL::executeQuery(
-                $event->getSchema(),
-                $event->getQuery(),
-                $rootValue,
-                $event->getContext(),
-                $variableValues,
-                null,
-                null,
-                $validators
-            );
-
-            $exResult = new ExecutorResultEvent($request, $result);
-            $this->eventDispatcher->dispatch($exResult, ExecutorEvents::POST_EXECUTE);
-            $result = $exResult->getResult();
-
-            if (\Pimcore::inDebugMode()) {
-                $debug = DebugFlag::INCLUDE_DEBUG_MESSAGE | DebugFlag::INCLUDE_TRACE;
-                $output = $result->toArray($debug);
+            // If we get here and a lock attribute exists, we acquired the protection lock
+            if ($request->attributes->get('datahub_inprogress_lock')) {
+                Logger::debug(sprintf('In-progress: lock ACQUIRED (operationName=%s)', (string)$operationName));
             } else {
-                $output = $result->toArray();
+                Logger::debug('In-progress: no protection (not enabled or query not listed)');
             }
-        } catch (\Exception $e) {
-            $output = [
-                'errors' => [
+
+            // context info, will be passed on to all resolver function
+            $context = ['clientname' => $clientname, 'configuration' => $configuration];
+
+            $config = $this->getParameter('pimcore_data_hub');
+
+            if (isset($config['graphql']) && isset($config['graphql']['not_allowed_policy'])) {
+                PimcoreDataHubBundle::setNotAllowedPolicy($config['graphql']['not_allowed_policy']);
+            }
+
+            $longRunningHelper->addPimcoreRuntimeCacheProtectedItems([PimcoreDataHubBundle::RUNTIME_CONTEXT_KEY]);
+            RuntimeCache::set(PimcoreDataHubBundle::RUNTIME_CONTEXT_KEY, $context);
+
+            ClassTypeDefinitions::build($service, $context);
+
+            $queryType = new QueryType($service, $localeService, $modelFactory, $this->eventDispatcher, [], $context);
+            $mutationType = new MutationType($service, $localeService, $modelFactory, $this->eventDispatcher, [], $context);
+
+            try {
+                $schemaConfig = [
+                    'query' => $queryType,
+                ];
+                if (!$mutationType->isEmpty()) {
+                    $schemaConfig['mutation'] = $mutationType;
+                }
+                $schema = new \GraphQL\Type\Schema(
+                    $schemaConfig
+                );
+            } catch (\Exception $e) {
+                Warning::enable(false);
+                $schema = new \GraphQL\Type\Schema(
                     [
-                        'message' => $e->getMessage(),
+                        'query' => $queryType,
+                        'mutation' => $mutationType,
+                    ]
+                );
+                $schema->assertValid();
+                Logger::error($e);
+
+                throw $e;
+            }
+
+            $contentType = $request->headers->get('content-type') ?? '';
+
+            if (mb_stripos($contentType, 'multipart/form-data') !== false) {
+                $input = $this->uploadService->parseUploadedFiles($request);
+            } else {
+                $input = json_decode($request->getContent(), true);
+            }
+
+            $query = $input['query'] ?? '';
+
+            try {
+                $rootValue = [];
+
+                $validators = null;
+
+                $event = new ExecutorEvent(
+                    $request,
+                    $query,
+                    $schema,
+                    $context
+                );
+
+                $this->eventDispatcher->dispatch($event, ExecutorEvents::PRE_EXECUTE);
+
+                if ($event->getRequest() instanceof Request) {
+                    $variableValues = $event->getRequest()->request->all('variables');
+                }
+
+                if (!$variableValues) {
+                    $variableValues = $input['variables'] ?? null;
+                }
+
+                $configAllowIntrospection = true;
+                if (isset($config['graphql']) && isset($config['graphql']['allow_introspection'])) {
+                    $configAllowIntrospection = $config['graphql']['allow_introspection'];
+                }
+
+                $disableIntrospection = !$configAllowIntrospection || (isset($configuration->getSecurityConfig()['disableIntrospection']) && $configuration->getSecurityConfig()['disableIntrospection']);
+
+                DocumentValidator::addRule(new DisableIntrospection((int)$disableIntrospection));
+
+                $result = GraphQL::executeQuery(
+                    $event->getSchema(),
+                    $event->getQuery(),
+                    $rootValue,
+                    $event->getContext(),
+                    $variableValues,
+                    null,
+                    null,
+                    $validators
+                );
+
+                $exResult = new ExecutorResultEvent($request, $result);
+                $this->eventDispatcher->dispatch($exResult, ExecutorEvents::POST_EXECUTE);
+                $result = $exResult->getResult();
+
+                if (\Pimcore::inDebugMode()) {
+                    $debug = DebugFlag::INCLUDE_DEBUG_MESSAGE | DebugFlag::INCLUDE_TRACE;
+                    $output = $result->toArray($debug);
+                } else {
+                    $output = $result->toArray();
+                }
+            } catch (\Exception $e) {
+                $output = [
+                    'errors' => [
+                        [
+                            'message' => $e->getMessage(),
+                        ],
                     ],
-                ],
-            ];
+                ];
+            }
+
+            $response = new JsonResponse($output);
+
+            $responseService->removeCorsHeaders($response);
+            if (!$skipOutputCache) {
+                $this->cacheService->save($request, $response);
+            }
+
+            $this->persistentCacheService->postHandle($request, $response);
+        } finally {
+            $this->persistentCacheService->releaseColdMissLock(
+                $request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_COLD_MISS_LOCK)
+            );
+            $request->attributes->remove(PersistentOutputCacheService::REQUEST_ATTR_COLD_MISS_LOCK);
         }
-
-        $response = new JsonResponse($output);
-
-        $responseService->removeCorsHeaders($response);
-        if (!$skipOutputCache) {
-            $this->cacheService->save($request, $response);
-        }
-
-        $this->persistentCacheService->postHandle($request, $response);
         $responseService->addCorsHeaders($response);
         $responseService->addHitMissHeaders($response, false);
 

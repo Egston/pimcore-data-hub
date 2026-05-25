@@ -22,17 +22,25 @@ use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Event\AssetEvents;
 use Pimcore\Event\DataObjectEvents;
 use Pimcore\Event\DocumentEvents;
+use Pimcore\Event\Model\ElementEventInterface;
 use Pimcore\Logger;
+use Pimcore\Model\Element\ElementInterface;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Contracts\EventDispatcher\Event;
 
 /**
  * Marks the persistent GraphQL cache as potentially stale when content changes.
  *
- * This is a best-effort fallback to track a last-invalidation timestamp that
- * we compare against cached responses. It does not depend on Pimcore's 'output'
- * tag invalidation directly, but on relevant content change events instead.
+ * Per-tag invalidation path: each changed element yields a per-object tag
+ * (`TAG_OBJECT_PREFIX . <sanitized-class>_<id>`) and a per-class tag
+ * (`TAG_CLASS_PREFIX . <sanitized-class>`). The reverse index
+ * (`REVERSE_INDEX_PREFIX . <tag>`) is consulted to find the
+ * `<payloadKey, metaKey>` pairs that depend on the changed tag; those are
+ * either dispatched to the refresh queue (when enabled) or fall through to
+ * the global watermark bump as the safety floor that preserves the
+ * `lastInvalidation > refreshedAt` stale-detection in preHandle.
  */
 class PersistentCacheInvalidationListener implements EventSubscriberInterface
 {
@@ -55,35 +63,128 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
         ];
     }
 
-    public function mark(): void
+    public function mark(Event $event): void
     {
-        $this->persistentCache->markOutputInvalidated();
-
-        // Additionally schedule background refreshes for every persisted entry
-        // when async refresh is enabled. INDEX_ALL is iterated so non-guarded
-        // operations (persistent_output_cache_guard_only=false) are covered too;
-        // herd protection and the index are independent concerns.
         try {
             $cfg = $this->container->get('pimcore_data_hub');
-            $graphql = $cfg['graphql'] ?? [];
-            if (!($graphql['persistent_refresh_queue_enabled'] ?? false) || $this->bus === null) {
-                return;
-            }
-
+            $graphql = is_array($cfg) ? ($cfg['graphql'] ?? []) : [];
+            $queueEnabled = ($graphql['persistent_refresh_queue_enabled'] ?? false) && $this->bus !== null;
             $enqueueTtl = max(1, (int)($graphql['persistent_enqueue_dedupe_ttl'] ?? 60));
 
-            $list = \Pimcore\Cache::load(PersistentOutputCacheService::INDEX_ALL);
-            if (!is_array($list)) {
+            if (!$queueEnabled) {
+                // Safety floor: the global watermark bump preserves the
+                // `lastInvalidation > refreshedAt` stale-detection in preHandle
+                // when the queue path is disabled.
+                $this->persistentCache->markOutputInvalidated();
+
                 return;
             }
-            $metaPrefixLen = strlen(PersistentOutputCacheService::PAYLOAD_KEY_PREFIX);
-            foreach ($list as $payloadKey) {
-                if (!is_string($payloadKey) || !str_starts_with($payloadKey, PersistentOutputCacheService::PAYLOAD_KEY_PREFIX)) {
+
+            $element = $this->extractElement($event);
+            if ($element === null) {
+                // Non-element event on the queue-enabled path: fall back to the watermark
+                // so invalidation is never silently dropped.
+                $this->persistentCache->markOutputInvalidated();
+
+                return;
+            }
+
+            $tags = $this->tagsForElement($element);
+            $dispatched = $this->dispatchForTags($tags, $enqueueTtl);
+            if ($dispatched === 0) {
+                // Zero bus dispatches: every tag missed the reverse index, all pairs were
+                // malformed/deduped, or tagsForElement returned []. Bump the watermark so
+                // the invalidation is never silently lost.
+                $this->persistentCache->markOutputInvalidated();
+            }
+        } catch (\Throwable $e) {
+            Logger::error('persistent_cache_invalidation: ' . $e->getMessage(), ['exception' => $e]);
+
+            // Safety floor: bump the watermark so any exception in the queue-dispatch path
+            // does not silently drop the invalidation signal.
+            try {
+                $this->persistentCache->markOutputInvalidated();
+            } catch (\Throwable) {
+                // best effort
+            }
+        }
+    }
+
+    private function extractElement(Event $event): ?ElementInterface
+    {
+        if ($event instanceof ElementEventInterface) {
+            return $event->getElement();
+        }
+
+        return null;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function tagsForElement(?ElementInterface $element): array
+    {
+        if ($element === null) {
+            return [];
+        }
+        $id = $element->getId();
+        if ($id === null) {
+            return [];
+        }
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($element), '\\'));
+
+        return [
+            PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_' . $id,
+            PersistentOutputCacheService::TAG_CLASS_PREFIX . $sanitizedClass,
+        ];
+    }
+
+    /**
+     * @param list<string> $tags
+     *
+     * @return int number of bus dispatches that fired
+     */
+    private function dispatchForTags(array $tags, int $enqueueTtl): int
+    {
+        if ($tags === []) {
+            return 0;
+        }
+        $seenPayloadKeys = [];
+        $dispatchCount = 0;
+        foreach ($tags as $tag) {
+            $list = $this->cacheLoad(PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $tag);
+            if (!is_array($list) || $list === []) {
+                if (str_starts_with($tag, PersistentOutputCacheService::TAG_OBJECT_PREFIX)) {
+                    Logger::debug('persistent_cache_invalidation: reverse-index empty for per-object tag', ['tag' => $tag]);
+                }
+
+                continue;
+            }
+            foreach ($list as $pair) {
+                if (!is_array($pair) || count($pair) < 2) {
                     continue;
                 }
-                $metaKey = PersistentOutputCacheService::META_KEY_PREFIX . substr($payloadKey, $metaPrefixLen);
-                $meta = \Pimcore\Cache::load($metaKey);
+                if (!is_string($pair[0]) || !is_string($pair[1])) {
+                    Logger::warning('persistent_cache_invalidation: reverse-index entry not a string pair', ['tag' => $tag]);
+
+                    continue;
+                }
+                $payloadKey = $pair[0];
+                $metaKey = $pair[1];
+                if ($payloadKey === '' || $metaKey === '' || isset($seenPayloadKeys[$payloadKey])) {
+                    continue;
+                }
+                if (!str_starts_with($payloadKey, PersistentOutputCacheService::PAYLOAD_KEY_PREFIX)) {
+                    Logger::warning('persistent_cache_invalidation: payload key missing expected prefix', ['tag' => $tag]);
+
+                    continue;
+                }
+                $seenPayloadKeys[$payloadKey] = true;
+
+                $meta = $this->cacheLoad($metaKey);
                 if (!is_array($meta)) {
+                    Logger::debug('persistent_cache_invalidation: meta key evicted or never written, skipping pair', ['tag' => $tag, 'metaKey' => $metaKey]);
+
                     continue;
                 }
                 $client = (string)($meta['client'] ?? '');
@@ -92,24 +193,47 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                 if ($client === '' || $canonical === '') {
                     continue;
                 }
+
                 $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX
                     . hash('sha256', 'client:' . $client . "\n" . $canonical);
-                $existing = \Pimcore\Cache::load($dedupeKey);
+                $existing = $this->cacheLoad($dedupeKey);
                 if ($existing !== false && $existing !== null) {
                     continue;
                 }
-                \Pimcore\Cache::save(
+                $this->cacheSave(
                     1,
                     $dedupeKey,
                     [PersistentOutputCacheService::TAG_COMMON],
-                    $enqueueTtl,
-                    1,
-                    true
+                    $enqueueTtl
                 );
-                $this->bus->dispatch(new PersistentRefreshMessage($client, $canonical, $operation !== '' ? $operation : null));
+                $this->bus->dispatch(new PersistentRefreshMessage(
+                    $client,
+                    $canonical,
+                    $operation !== '' ? $operation : null
+                ));
+                ++$dispatchCount;
             }
-        } catch (\Throwable $e) {
-            Logger::error('DataHub persistent cache invalidation listener: scheduling failed: ' . $e->getMessage());
         }
+
+        return $dispatchCount;
+    }
+
+    /**
+     * Read helper – separated for testability so the listener can be
+     * exercised without booting the Pimcore kernel.
+     *
+     * @return mixed
+     */
+    protected function cacheLoad(string $key)
+    {
+        return \Pimcore\Cache::load($key);
+    }
+
+    /**
+     * @param mixed $value
+     */
+    protected function cacheSave($value, string $key, array $tags, int $ttl): void
+    {
+        \Pimcore\Cache::save($value, $key, $tags, $ttl, 1, true);
     }
 }

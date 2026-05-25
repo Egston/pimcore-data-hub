@@ -20,6 +20,8 @@ namespace Pimcore\Bundle\DataHubBundle\Service;
 use GraphQL\Language\AST\DocumentNode;
 use GraphQL\Language\Parser;
 use GraphQL\Language\Printer;
+use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
+use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
@@ -30,6 +32,9 @@ class PersistentOutputCacheService
     // Tag/key names use '_' instead of ':' — PSR-6 reserves '{}()/\@:' and
     // CacheItem validation throws on any of them in either a key or a tag.
     public const TAG_COMMON = 'datahub_graphql_persistent';
+
+    /** Request attribute carrying the acquired cold-miss lock (or absent when no lock held). */
+    public const REQUEST_ATTR_COLD_MISS_LOCK = '_datahub_swr_cold_miss_lock';
 
     /**
      * Dedicated tag for the singleton invalidation watermark; kept separate from
@@ -42,6 +47,20 @@ class PersistentOutputCacheService
     public const TAG_OP_PREFIX = 'datahub_graphql_op_';
 
     public const TAG_CLIENT_PREFIX = 'datahub_graphql_client_';
+
+    /** Per-object cache tag (one per `<class>:<id>` recorded during the GraphQL request). */
+    public const TAG_OBJECT_PREFIX = 'datahub_graphql_obj_';
+
+    /** Per-class cache tag (one per distinct element class recorded). */
+    public const TAG_CLASS_PREFIX = 'datahub_graphql_class_';
+
+    /**
+     * Reverse-index prefix mapping a per-object or per-class tag back to the
+     * `<payloadKey, metaKey>` pairs that depend on it. The invalidation
+     * listener iterates this index instead of INDEX_ALL when per-object
+     * tagging is engaged.
+     */
+    public const REVERSE_INDEX_PREFIX = 'taginx_';
 
     public const KEY_LAST_INVALIDATION = 'datahub_graphql_output_last_invalidation_ts';
 
@@ -70,8 +89,18 @@ class PersistentOutputCacheService
 
     private int $payloadTtl = 86400;
 
-    public function __construct(ContainerBagInterface $container)
-    {
+    private ?OperationClassifier $operationClassifier;
+
+    private LockFactoryResolver $lockFactoryResolver;
+
+    private ?DependencyCollector $dependencyCollector;
+
+    public function __construct(
+        ContainerBagInterface $container,
+        ?OperationClassifier $operationClassifier = null,
+        ?LockFactoryResolver $lockFactoryResolver = null,
+        ?DependencyCollector $dependencyCollector = null
+    ) {
         $cfg = $container->get('pimcore_data_hub');
 
         $graphql = $cfg['graphql'] ?? [];
@@ -86,6 +115,9 @@ class PersistentOutputCacheService
             return is_string($v) && $v !== '';
         }));
         $this->payloadTtl = max(1, (int)($graphql['persistent_output_cache_payload_ttl'] ?? 86400));
+        $this->operationClassifier = $operationClassifier;
+        $this->lockFactoryResolver = $lockFactoryResolver ?? new LockFactoryResolver();
+        $this->dependencyCollector = $dependencyCollector;
     }
 
     public function isEnabled(): bool
@@ -236,6 +268,77 @@ class PersistentOutputCacheService
         return $this->cacheClearTag(self::TAG_COMMON);
     }
 
+    /**
+     * SWR_ONLY cold-miss lock space. Distinct from the herd-guard atomic-lock
+     * key (`datahub_inprogress:*`) and from the refresh lock
+     * (`datahub_persistent_refresh_lock_*`) — three separate Symfony Lock
+     * resources guarding three independent contention surfaces.
+     *
+     * Returns a lock object on win, null on lose-or-unavailable. Callers MUST
+     * treat null as "no lock held"; the cold-miss path falls back to either a
+     * bounded-wait poll on the winner's cache write or an inline resolver run
+     * after the wait deadline. Either way, the never-503-for-browsers
+     * invariant is preserved: this method never raises.
+     */
+    public function acquireColdMissLock(Request $request, int $lockTtlSeconds): ?object
+    {
+        $factory = $this->lockFactoryResolver->resolve();
+        if (!$factory) {
+            Logger::warning(
+                'DataHub SWR cold-miss: lock factory unavailable, falling back to inline resolver'
+            );
+
+            return null;
+        }
+
+        [$client, $canonical] = $this->clientAndCanonical($request);
+        $metaKey = $this->keyMeta($client, $canonical);
+        $payloadKey = $this->keyPayload($client, $canonical);
+        $resource = 'datahub_swr_cold_miss_' . md5($metaKey . '|' . $payloadKey);
+
+        try {
+            // autoRelease=true so the Lock destructor releases on graceful PHP
+            // shutdown even if the controller's release path doesn't fire.
+            $lock = $factory->createLock($resource, $lockTtlSeconds, true);
+            if ($lock->acquire(false)) {
+                $refreshInterval = max(1, (int) floor($lockTtlSeconds / 2));
+                LockSignalRefresher::arm($lock, $lockTtlSeconds, $refreshInterval);
+
+                return $lock;
+            }
+        } catch (\Throwable $e) {
+            Logger::warning(
+                'DataHub SWR cold-miss: lock acquire failed: ' . $e->getMessage()
+            );
+        }
+
+        return null;
+    }
+
+    /**
+     * Release a previously acquired cold-miss lock. Swallows release exceptions
+     * with a WARNING log — a stuck renewer holding a lock past its intended
+     * scope is the specific risk this catch-and-log shape guards against.
+     */
+    public function releaseColdMissLock(?object $lock): void
+    {
+        if ($lock === null) {
+            return;
+        }
+
+        try {
+            if (method_exists($lock, 'release')) {
+                $lock->release();
+            }
+        } catch (\Throwable $e) {
+            Logger::warning(
+                'DataHub SWR cold-miss: lock release failed: ' . $e->getMessage()
+            );
+        } finally {
+            LockSignalRefresher::disarm();
+        }
+    }
+
     /** Persist a fresh response for the given request. */
     public function savePersistent(Request $request, JsonResponse $response): void
     {
@@ -306,10 +409,66 @@ class PersistentOutputCacheService
             'canonical' => $canonical,
         ];
 
-        $tags = $this->buildTags($request, $operationName);
-        $this->cacheSave($payloadKey, $payload, $tags, $this->payloadTtl);
+        $baseTags = $this->buildTags($request, $operationName);
+        $collectorTags = $this->collectorTagsForOperation($operationName, $client);
+        $tags = array_values(array_unique([...$baseTags, ...$collectorTags]));
+
+        $payloadTtl = $this->payloadTtl;
+        if ($this->operationClassifier !== null && $operationName !== '') {
+            // Classifier-miss is reachable for legacy in_progress_queries operations folded into operations: at config-merge time.
+            $payloadTtl = $this->operationClassifier->getTtl($operationName) ?? $this->payloadTtl;
+        }
+
+        $this->cacheSave($payloadKey, $payload, $tags, $payloadTtl);
         $this->cacheSave($metaKey, $meta, $tags, $this->ttl);
         $this->updateIndices($payloadKey, $client, $operationName);
+        $this->updateReverseIndices($collectorTags, $payloadKey, $metaKey);
+    }
+
+    /**
+     * Resolve the per-object / per-class tag set for the current request from
+     * the DependencyCollector, gated on the operation's granularity. SINGLE
+     * with an empty collector raises an in-flight warning — the canonical
+     * detector for missing POST_LOAD coverage (raw-SQL hydrators bypass the
+     * subscriber and the collector stays empty).
+     *
+     * @return list<string>
+     */
+    private function collectorTagsForOperation(string $operationName, string $client): array
+    {
+        if ($this->dependencyCollector === null || $this->operationClassifier === null || $operationName === '') {
+            return [];
+        }
+        $granularity = $this->operationClassifier->getGranularity($operationName);
+        if ($granularity === null) {
+            return [];
+        }
+        if ($granularity === Granularity::SINGLE && !$this->dependencyCollector->hasRecordedAny()) {
+            $this->logCollectorEmptyOnSave($operationName, $client);
+        }
+
+        return $this->dependencyCollector->tagsForGranularity($granularity);
+    }
+
+    /**
+     * Loud in-flight detector for the missing-POST_LOAD-coverage failure
+     * mode: SINGLE-granularity operations should always record at least one
+     * element before writing to the persistent cache. Raw-SQL hydrators
+     * bypass the POST_LOAD subscriber and the collector stays empty,
+     * producing a write with no per-object tags — invalidation would then
+     * miss it entirely.
+     *
+     * Separated from the call site so tests can observe the trigger
+     * condition without booting the Pimcore kernel (the Logger facade
+     * no-ops when there is no container).
+     */
+    protected function logCollectorEmptyOnSave(string $operationName, string $client): void
+    {
+        Logger::warning(sprintf(
+            'datahub.swr.collector_empty_on_save operation=%s client=%s',
+            $operationName,
+            $client
+        ));
     }
 
     private function buildTags(Request $request, ?string $operationName): array
@@ -366,6 +525,53 @@ class PersistentOutputCacheService
         $this->cacheSave($indexKey, $list, [self::TAG_COMMON], null);
     }
 
+    /**
+     * @param list<string> $tags
+     */
+    private function updateReverseIndices(array $tags, string $payloadKey, string $metaKey): void
+    {
+        foreach ($tags as $tag) {
+            $this->addToReverseIndex($tag, $payloadKey, $metaKey);
+        }
+    }
+
+    private function addToReverseIndex(string $tag, string $payloadKey, string $metaKey): void
+    {
+        $indexKey = self::REVERSE_INDEX_PREFIX . $tag;
+        $list = $this->cacheLoad($indexKey);
+        if (!is_array($list)) {
+            $list = [];
+        }
+        $pair = [$payloadKey, $metaKey];
+        foreach ($list as $existing) {
+            if (is_array($existing) && ($existing[0] ?? null) === $payloadKey) {
+                return;
+            }
+        }
+        $list[] = $pair;
+        if (count($list) > self::MAX_INDEX_SIZE) {
+            $alive = [];
+            foreach ($list as $entry) {
+                if (!is_array($entry) || count($entry) < 2) {
+                    continue;
+                }
+                $v = $this->cacheLoad((string)$entry[0]);
+                if ($v !== false && $v !== null) {
+                    $alive[] = $entry;
+                }
+            }
+            $list = $alive;
+            if (count($list) > self::MAX_INDEX_SIZE) {
+                $list = array_slice($list, -self::MAX_INDEX_SIZE);
+                Logger::warning('persistent_cache: reverse-index truncated at max size', ['tag' => $tag, 'size' => self::MAX_INDEX_SIZE]);
+            }
+        }
+        // Reverse-index entries carry only TAG_COMMON — clearAll() drops them
+        // on cache flush. Per-object tag membership belongs in the index
+        // body, not in the index entry's tag set.
+        $this->cacheSave($indexKey, $list, [self::TAG_COMMON], null);
+    }
+
     private function shouldUseForRequest(Request $request): bool
     {
         if (!$this->enabled) {
@@ -380,12 +586,29 @@ class PersistentOutputCacheService
         if ($this->guardOnly) {
             $input = json_decode($request->getContent(), true) ?: [];
             $operationName = $input['operationName'] ?? null;
-            if (!$operationName) {
+            if (!$operationName || !is_string($operationName)) {
                 return false;
             }
-            if (!in_array($operationName, $this->guardOperations, true)) {
-                return false;
+            // Two membership surfaces engage the SWR layer: the legacy
+            // in_progress_queries list (folded by Configuration into operations
+            // with tier=herd_guarded, granularity=list) and the post-fold
+            // operations: tree (covers both HERD_GUARDED and SWR_ONLY). Either
+            // gate true engages the layer; required for SWR_ONLY operations
+            // declared only via operations: to participate at all.
+            if (in_array($operationName, $this->guardOperations, true)) {
+                return true;
             }
+            if ($this->operationClassifier !== null
+                && $this->operationClassifier->hasOperation($operationName)) {
+                return true;
+            }
+
+            Logger::debug(sprintf(
+                'DataHub persistent cache: gate skipped — operation not in in_progress_queries or operations tree (operationName=%s)',
+                $operationName
+            ));
+
+            return false;
         }
 
         return true;

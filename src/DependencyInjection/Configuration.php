@@ -104,6 +104,16 @@ class Configuration implements ConfigurationInterface
                         ->booleanNode('persistent_refresh_queue_enabled')->info('enqueue background refresh jobs to Symfony Messenger instead of running them in kernel.terminate')->defaultValue(false)->end()
                         ->integerNode('persistent_refresh_operation_lock_ttl')->info('TTL (seconds) for per-operation lock in the worker when herd guard uses operation-name; set slightly above p99 refresh time')->defaultValue(120)->end()
                         ->integerNode('persistent_enqueue_dedupe_ttl')->info('TTL (seconds) for enqueue dedupe marker to avoid flooding the queue with identical refresh jobs')->defaultValue(60)->end()
+                        ->integerNode('swr_cold_miss_lock_wait_ms')
+                            ->info('milliseconds a losing SWR_ONLY cold-miss request waits for the winner to publish a cache entry before falling through to its own inline resolver. 0 disables bounded-wait (immediate defensive fallback).')
+                            ->min(0)
+                            ->defaultValue(5000)
+                        ->end()
+                        ->integerNode('swr_cold_miss_lock_ttl')
+                            ->info('TTL in seconds for the SWR_ONLY cold-miss lock itself. Distinct from swr_cold_miss_lock_wait_ms — the wait knob bounds the loser, the TTL bounds the winner.')
+                            ->min(1)
+                            ->defaultValue(30)
+                        ->end()
                         ->booleanNode('allow_sqlObjectCondition')
                             ->setDeprecated(
                                 'pimcore/data-hub',
