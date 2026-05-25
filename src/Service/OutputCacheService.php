@@ -425,6 +425,13 @@ class OutputCacheService
             return false;
         }
 
+        // Tier attribute set by the controller from the `operations:` tree, OR
+        // the legacy `in_progress_queries:` membership check below — either
+        // gate engages the guard.
+        if ($request->attributes->get('_datahub_tier') === Tier::HERD_GUARDED->value) {
+            return true;
+        }
+
         if (empty($this->inProgressQueries)) {
             return false;
         }

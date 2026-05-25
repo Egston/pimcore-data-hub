@@ -52,8 +52,11 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
 
     public static function getSubscribedEvents(): array
     {
+        // Priority 0 pinned: must run before InProgressLockReleaseListener
+        // (-100) so the refresh sub-request fires while the parent worker
+        // still owns the in-progress markers.
         return [
-            KernelEvents::TERMINATE => 'onKernelTerminate',
+            KernelEvents::TERMINATE => ['onKernelTerminate', 0],
         ];
     }
 

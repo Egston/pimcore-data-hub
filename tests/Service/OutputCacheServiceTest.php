@@ -367,6 +367,90 @@ class OutputCacheServiceTest extends TestCase
         $this->assertNull($reject, 'Background refresh must bypass herd guard');
     }
 
+    public function testShouldGuardRequestReturnsTrueForHerdGuardedTierAttributeEvenWhenOperationAbsentFromInProgressQueries()
+    {
+        // Protection enabled but the legacy in_progress_queries list is empty.
+        // The HERD_GUARDED tier attribute alone must engage the guard.
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => [],
+                'in_progress_key_strategy' => 'operation',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $body = json_encode([
+            'query' => 'query TierGuarded($id: ID!){node(id:$id){id}}',
+            'variables' => ['id' => 1],
+            'operationName' => 'TierGuarded',
+        ]);
+
+        $req1 = Request::create('/api', 'POST', [], [], [], [], $body);
+        $req1->attributes->set('clientname', 'client-tier');
+        $req1->attributes->set('_datahub_tier', Tier::HERD_GUARDED->value);
+
+        $first = $sut->maybeRejectOrAcquire($req1);
+        $this->assertNull($first, 'HERD_GUARDED tier alone must engage the guard; first caller acquires');
+
+        $req2 = Request::create('/api', 'POST', [], [], [], [], $body);
+        $req2->attributes->set('clientname', 'client-tier');
+        $req2->attributes->set('_datahub_tier', Tier::HERD_GUARDED->value);
+
+        $second = $sut->maybeRejectOrAcquire($req2);
+        $this->assertInstanceOf(JsonResponse::class, $second, 'Concurrent HERD_GUARDED request must be 503');
+        $this->assertSame(503, $second->getStatusCode());
+
+        // Cleanup
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut2->method('saveToCache')->willReturnCallback(function () {
+        });
+        $sut2->save($req1, new JsonResponse(['data' => ['ok' => true]]));
+    }
+
+    public function testTierAttributeNeitherDoesNotEngageGuardWhenInProgressQueriesEmpty()
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => [],
+                'in_progress_key_strategy' => 'operation',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
+            'query' => 'query Anon{__typename}',
+            'operationName' => 'Anon',
+        ]));
+        $req->attributes->set('clientname', 'client-neither');
+        $req->attributes->set('_datahub_tier', Tier::NEITHER->value);
+
+        $this->assertNull(
+            $sut->maybeRejectOrAcquire($req),
+            'NEITHER tier with empty in_progress_queries must not engage the guard'
+        );
+        $this->assertFalse(
+            $req->attributes->has('datahub_inprogress_guard_key'),
+            'No guard key should be stored when the guard does not engage'
+        );
+    }
+
     public function testProbeStatusDisabledHitMiss()
     {
         // disabled

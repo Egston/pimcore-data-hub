@@ -42,12 +42,43 @@ class Configuration implements ConfigurationInterface
                         ->booleanNode('persistent_output_cache_enabled')->info('enables persistent output cache for graphql responses (separate from Pimcore \"output\" tag).')->defaultValue(false)->end()
                         ->integerNode('persistent_output_cache_lifetime')->info('persistent output cache TTL in seconds. Defaults to output_cache_lifetime when not set')->defaultNull()->end()
                         ->integerNode('persistent_output_cache_payload_ttl')->info('TTL in seconds for the large payload entry; use a longer TTL to avoid frequent rewrites')->defaultValue(86400)->end()
+                        ->arrayNode('persistent_output_cache_payload_ttl_by_granularity')
+                            ->info('per-granularity payload TTL defaults; layered on top of the legacy persistent_output_cache_payload_ttl scalar and resolved per classified operation via OperationClassifier')
+                            ->addDefaultsIfNotSet()
+                            ->children()
+                                ->integerNode('single')->defaultValue(86400)->end()
+                                ->integerNode('list')->defaultValue(1209600)->end()
+                            ->end()
+                        ->end()
                         ->booleanNode('persistent_output_cache_guard_only')->info('apply persistent cache only to queries listed in in_progress_queries')->defaultValue(true)->end()
-                        ->booleanNode('persistent_disable_output_cache_for_guarded')->info('when true, skip the standard output cache layer for requests where the persistent cache applies (recommended to reduce duplicate work)')->defaultValue(false)->end()
+                        ->booleanNode('persistent_disable_output_cache_for_guarded')->info('when true, bypass the standard output cache layer (both read and write) for requests where the persistent (SWR) cache applies. Recommended when the persistent layer is enabled: eliminates duplicate storage and double-write traffic in Redis, since the same response would otherwise be stored in two cache layers with different keys. Has no effect while persistent_output_cache_enabled is false.')->defaultValue(false)->end()
                         ->booleanNode('in_progress_protection_enabled')->info('reject duplicate parallel requests for selected queries while the first one is in progress')->defaultValue(false)->end()
                         ->arrayNode('in_progress_queries')
-                            ->info('list of GraphQL operation names to protect (thundering herd protection)')
+                            ->info('list of GraphQL operation names to protect (thundering herd protection); permanent BC alias — each member folds into operations as { tier: herd_guarded, granularity: list }')
                             ->scalarPrototype()->end()
+                            ->defaultValue([])
+                        ->end()
+                        ->arrayNode('operations')
+                            ->info('per-operation tier classification driving the two-tier SWR layer; entries are closed-shape and explicit tier+granularity is required')
+                            ->useAttributeAsKey('operationName')
+                            ->normalizeKeys(false)
+                            ->arrayPrototype()
+                                ->children()
+                                    ->enumNode('tier')
+                                        ->values(['herd_guarded', 'swr_only'])
+                                        ->isRequired()
+                                        ->cannotBeEmpty()
+                                    ->end()
+                                    ->enumNode('granularity')
+                                        ->values(['single', 'list'])
+                                        ->isRequired()
+                                        ->cannotBeEmpty()
+                                    ->end()
+                                    ->integerNode('ttl_override')->min(1)->defaultNull()->end()
+                                    ->integerNode('enqueue_dedup_ttl_override')->min(1)->defaultNull()->end()
+                                    ->integerNode('priority_weight')->defaultValue(1)->end()
+                                ->end()
+                            ->end()
                             ->defaultValue([])
                         ->end()
                         ->integerNode('in_progress_ttl')->info('TTL in seconds for the in-progress marker/lock — bounds the leak window when a request dies without releasing (SIGKILL, OOM). With refresh enabled this can be set much smaller than the slowest legitimate request.')->defaultValue(60)->end()
@@ -81,6 +112,39 @@ class Configuration implements ConfigurationInterface
                             ->info('enables SQL Condition for graphql. It is enabled by default')
                             ->defaultValue(true)
                         ->end()
+                    ->end()
+                    ->validate()
+                        ->always(function (array $graphql): array {
+                            $inProgress = $graphql['in_progress_queries'] ?? [];
+                            $operations = $graphql['operations'] ?? [];
+                            if (!is_array($inProgress) || !is_array($operations)) {
+                                return $graphql;
+                            }
+                            $conflicts = [];
+                            foreach ($inProgress as $opName) {
+                                if (!is_string($opName) || $opName === '') {
+                                    continue;
+                                }
+                                if (isset($operations[$opName])) {
+                                    $conflicts[] = $opName;
+
+                                    continue;
+                                }
+                                $operations[$opName] = [
+                                    'tier' => 'herd_guarded',
+                                    'granularity' => 'list',
+                                    'ttl_override' => null,
+                                    'enqueue_dedup_ttl_override' => null,
+                                    'priority_weight' => 1,
+                                ];
+                            }
+                            $graphql['operations'] = $operations;
+                            if ($conflicts !== []) {
+                                $graphql['_in_progress_operations_conflicts'] = $conflicts;
+                            }
+
+                            return $graphql;
+                        })
                     ->end()
                 ->end()
             ->end()

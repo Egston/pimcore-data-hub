@@ -32,9 +32,11 @@ use Pimcore\Bundle\DataHubBundle\GraphQL\Service;
 use Pimcore\Bundle\DataHubBundle\PimcoreDataHubBundle;
 use Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService;
 use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
+use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
+use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Pimcore\Cache\RuntimeCache;
 use Pimcore\Controller\FrontendController;
 use Pimcore\Helper\LongRunningHelper;
@@ -74,18 +76,25 @@ class WebserviceController extends FrontendController
      */
     private $uploadService;
 
+    /**
+     * @var OperationClassifier
+     */
+    private $operationClassifier;
+
     public function __construct(
         EventDispatcherInterface $eventDispatcher,
         CheckConsumerPermissionsService $permissionsService,
         OutputCacheService $cacheService,
         PersistentOutputCacheService $persistentCacheService,
-        FileUploadService $uploadService
+        FileUploadService $uploadService,
+        OperationClassifier $operationClassifier
     ) {
         $this->eventDispatcher = $eventDispatcher;
         $this->permissionsService = $permissionsService;
         $this->cacheService = $cacheService;
         $this->persistentCacheService = $persistentCacheService;
         $this->uploadService = $uploadService;
+        $this->operationClassifier = $operationClassifier;
     }
 
     /**
@@ -114,6 +123,14 @@ class WebserviceController extends FrontendController
             throw new AccessDeniedHttpException('Permission denied, apikey not valid');
         }
 
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+
+        $tier = $operationName !== null
+            ? $this->operationClassifier->getTier($operationName)
+            : Tier::NEITHER;
+        $request->attributes->set('_datahub_tier', $tier->value);
+
         // Lightweight cache-status probe: HEAD or cache_status=1
         $isStatusProbe = strtoupper($request->getMethod()) === 'HEAD' || $request->query->getBoolean('cache_status');
         if ($isStatusProbe) {
@@ -133,6 +150,21 @@ class WebserviceController extends FrontendController
             $responseService->addHitMissHeaders($response, $outStatus === 'HIT');
 
             return $response;
+        }
+
+        // Herd guard runs ahead of the persistent-cache layer for HERD_GUARDED
+        // operations — a STALE persistent HIT would otherwise let concurrent
+        // callers each spawn an unprotected refresh. Refresh sub-requests
+        // carry _datahub_bypass_in_progress_guard so they don't 503 themselves.
+        if ($tier === Tier::HERD_GUARDED
+            && !$request->attributes->get('_datahub_bypass_in_progress_guard')
+        ) {
+            if ($inProgressResponse = $this->cacheService->maybeRejectOrAcquire($request)) {
+                Logger::debug(sprintf('In-progress (early): duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
+                $responseService->addCorsHeaders($inProgressResponse);
+
+                return $inProgressResponse;
+            }
         }
 
         // Persistent cache pre-check: may short-circuit or mark for background refresh
@@ -164,20 +196,20 @@ class WebserviceController extends FrontendController
 
         Logger::debug('Output cache MISS');
 
-        // Try to acquire an in-progress marker for selected protected queries to avoid thundering herd
-        if ($inProgressResponse = $this->cacheService->maybeRejectOrAcquire($request)) {
-            $input = json_decode($request->getContent(), true) ?: [];
-            $operationName = $input['operationName'] ?? null;
-            Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
-            $responseService->addCorsHeaders($inProgressResponse);
+        // Try to acquire an in-progress marker for selected protected queries to avoid thundering herd.
+        // HERD_GUARDED operations already ran the early-gate above; this fallback handles the legacy
+        // in_progress_queries-only path (operation absent from the new `operations:` tree).
+        if ($tier !== Tier::HERD_GUARDED) {
+            if ($inProgressResponse = $this->cacheService->maybeRejectOrAcquire($request)) {
+                Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
+                $responseService->addCorsHeaders($inProgressResponse);
 
-            return $inProgressResponse;
+                return $inProgressResponse;
+            }
         }
 
         // If we get here and a lock attribute exists, we acquired the protection lock
         if ($request->attributes->get('datahub_inprogress_lock')) {
-            $input = json_decode($request->getContent(), true) ?: [];
-            $operationName = $input['operationName'] ?? null;
             Logger::debug(sprintf('In-progress: lock ACQUIRED (operationName=%s)', (string)$operationName));
         } else {
             Logger::debug('In-progress: no protection (not enabled or query not listed)');

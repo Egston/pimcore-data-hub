@@ -14,10 +14,13 @@
               install. See tests/_bootstrap.php and tests/Service.suite.dist.yml.
             -->
             <file>tests/Command/PersistentCacheClearCommandTest.php</file>
+            <file>tests/Controller/WebserviceControllerTierGateTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceBackendTest.php</file>
+            <file>tests/Service/OperationClassifierTest.php</file>
             <file>tests/EventListener/InProgressLockReleaseListenerTest.php</file>
             <file>tests/Lock/LockSignalRefresherTest.php</file>
+            <file>tests/DependencyInjection/ConfigurationTest.php</file>
         </testsuite>
     </testsuites>
     <coverage>
