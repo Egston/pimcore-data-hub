@@ -29,6 +29,7 @@ use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
+use Symfony\Component\HttpKernel\KernelEvents;
 
 final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
 {
@@ -98,6 +99,16 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
         $response = new Response('ok');
 
         return new TerminateEvent($kernel, $request, $response);
+    }
+
+    public function testGetSubscribedEventsReturnsPriorityZeroForTerminate(): void
+    {
+        $events = PersistentCacheRefreshOnTerminateListener::getSubscribedEvents();
+        $this->assertArrayHasKey(KernelEvents::TERMINATE, $events);
+        // Refresh must run before InProgressLockReleaseListener (-100) so the
+        // parent worker still owns its in-progress markers when the refresh
+        // sub-request fires.
+        $this->assertSame(['onKernelTerminate', 0], $events[KernelEvents::TERMINATE]);
     }
 
     public function testOnTerminateGuardedCallsController(): void

@@ -25,6 +25,7 @@ use Pimcore\Extension\Bundle\Traits\BundleAdminClassicTrait;
 use Pimcore\Extension\Bundle\Traits\PackageVersionTrait;
 use Pimcore\HttpKernel\Bundle\DependentBundleInterface;
 use Pimcore\HttpKernel\BundleCollection\BundleCollection;
+use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 
 class PimcoreDataHubBundle extends AbstractPimcoreBundle implements PimcoreBundleAdminClassicInterface, DependentBundleInterface
@@ -45,6 +46,68 @@ class PimcoreDataHubBundle extends AbstractPimcoreBundle implements PimcoreBundl
     {
         $container->addCompilerPass(new ImportExportLocatorsPass());
         $container->addCompilerPass(new CustomDocumentTypePass());
+    }
+
+    /**
+     * Once-per-process informational logging for the operation-classification
+     * config tree. Two emissions:
+     *
+     *   - INFO: surfaces that in_progress_queries is in use so operators can plan
+     *     migration to the richer `operations` shape. The list remains a permanent
+     *     BC alias; this is not a deprecation warning.
+     *   - WARNING: surfaces operationNames declared in both lists. The explicit
+     *     `operations` entry wins; the warning enumerates the conflicting names so
+     *     an operator can decide whether the duplication was intentional.
+     *
+     * Conflict detection happens in the Configuration validator (where both lists
+     * are available before the fold) and is stashed in the sentinel key
+     * `_in_progress_operations_conflicts`. boot() reads the sentinel and emits the
+     * warning; Symfony Config validator closures run at container compile time and
+     * cannot emit log lines reliably (Pimcore\Logger may not be wired yet).
+     */
+    public function boot(): void
+    {
+        parent::boot();
+
+        if (!$this->container || !$this->container->hasParameter('pimcore_data_hub')) {
+            return;
+        }
+        $cfg = $this->container->getParameter('pimcore_data_hub');
+        if (!is_array($cfg)) {
+            Logger::warning('pimcore_data_hub.boot_log_skipped: parameter is not an array');
+
+            return;
+        }
+        $graphql = $cfg['graphql'] ?? [];
+        if (!is_array($graphql)) {
+            Logger::warning('pimcore_data_hub.boot_log_skipped: graphql key is not an array');
+
+            return;
+        }
+        $inProgress = $graphql['in_progress_queries'] ?? [];
+        $operations = $graphql['operations'] ?? [];
+        if (!is_array($inProgress) || !is_array($operations)) {
+            Logger::warning('pimcore_data_hub.boot_log_skipped: in_progress_queries or operations is not an array');
+
+            return;
+        }
+        $inProgressNames = array_values(array_filter($inProgress, static fn ($v) => is_string($v) && $v !== ''));
+        if ($inProgressNames === []) {
+            return;
+        }
+        Logger::info(sprintf(
+            'pimcore_data_hub.in_progress_queries_deprecated: %d entries (%s) fold into operations as { tier: herd_guarded, granularity: list }; consider migrating to the explicit operations config tree',
+            count($inProgressNames),
+            implode(', ', $inProgressNames)
+        ));
+
+        $conflicts = $graphql['_in_progress_operations_conflicts'] ?? [];
+        if (is_array($conflicts) && $conflicts !== []) {
+            Logger::warning(sprintf(
+                'pimcore_data_hub.operations_in_progress_conflict: operationNames declared in both in_progress_queries and operations — explicit operations entry wins: %s',
+                implode(', ', $conflicts)
+            ));
+        }
     }
 
     public static function registerDependentBundles(BundleCollection $collection): void

@@ -40,7 +40,7 @@ class InProgressLockReleaseListener implements EventSubscriberInterface
     {
         return [
             KernelEvents::EXCEPTION => ['onKernelException', -100],
-            KernelEvents::TERMINATE => 'onKernelTerminate',
+            KernelEvents::TERMINATE => ['onKernelTerminate', -100],
         ];
     }
 
