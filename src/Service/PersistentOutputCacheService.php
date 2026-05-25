@@ -23,6 +23,8 @@ use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -95,11 +97,15 @@ class PersistentOutputCacheService
 
     private ?DependencyCollector $dependencyCollector;
 
+    private readonly ?LoggerInterface $psrLogger;
+
     public function __construct(
         ContainerBagInterface $container,
         ?OperationClassifier $operationClassifier = null,
         ?LockFactoryResolver $lockFactoryResolver = null,
-        ?DependencyCollector $dependencyCollector = null
+        ?DependencyCollector $dependencyCollector = null,
+        #[Autowire(service: 'monolog.logger.pimcore')]
+        ?LoggerInterface $psrLogger = null,
     ) {
         $cfg = $container->get('pimcore_data_hub');
 
@@ -118,6 +124,7 @@ class PersistentOutputCacheService
         $this->operationClassifier = $operationClassifier;
         $this->lockFactoryResolver = $lockFactoryResolver ?? new LockFactoryResolver();
         $this->dependencyCollector = $dependencyCollector;
+        $this->psrLogger = $psrLogger;
     }
 
     public function isEnabled(): bool
@@ -304,6 +311,10 @@ class PersistentOutputCacheService
             if ($lock->acquire(false)) {
                 $refreshInterval = max(1, (int) floor($lockTtlSeconds / 2));
                 LockSignalRefresher::arm($lock, $lockTtlSeconds, $refreshInterval);
+                $this->psrLogger?->info('swr.cold_miss.lock.acquired', [
+                    'resource' => $resource,
+                    'lock_ttl_seconds' => $lockTtlSeconds,
+                ]);
 
                 return $lock;
             }

@@ -1,0 +1,24 @@
+{
+    "class": "TestUncachedItem",
+    "parentFolder": "/datahub-tests/uncached-items",
+    "items": [
+        {
+            "key": "uncached-item-1",
+            "localized": {
+                "en": { "title": "Uncached Item 1" }
+            }
+        },
+        {
+            "key": "uncached-item-2",
+            "localized": {
+                "en": { "title": "Uncached Item 2" }
+            }
+        },
+        {
+            "key": "uncached-item-3",
+            "localized": {
+                "en": { "title": "Uncached Item 3" }
+            }
+        }
+    ]
+}

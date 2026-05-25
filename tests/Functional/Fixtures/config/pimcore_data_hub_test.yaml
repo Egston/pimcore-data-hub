@@ -1,0 +1,31 @@
+# L3 functional-test config overlay for the two-tier SWR refactor.
+#
+# Three synthetic GraphQL operations per tier registered in the operations: dict.
+# Operations not listed here resolve to Tier::NEITHER and fall through to the
+# standard output cache — the NEITHER-tier coverage in ColdMissTest relies on this.
+#
+# The queue is enabled so RefreshQueueTest / PriorityQueueTest exercise the
+# Messenger transport path. The strategy is oldest_refreshed_at_first_with_weight_bands;
+# with all operations at default weight the band offset is 0 so both plain-ordering
+# and band-offset tests can run under this single config.
+pimcore_data_hub:
+    graphql:
+        persistent_output_cache_enabled: true
+        persistent_disable_output_cache_for_guarded: true
+        in_progress_protection_enabled: true
+        operations:
+            getTestSwrGuardedItemListing:
+                tier: herd_guarded
+                granularity: list
+            getTestSwrGuardedItem:
+                tier: herd_guarded
+                granularity: single
+            getTestSwrOnlyItemListing:
+                tier: swr_only
+                granularity: list
+            getTestSwrOnlyItem:
+                tier: swr_only
+                granularity: single
+        persistent_refresh_queue_enabled: true
+        persistent_refresh_priority_strategy: oldest_refreshed_at_first_with_weight_bands
+        persistent_refresh_priority_weight_band_seconds: 60
