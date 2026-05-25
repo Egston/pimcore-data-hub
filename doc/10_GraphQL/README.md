@@ -93,6 +93,41 @@ Just add the parameter `?pimcore_outputfilters_disabled=true` to the URL. This w
 It is possible to customize some behavior of output cache with event listeners. For details 
 see [Events Documentation](./10_Events.md).
 
+### In-Progress Protection (Thundering Herd Control)
+When a cached response is invalidated, many clients might request the same heavy query in parallel. To prevent multiple identical executions, enable the in-progress protection which rejects duplicate requests while the first one is computing and will be cached.
+
+Configure in your `config.yml`:
+```yml
+pimcore_data_hub:
+  graphql:
+    output_cache_enabled: true
+    # Protect selected queries by operationName
+    in_progress_protection_enabled: true
+    in_progress_queries: ['YourHeavyOperationName']
+    in_progress_ttl: 60                 # seconds for the in-progress marker
+    in_progress_http_status: 503        # status returned to duplicates
+    in_progress_retry_after: 5          # optional Retry-After header (seconds)
+    in_progress_key_strategy: request   # 'request' (query+variables) or 'operation' (operationName only)
+```
+
+Notes
+- The operationName is the GraphQL operation’s name in your document, e.g. `query getResourceLibraryAssetItemListing { ... }`; add that string to `in_progress_queries`.
+- Protection is client-agnostic: one client’s execution blocks other clients for the same query+variables until the response is cached.
+- Key strategy:
+  - `request` (default): blocks only identical query+variables; different variables are independent.
+  - `operation`: blocks all variants of the same operationName, regardless of variables.
+- On duplicates, the endpoint returns the configured status (e.g., 503) with a JSON error and optional `Retry-After` header.
+
+Atomic locking (recommended)
+- For strict single-flight behavior across PHP-FPM workers and pods, configure Symfony Lock with Redis:
+```yml
+framework:
+  lock:
+    resources:
+      default: 'redis://%env(REDIS_DSN)%?prefix=datahub_lock:'
+```
+- Ensure `symfony/lock` is installed and the `lock.factory` service is available. Using the same Redis as cache is fine; prefer a distinct DB index or a `prefix` to keep keys separated.
+
 ### Note on Debugging With iGraplQL Playground
 
 Open the settings and change `request.credentials` to `include`. Otherwise the 

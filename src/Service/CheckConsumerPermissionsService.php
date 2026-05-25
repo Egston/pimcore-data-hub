@@ -24,6 +24,13 @@ class CheckConsumerPermissionsService
 
     public function performSecurityCheck(Request $request, Configuration $configuration): bool
     {
+        // Background SWR refresh sub-requests are synthesized server-side from a
+        // request that already passed this check; they carry no apikey of their
+        // own. The attribute is not user-controllable (it lives in the request
+        // attribute bag, never populated from HTTP input).
+        if ($request->attributes->get('_datahub_persistent_refresh')) {
+            return true;
+        }
         $securityConfig = $configuration->getSecurityConfig();
         if ($securityConfig['method'] === Configuration::SECURITYCONFIG_AUTH_APIKEY) {
             $apiKey = $request->headers->get('apikey');

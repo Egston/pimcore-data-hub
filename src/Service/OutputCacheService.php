@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 /**
  * Pimcore
  *
@@ -15,9 +17,13 @@
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
+use GraphQL\Language\AST\DocumentNode;
+use GraphQL\Language\Parser;
+use GraphQL\Language\Printer;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreLoadEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\OutputCachePreSaveEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\OutputCacheEvents;
+use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
@@ -39,6 +45,70 @@ class OutputCacheService
     private $lifetime = 30;
 
     /**
+     * Enable/disable in-progress protection.
+     */
+    private $inProgressProtectionEnabled = false;
+
+    /**
+     * List of GraphQL operation names to protect.
+     */
+    private $inProgressQueries = [];
+
+    /**
+     * TTL (seconds) for the in-progress marker/lock. Bounds the leak window when
+     * a request dies between acquire and release without an exception (SIGKILL,
+     * OOM, FPM worker recycle). Periodic refresh keeps the lock alive during
+     * legitimate long-running requests, so this can be set much smaller than the
+     * worst-case execution time.
+     */
+    private $inProgressTtl = 60;
+
+    /**
+     * Seconds between background refresh ticks for the in-progress lock and
+     * marker. Must be < $inProgressTtl. 0 = disabled (legacy behaviour: TTL
+     * alone bounds both the leak window and the longest supported request).
+     * Auto-defaulted to floor($inProgressTtl / 2) when left at 0.
+     */
+    private $inProgressRefreshInterval = 0;
+
+    /**
+     * Process-wide latch: SIGALRM handler is currently armed. Guards uninstall
+     * from running pcntl calls when nothing was ever installed.
+     */
+    private $pcntlRefresherInstalled = false;
+
+    /**
+     * Cached Redis-backed LockFactory built lazily from REDIS_DSN. Kept on
+     * the instance so each request only pays the connection setup once.
+     *
+     * @var object|null
+     */
+    private $herdLockFactory = null;
+
+    /**
+     * Whether we already attempted Redis factory construction this request.
+     * Distinguishes "not tried yet" from "tried and got null".
+     */
+    private bool $herdLockFactoryResolved = false;
+
+    /**
+     * HTTP status code used when rejecting duplicates.
+     */
+    private $inProgressHttpStatus = 503;
+
+    /**
+     * Optional Retry-After header value (seconds).
+     */
+    private $inProgressRetryAfter = null;
+
+    /**
+     * Strategy for guard key: 'request' (query+variables) or 'operation' (operationName only).
+     *
+     * @var string
+     */
+    private $inProgressKeyStrategy = 'request';
+
+    /**
      * @var EventDispatcherInterface
      */
     public $eventDispatcher;
@@ -56,7 +126,73 @@ class OutputCacheService
             if (isset($dataHubConfig['graphql']['output_cache_lifetime'])) {
                 $this->lifetime = intval($dataHubConfig['graphql']['output_cache_lifetime']);
             }
+
+            // in-progress protection config
+            if (isset($dataHubConfig['graphql']['in_progress_protection_enabled'])) {
+                $this->inProgressProtectionEnabled = filter_var($dataHubConfig['graphql']['in_progress_protection_enabled'], FILTER_VALIDATE_BOOLEAN);
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_queries']) && is_array($dataHubConfig['graphql']['in_progress_queries'])) {
+                $this->inProgressQueries = array_values(array_filter($dataHubConfig['graphql']['in_progress_queries'], static function ($v) {
+                    return is_string($v) && $v !== '';
+                }));
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_ttl'])) {
+                $this->inProgressTtl = max(1, intval($dataHubConfig['graphql']['in_progress_ttl']));
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_refresh_interval'])) {
+                $this->inProgressRefreshInterval = max(0, intval($dataHubConfig['graphql']['in_progress_refresh_interval']));
+            }
+            if ($this->inProgressRefreshInterval === 0 && $this->inProgressTtl > 1) {
+                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
+            }
+            if ($this->inProgressRefreshInterval >= $this->inProgressTtl) {
+                // Refresh must fire before the TTL elapses or the lock leaks for a full TTL window.
+                $this->inProgressRefreshInterval = max(1, (int) floor($this->inProgressTtl / 2));
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_http_status'])) {
+                $this->inProgressHttpStatus = intval($dataHubConfig['graphql']['in_progress_http_status']);
+            }
+            if (array_key_exists('in_progress_retry_after', $dataHubConfig['graphql'])) {
+                $v = $dataHubConfig['graphql']['in_progress_retry_after'];
+                $this->inProgressRetryAfter = $v === null ? null : intval($v);
+            }
+            if (isset($dataHubConfig['graphql']['in_progress_key_strategy'])) {
+                $strategy = (string) $dataHubConfig['graphql']['in_progress_key_strategy'];
+                $strategy = in_array($strategy, ['request', 'operation'], true) ? $strategy : 'request';
+                $this->inProgressKeyStrategy = $strategy;
+            }
         }
+    }
+
+    /**
+     * Probe the standard output cache status for this request without side effects.
+     * Returns one of: 'HIT', 'MISS', or 'DISABLED'.
+     */
+    public function probeStatus(Request $request): string
+    {
+        // Reuse the same gating logic as normal load/save
+        $event = new OutputCachePreLoadEvent($request, true);
+        $this->eventDispatcher->dispatch($event, OutputCacheEvents::PRE_LOAD);
+        $use = $this->cacheEnabled && $event->isUseCache();
+
+        if (!$use) {
+            return 'DISABLED';
+        }
+
+        $newKey = $this->computeKey($request);
+        $item = $this->loadFromCache($newKey);
+        if ($item !== false && $item !== null) {
+            return 'HIT';
+        }
+
+        // try legacy key for completeness
+        $legacyKey = $this->computeLegacyKey($request);
+        $item = $this->loadFromCache($legacyKey);
+        if ($item !== false && $item !== null) {
+            return 'HIT';
+        }
+
+        return 'MISS';
     }
 
     /**
@@ -69,9 +205,21 @@ class OutputCacheService
             return null;
         }
 
-        $cacheKey = $this->computeKey($request);
+        // Try new canonical key first
+        $newKey = $this->computeKey($request);
+        $item = $this->loadFromCache($newKey);
+        if ($item !== false && $item !== null) {
+            return $item;
+        }
 
-        return $this->loadFromCache($cacheKey);
+        // Backward-compat: try legacy key (print_r-based) so rollout is seamless
+        $legacyKey = $this->computeLegacyKey($request);
+        $item = $this->loadFromCache($legacyKey);
+        if ($item !== false && $item !== null) {
+            return $item;
+        }
+
+        return null;
     }
 
     /**
@@ -80,6 +228,11 @@ class OutputCacheService
      */
     public function save(Request $request, JsonResponse $response, $extraTags = []): void
     {
+        // Release concurrency guards unconditionally — they protect against thundering herd
+        // regardless of whether the response ends up in the cache.
+        $this->deleteInProgressLock($request);
+        $this->releaseAtomicLockIfAny($request);
+
         if ($this->useCache($request)) {
             $clientname = $request->attributes->getString('clientname');
             $extraTags = array_merge(['output', 'datahub', $clientname], $extraTags);
@@ -111,19 +264,389 @@ class OutputCacheService
      */
     protected function saveToCache($key, $item, $tags = []): void
     {
-        # Increase priority to 1 to make it less likely this cache item is evicted from the
-        # queue before actually being written
-        \Pimcore\Cache::save($item, $key, $tags, $this->lifetime, 1);
+        // Increase priority to 1 to make it less likely this cache item is evicted from the
+        // queue before actually being written, or better yet, write it immediately.
+        \Pimcore\Cache::save($item, $key, $tags, $this->lifetime, 1, true);
+
+        try {
+            Logger::debug(sprintf('Output cache SAVED (key=%s, ttl=%d, tags=%s)', $key, (int) $this->lifetime, implode(',', $tags)));
+        } catch (\Throwable $e) {
+            // ignore logging failures
+        }
     }
 
+    /**
+     * Canonicalize the incoming JSON body for cache/lock keys:
+     * - Parse JSON
+     * - Optionally AST-normalize the GraphQL 'query'
+     * - Harmonize variables (treat missing vs null equivalently for declared vars)
+     * - Recursively ksort all associative arrays
+     * - Encode with stable json_encode flags
+     *
+     */
+    private function canonicalizePayloadForCache(Request $request): string
+    {
+        $cached = $request->attributes->get('_datahub_canonical_payload');
+        if (is_string($cached)) {
+            return $cached;
+        }
+
+        $payload = json_decode($request->getContent(), true);
+        if (!is_array($payload)) {
+            $payload = [];
+        }
+
+        if (!empty($payload['query']) && is_string($payload['query'])) {
+            $payload['query'] = $this->normalizeQueryAst($payload['query']);
+        }
+
+        $payload = $this->ksortRecursive($payload);
+
+        $canonical = json_encode(
+            $payload,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
+        );
+
+        // Guard against rare encode failures returning false
+        if (!is_string($canonical)) {
+            $canonical = '{}';
+        }
+
+        $request->attributes->set('_datahub_canonical_payload', $canonical);
+
+        return $canonical;
+    }
+
+    /**
+     * Parse and re-print the GraphQL query to a canonical form.
+     */
+    private function normalizeQueryAst(string $query): string
+    {
+        try {
+            /** @var DocumentNode $ast */
+            $ast = Parser::parse($query);
+
+            // Printer preserves a canonical formatting; not sorting selections (keeps semantic order)
+            return Printer::doPrint($ast);
+        } catch (\Throwable $e) {
+            // The query is already invalid; we cannot parse it. However, we still need some
+            // reproducible canonical form for caching/locking.
+            return trim($query);
+        }
+    }
+
+    /** Recursively ksort associative arrays; leave list arrays as-is (order significant). */
+    private function ksortRecursive(array $value): array
+    {
+        $isAssoc = static function (array $a): bool {
+            $i = 0;
+            foreach ($a as $k => $_) {
+                if ($k !== $i++) {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
+        if ($isAssoc($value)) {
+            ksort($value);
+        }
+
+        foreach ($value as $k => $v) {
+            if (is_array($v)) {
+                $value[$k] = $this->ksortRecursive($v);
+            }
+        }
+
+        return $value;
+    }
+
+    /** Compute a cache key for the given request. */
     private function computeKey(Request $request): string
     {
-        $clientname = $request->attributes->getString('clientname');
+        $clientname = (string) $request->attributes->get('clientname', '');
+        $payload    = $this->canonicalizePayloadForCache($request);
 
+        return 'output_' . hash('sha256', 'client:' . $clientname . "\n" . $payload);
+    }
+
+    /** Legacy key computation for seamless rollout without invalidating existing cache. */
+    private function computeLegacyKey(Request $request): string
+    {
+        $clientname = $request->attributes->getString('clientname');
         $input = json_decode($request->getContent(), true);
         $input = print_r($input, true);
 
         return md5('output_' . $clientname . $input);
+    }
+
+    /**
+     * Reject duplicates or acquire an in-progress marker for protected queries.
+     * Returns a JsonResponse when another identical request is running; otherwise null.
+     */
+    public function maybeRejectOrAcquire(Request $request): ?JsonResponse
+    {
+        // allow background refresh to bypass herd guard
+        if ($request->attributes->get('_datahub_bypass_in_progress_guard')) {
+            return null;
+        }
+        if (!$this->shouldGuardRequest($request)) {
+            return null;
+        }
+
+        // First try an atomic lock using Symfony Lock (preferably backed by Redis)
+        $lock = $this->acquireAtomicLock($request);
+        if ($lock === false) {
+            // another process holds the lock
+            return $this->buildInProgressResponse();
+        }
+
+        // Fallback or additionally set a lightweight marker in cache for quick checks
+        $guardKey = $this->computeGuardKey($request);
+        if ($this->inProgressLockExists($guardKey)) {
+            // Someone already set marker; if we do not own a lock, reject
+            if (!$lock) {
+                return $this->buildInProgressResponse();
+            }
+        } else {
+            $this->saveInProgressLock($guardKey, $request);
+            // Store so the safety-net listener can delete the marker if save() never runs.
+            $request->attributes->set('datahub_inprogress_guard_key', $guardKey);
+        }
+
+        return null;
+    }
+
+    /** Determine if the current request should be protected. */
+    private function shouldGuardRequest(Request $request): bool
+    {
+        if (!$this->inProgressProtectionEnabled) {
+            return false;
+        }
+
+        if (empty($this->inProgressQueries)) {
+            return false;
+        }
+
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = $input['operationName'] ?? null;
+        if (!$operationName) {
+            return false;
+        }
+
+        return in_array($operationName, $this->inProgressQueries, true);
+    }
+
+    /** Build cache key for the in-progress marker. */
+    private function lockKeyFor(string $guardKey): string
+    {
+        return 'datahub_inprogress_' . $guardKey;
+    }
+
+    /** Check if in-progress marker is present. */
+    private function inProgressLockExists(string $guardKey): bool
+    {
+        return (bool) \Pimcore\Cache::load($this->lockKeyFor($guardKey));
+    }
+
+    /** Save in-progress marker with TTL. */
+    private function saveInProgressLock(string $guardKey, Request $request): void
+    {
+        $clientname = $request->attributes->getString('clientname');
+        $tags = ['datahub_inprogress', $clientname];
+        $key = $this->lockKeyFor($guardKey);
+
+        // value is irrelevant; we only care about existence
+        \Pimcore\Cache::save(1, $key, $tags, $this->inProgressTtl, 1, true);
+    }
+
+    /** Remove the in-progress marker and clear the request attribute so the safety-net listener is a no-op. */
+    private function deleteInProgressLock(Request $request): void
+    {
+        $this->uninstallLockRefresher();
+
+        $guardKey = $this->computeGuardKey($request);
+        $key = $this->lockKeyFor($guardKey);
+
+        try {
+            \Pimcore\Cache::remove($key);
+        } catch (\Throwable $e) {
+        }
+
+        $request->attributes->remove('datahub_inprogress_guard_key');
+    }
+
+    /** Compute a client-agnostic guard key according to configured strategy. */
+    private function computeGuardKey(Request $request): string
+    {
+        $input = json_decode($request->getContent(), true) ?: [];
+
+        if ($this->inProgressKeyStrategy === 'operation') {
+            $operationName = $input['operationName'] ?? '';
+            // If operationName is missing, fall back to full request body
+            if ($operationName !== '') {
+                return md5('op_' . $operationName);
+            }
+        }
+
+        $canonical = $this->canonicalizePayloadForCache($request);
+
+        return hash('sha256', 'req:' . $canonical);
+    }
+
+    /**
+     * Resolve a Symfony LockFactory if available. Prefers a Redis-backed
+     * factory built from REDIS_DSN so the herd guard pays sub-ms refresh
+     * cost and gets native TTL auto-eviction; falls back to whatever
+     * Pimcore wires as the default (typically DoctrineDbalStore-backed),
+     * and finally to null when Lock isn't installed at all.
+     *
+     * Result is cached on the instance so we only build the Redis
+     * connection once per request.
+     *
+     * @return object|null
+     */
+    private function getLockFactory()
+    {
+        if ($this->herdLockFactoryResolved) {
+            return $this->herdLockFactory;
+        }
+        $this->herdLockFactoryResolved = true;
+
+        if (!class_exists('Symfony\\Component\\Lock\\LockFactory')) {
+            return null;
+        }
+
+        // Preferred path: Redis-backed store. Short-lived TTL-based locks belong
+        // in Redis — auto-expiry, no row-leak, faster than DBAL UPDATEs each
+        // refresh tick.
+        try {
+            $dsn = getenv('REDIS_DSN') ?: ($_ENV['REDIS_DSN'] ?? null);
+            if (is_string($dsn) && $dsn !== ''
+                && class_exists('Symfony\\Component\\Lock\\Store\\StoreFactory')) {
+                $store = \Symfony\Component\Lock\Store\StoreFactory::createStore($dsn);
+                $this->herdLockFactory = new \Symfony\Component\Lock\LockFactory($store);
+
+                return $this->herdLockFactory;
+            }
+        } catch (\Throwable $e) {
+            Logger::warning(
+                'DataHub in-progress: Redis-backed lock factory unavailable, '
+                . 'falling back to Pimcore default: ' . $e->getMessage()
+            );
+        }
+
+        // Fallback: Pimcore's default lock factory (DBAL or whatever is wired).
+        try {
+            $container = \Pimcore::getContainer();
+            if ($container && $container->has('lock.factory')) {
+                $this->herdLockFactory = $container->get('lock.factory');
+
+                return $this->herdLockFactory;
+            }
+            if ($container && $container->has('Symfony\\Component\\Lock\\LockFactory')) {
+                $this->herdLockFactory = $container->get('Symfony\\Component\\Lock\\LockFactory');
+
+                return $this->herdLockFactory;
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        return null;
+    }
+
+    /**
+     * Try to acquire a non-blocking lock for this request.
+     *
+     * @return object|false|null Returns lock object on success, false if held by others, null if locking unavailable
+     */
+    private function acquireAtomicLock(Request $request)
+    {
+        $factory = $this->getLockFactory();
+        if (!$factory) {
+            return null;
+        }
+
+        $resource = 'datahub_inprogress:' . $this->computeGuardKey($request);
+
+        try {
+            // autoRelease=true so the Lock destructor releases on graceful PHP
+            // shutdown even if save() and the safety-net listener both fail to run.
+            $lock = $factory->createLock($resource, $this->inProgressTtl, true);
+            if ($lock->acquire(false)) {
+                // keep reference on request for releasing in save()
+                $request->attributes->set('datahub_inprogress_lock', $lock);
+                LockSignalRefresher::arm(
+                    $lock,
+                    $this->inProgressTtl,
+                    $this->inProgressRefreshInterval,
+                    $this->lockKeyFor($this->computeGuardKey($request)),
+                    ['datahub_inprogress', $request->attributes->getString('clientname')]
+                );
+                $this->pcntlRefresherInstalled = true;
+
+                return $lock;
+            }
+        } catch (\Throwable $e) {
+            // if anything goes wrong, just fallback
+            Logger::warning('DataHub in-progress: failed to acquire atomic lock: ' . $e->getMessage());
+        }
+
+        return false; // indicates someone else holds it
+    }
+
+    /**
+     * Release the previously acquired lock if present on request.
+     */
+    private function releaseAtomicLockIfAny(Request $request): void
+    {
+        $this->uninstallLockRefresher();
+
+        $lock = $request->attributes->get('datahub_inprogress_lock');
+        if ($lock) {
+            try {
+                if (method_exists($lock, 'release')) {
+                    $lock->release();
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+            $request->attributes->remove('datahub_inprogress_lock');
+        }
+    }
+
+    /**
+     * Cancel any pending SIGALRM and detach the handler. Idempotent: safe to
+     * call from every release path (save, listener, deleteInProgressLock).
+     */
+    private function uninstallLockRefresher(): void
+    {
+        if (!$this->pcntlRefresherInstalled) {
+            return;
+        }
+
+        LockSignalRefresher::disarm();
+        $this->pcntlRefresherInstalled = false;
+    }
+
+    private function buildInProgressResponse(): JsonResponse
+    {
+        $payload = [
+            'errors' => [
+                [
+                    'message' => 'Query is currently being processed. Please retry shortly.',
+                ],
+            ],
+        ];
+
+        $response = new JsonResponse($payload, $this->inProgressHttpStatus);
+        if ($this->inProgressRetryAfter !== null) {
+            $response->headers->set('Retry-After', (string) max(0, $this->inProgressRetryAfter));
+        }
+
+        return $response;
     }
 
     private function useCache(Request $request): bool

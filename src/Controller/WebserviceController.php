@@ -33,6 +33,7 @@ use Pimcore\Bundle\DataHubBundle\PimcoreDataHubBundle;
 use Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService;
 use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Cache\RuntimeCache;
 use Pimcore\Controller\FrontendController;
@@ -64,6 +65,11 @@ class WebserviceController extends FrontendController
     private $cacheService;
 
     /**
+     * @var PersistentOutputCacheService
+     */
+    private $persistentCacheService;
+
+    /**
      * @var FileUploadService
      */
     private $uploadService;
@@ -72,11 +78,13 @@ class WebserviceController extends FrontendController
         EventDispatcherInterface $eventDispatcher,
         CheckConsumerPermissionsService $permissionsService,
         OutputCacheService $cacheService,
+        PersistentOutputCacheService $persistentCacheService,
         FileUploadService $uploadService
     ) {
         $this->eventDispatcher = $eventDispatcher;
         $this->permissionsService = $permissionsService;
         $this->cacheService = $cacheService;
+        $this->persistentCacheService = $persistentCacheService;
         $this->uploadService = $uploadService;
     }
 
@@ -106,15 +114,74 @@ class WebserviceController extends FrontendController
             throw new AccessDeniedHttpException('Permission denied, apikey not valid');
         }
 
-        if ($response = $this->cacheService->load($request)) {
-            Logger::debug('Loading response from cache');
-
+        // Lightweight cache-status probe: HEAD or cache_status=1
+        $isStatusProbe = strtoupper($request->getMethod()) === 'HEAD' || $request->query->getBoolean('cache_status');
+        if ($isStatusProbe) {
+            $outStatus = $this->cacheService->probeStatus($request);
+            $persistProbe = $this->persistentCacheService->probeStatus($request);
+            $response = new JsonResponse(null, 204);
+            $cacheStatus = sprintf('pimcore-output; %s', strtolower($outStatus));
+            if ($persistProbe['applies']) {
+                $cacheStatus .= sprintf(', pimcore-persistent; %s', strtolower($persistProbe['status']));
+                $response->headers->set('X-Pimcore-DataHub-Persistent-Cache', $persistProbe['status']);
+                if ($persistProbe['status'] === 'STALE') {
+                    $response->headers->set('Warning', '110 - "Response is Stale"');
+                }
+            }
+            $response->headers->set('Cache-Status', $cacheStatus);
             $responseService->addCorsHeaders($response);
+            $responseService->addHitMissHeaders($response, $outStatus === 'HIT');
 
             return $response;
         }
 
-        Logger::debug('Cache entry not found');
+        // Persistent cache pre-check: may short-circuit or mark for background refresh
+        if ($pResponse = $this->persistentCacheService->preHandle($request, $responseService)) {
+            // Persistent HIT (fresh). Add output-cache header as MISS to clarify layer used
+            $responseService->addHitMissHeaders($pResponse, true);
+
+            return $pResponse;
+        }
+
+        // Optionally bypass standard output cache when persistent applies to this request
+        $configAll = $this->getParameter('pimcore_data_hub');
+        $graphqlCfg = $configAll['graphql'] ?? [];
+        $skipOutputCacheForGuarded = (bool)($graphqlCfg['persistent_disable_output_cache_for_guarded'] ?? false);
+
+        // When running a background refresh, bypass the standard output cache layer
+        $isPersistentRefresh = (bool)$request->attributes->get('_datahub_persistent_refresh');
+        $isPersistentApplies = (bool)$request->attributes->get('_datahub_persistent_applies');
+        $skipOutputCache = $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
+
+        if (!$skipOutputCache && ($response = $this->cacheService->load($request))) {
+            Logger::debug('Output cache HIT');
+
+            $responseService->addCorsHeaders($response);
+            $responseService->addHitMissHeaders($response, true);
+
+            return $response;
+        }
+
+        Logger::debug('Output cache MISS');
+
+        // Try to acquire an in-progress marker for selected protected queries to avoid thundering herd
+        if ($inProgressResponse = $this->cacheService->maybeRejectOrAcquire($request)) {
+            $input = json_decode($request->getContent(), true) ?: [];
+            $operationName = $input['operationName'] ?? null;
+            Logger::debug(sprintf('In-progress: duplicate blocked (operationName=%s, status=%d)', (string)$operationName, $inProgressResponse->getStatusCode()));
+            $responseService->addCorsHeaders($inProgressResponse);
+
+            return $inProgressResponse;
+        }
+
+        // If we get here and a lock attribute exists, we acquired the protection lock
+        if ($request->attributes->get('datahub_inprogress_lock')) {
+            $input = json_decode($request->getContent(), true) ?: [];
+            $operationName = $input['operationName'] ?? null;
+            Logger::debug(sprintf('In-progress: lock ACQUIRED (operationName=%s)', (string)$operationName));
+        } else {
+            Logger::debug('In-progress: no protection (not enabled or query not listed)');
+        }
 
         // context info, will be passed on to all resolver function
         $context = ['clientname' => $clientname, 'configuration' => $configuration];
@@ -232,8 +299,13 @@ class WebserviceController extends FrontendController
         $response = new JsonResponse($output);
 
         $responseService->removeCorsHeaders($response);
-        $this->cacheService->save($request, $response);
+        if (!$skipOutputCache) {
+            $this->cacheService->save($request, $response);
+        }
+
+        $this->persistentCacheService->postHandle($request, $response);
         $responseService->addCorsHeaders($response);
+        $responseService->addHitMissHeaders($response, false);
 
         return $response;
     }

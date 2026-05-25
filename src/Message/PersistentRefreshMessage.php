@@ -15,16 +15,14 @@ declare(strict_types=1);
  *  @license    http://www.pimcore.org/license     GPLv3 and PCL
  */
 
-namespace Pimcore\Bundle\DataHubBundle\Service;
+namespace Pimcore\Bundle\DataHubBundle\Message;
 
-use Symfony\Component\HttpFoundation\JsonResponse;
-
-/** @internal  */
-interface ResponseServiceInterface
+final class PersistentRefreshMessage
 {
-    public function removeCorsHeaders(JsonResponse $response): void;
-
-    public function addCorsHeaders(JsonResponse $response): void;
-
-    public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void;
+    public function __construct(
+        public readonly string $client,
+        public readonly string $bodyJson,
+        public readonly ?string $operationName = null
+    ) {
+    }
 }

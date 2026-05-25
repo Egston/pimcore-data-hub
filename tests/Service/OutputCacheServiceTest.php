@@ -15,13 +15,13 @@
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use Codeception\Test\Unit;
+use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 
-class OutputCacheServiceTest extends Unit
+class OutputCacheServiceTest extends TestCase
 {
     protected $container;
 
@@ -160,5 +160,234 @@ class OutputCacheServiceTest extends Unit
         // Assert
         $this->assertTrue(\Pimcore::inDebugMode());
         $this->assertEquals(null, $cacheItem);
+    }
+
+    public function testCanonicalKeyForEquivalentPayloads()
+    {
+        // Arrange
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'output_cache_lifetime' => 25,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $keys = [];
+        $sut = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut->method('saveToCache')->willReturnCallback(function ($key) use (&$keys) {
+            $keys[] = $key;
+        });
+
+        $clientname = 'client-a';
+        $queryA = 'query Op(
+  $id: ID!
+){
+  node(id: $id) {
+    id
+  }
+}';
+        $queryB = 'query  Op($id: ID!){node(id:$id){id}}'; // same semantics, different formatting
+        $bodyA = json_encode(['query' => $queryA, 'variables' => ['id' => 123], 'operationName' => 'Op']);
+        $bodyB = json_encode(['variables' => ['id' => 123], 'operationName' => 'Op', 'query' => $queryB]); // different order
+
+        $reqA = Request::create('/api', 'POST', [], [], [], [], $bodyA);
+        $reqA->attributes->set('clientname', $clientname);
+        $reqA->headers->set('Content-Type', 'application/json');
+
+        $reqB = Request::create('/api', 'POST', [], [], [], [], $bodyB);
+        $reqB->attributes->set('clientname', $clientname);
+        $reqB->headers->set('Content-Type', 'application/json');
+
+        // Act
+        $sut->save($reqA, new JsonResponse(['data' => ['ok' => true]]));
+        $sut->save($reqB, new JsonResponse(['data' => ['ok' => true]]));
+
+        // Assert: same computed cache key for both payloads
+        $this->assertCount(2, $keys);
+        $this->assertSame($keys[0], $keys[1]);
+    }
+
+    public function testGuardRequestStrategyCanonicalizesPayload()
+    {
+        // Configure guard to use 'request' strategy
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => ['Op'],
+                'in_progress_key_strategy' => 'request',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $clientname = 'client-b';
+        $queryA = 'query Op(
+  $id: ID!
+){
+  node(id: $id) { id }
+}';
+        $queryB = 'query Op($id: ID!){node(id:$id){id}}';
+        $bodyA = json_encode(['query' => $queryA, 'variables' => ['id' => 456], 'operationName' => 'Op']);
+        $bodyB = json_encode(['variables' => ['id' => 456], 'operationName' => 'Op', 'query' => $queryB]);
+
+        $reqA = Request::create('/api', 'POST', [], [], [], [], $bodyA);
+        $reqA->attributes->set('clientname', $clientname);
+        $reqB = Request::create('/api', 'POST', [], [], [], [], $bodyB);
+        $reqB->attributes->set('clientname', $clientname);
+
+        // First request should acquire guard (no rejection)
+        $reject1 = $sut->maybeRejectOrAcquire($reqA);
+        $this->assertNull($reject1, 'First guard attempt should not be rejected');
+
+        // Second equivalent request should be rejected (deduped)
+        $reject2 = $sut->maybeRejectOrAcquire($reqB);
+        $this->assertInstanceOf(JsonResponse::class, $reject2);
+        $this->assertSame(503, $reject2->getStatusCode());
+
+        // Cleanup: release guard by saving the first request (releases lock + removes marker)
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut2->method('saveToCache')->willReturnCallback(function () {
+        });
+        $sut2->save($reqA, new JsonResponse(['data' => ['ok' => true]]));
+    }
+
+    public function testMaybeRejectOrAcquireSetsGuardKeyAttribute()
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => ['Op'],
+                'in_progress_key_strategy' => 'operation',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
+            'query' => 'query Acquire($id: ID!){node(id:$id){id}}',
+            'variables' => ['id' => 1],
+            'operationName' => 'Acquire',
+        ]));
+        $req->attributes->set('clientname', 'client-x');
+
+        $result = $sut->maybeRejectOrAcquire($req);
+
+        $this->assertNull($result, 'First caller should not be rejected');
+        $this->assertTrue(
+            $req->attributes->has('datahub_inprogress_guard_key'),
+            'Guard key must be stored on request so the safety-net listener can delete the marker if save() never runs'
+        );
+
+        // Cleanup: call save() to release the marker
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut2->method('saveToCache')->willReturnCallback(function () {
+        });
+        $sut2->save($req, new JsonResponse(['data' => ['ok' => true]]));
+    }
+
+    public function testSaveReleasesGuardKeyAttributeEvenWhenCacheDisabled()
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => ['output_cache_enabled' => false],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container, $eventDispatcher])
+            ->onlyMethods(['saveToCache'])
+            ->getMock();
+        $sut->expects($this->never())->method('saveToCache');
+
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
+            'query' => 'query Op($id: ID!){node(id:$id){id}}',
+            'variables' => ['id' => 1],
+            'operationName' => 'Op',
+        ]));
+        $req->attributes->set('clientname', 'client-y');
+        // Simulate the guard key attribute set by maybeRejectOrAcquire()
+        $req->attributes->set('datahub_inprogress_guard_key', md5('op_Op'));
+
+        $sut->save($req, new JsonResponse(['data' => ['ok' => true]]));
+
+        $this->assertFalse(
+            $req->attributes->has('datahub_inprogress_guard_key'),
+            'save() must clear the guard key attribute even when cache is disabled, so the safety-net listener is a no-op on TERMINATE'
+        );
+    }
+
+    public function testBypassGuardForBackgroundRefresh()
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'output_cache_enabled' => true,
+                'in_progress_protection_enabled' => true,
+                'in_progress_queries' => ['Op'],
+                'in_progress_key_strategy' => 'request',
+                'in_progress_ttl' => 5,
+            ],
+        ]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher->method('dispatch')->willReturnArgument(0);
+
+        $sut = new OutputCacheService($container, $eventDispatcher);
+
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode([
+            'query' => 'query Op($id: ID!){node(id:$id){id}}',
+            'variables' => ['id' => 1],
+            'operationName' => 'Op',
+        ]));
+        $req->attributes->set('_datahub_bypass_in_progress_guard', true);
+
+        $reject = $sut->maybeRejectOrAcquire($req);
+        $this->assertNull($reject, 'Background refresh must bypass herd guard');
+    }
+
+    public function testProbeStatusDisabledHitMiss()
+    {
+        // disabled
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn(['graphql' => ['output_cache_enabled' => false]]);
+        $eventDispatcher = $this->createMock(EventDispatcherInterface::class);
+        $sut = new OutputCacheService($container, $eventDispatcher);
+        $req = Request::create('/api', 'POST', [], [], [], [], json_encode(['query' => '{__typename}']));
+        $this->assertSame('DISABLED', $sut->probeStatus($req));
+
+        // enabled: MISS then HIT
+        $container2 = $this->createMock(ContainerBagInterface::class);
+        $container2->method('get')->willReturn(['graphql' => ['output_cache_enabled' => true, 'output_cache_lifetime' => 5]]);
+        $eventDispatcher2 = $this->createMock(EventDispatcherInterface::class);
+        $eventDispatcher2->method('dispatch')->willReturnArgument(0);
+        $sut2 = $this->getMockBuilder(OutputCacheService::class)
+            ->setConstructorArgs([$container2, $eventDispatcher2])
+            ->onlyMethods(['loadFromCache', 'saveToCache'])
+            ->getMock();
+
+        $sut2->method('loadFromCache')->willReturnOnConsecutiveCalls(null, null); // MISS probe path, then not used further
+        $this->assertSame('MISS', $sut2->probeStatus($req));
     }
 }

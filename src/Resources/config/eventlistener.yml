@@ -14,3 +14,15 @@ services:
             $config: '%pimcore_data_hub%'
         tags:
             - { name: kernel.event_listener, event: pimcore.admin.indexAction.settings, method: addIndexSettings }
+
+    Pimcore\Bundle\DataHubBundle\EventListener\PersistentCacheInvalidationListener:
+        tags:
+            - { name: kernel.event_subscriber }
+
+    Pimcore\Bundle\DataHubBundle\EventListener\PersistentCacheRefreshOnTerminateListener:
+        tags:
+            - { name: kernel.event_subscriber }
+
+    Pimcore\Bundle\DataHubBundle\EventListener\InProgressLockReleaseListener:
+        tags:
+            - { name: kernel.event_subscriber }

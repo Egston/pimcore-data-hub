@@ -1,22 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/7.5/phpunit.xsd"
-         bootstrap="vendor/autoload.php"
-         colors="true">
-    
-    <testsuite name="Project Test Suite">
-        <directory>tests/</directory>
-    </testsuite>
-
-    <filter>
-        <whitelist processUncoveredFilesFromWhitelist="true">
-            <directory suffix=".php">src/*</directory>
-        </whitelist>
-    </filter>
-
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="tests/bootstrap.php"
+         colors="true"
+         failOnWarning="true">
+    <testsuites>
+        <testsuite name="Unit">
+            <!--
+              Host-runnable unit tests only. Pre-existing tests that boot the
+              Pimcore kernel (`\Pimcore::getContainer()` / `\Pimcore::inDebugMode()`)
+              or mock final Pimcore classes are left out — they run via the
+              bundle's separate codeception suites in CI with a full Pimcore
+              install. See tests/_bootstrap.php and tests/Service.suite.dist.yml.
+            -->
+            <file>tests/Command/PersistentCacheClearCommandTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceBackendTest.php</file>
+            <file>tests/EventListener/InProgressLockReleaseListenerTest.php</file>
+            <file>tests/Lock/LockSignalRefresherTest.php</file>
+        </testsuite>
+    </testsuites>
+    <coverage>
+        <include>
+            <directory>src</directory>
+        </include>
+    </coverage>
     <php>
         <env name="APP_ENV" value="testing"/>
-        <env name="SYMFONY_PHPUNIT_VERSION" value="7.5" />
-        <env name="SYMFONY_DEPRECATIONS_HELPER" value="max[self]=10"/>
     </php>
 </phpunit>

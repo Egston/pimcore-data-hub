@@ -15,16 +15,4 @@ declare(strict_types=1);
  *  @license    http://www.pimcore.org/license     GPLv3 and PCL
  */
 
-namespace Pimcore\Bundle\DataHubBundle\Service;
-
-use Symfony\Component\HttpFoundation\JsonResponse;
-
-/** @internal  */
-interface ResponseServiceInterface
-{
-    public function removeCorsHeaders(JsonResponse $response): void;
-
-    public function addCorsHeaders(JsonResponse $response): void;
-
-    public function addHitMissHeaders(JsonResponse $response, bool $isCacheHit): void;
-}
+require_once __DIR__ . '/../vendor/autoload.php';
