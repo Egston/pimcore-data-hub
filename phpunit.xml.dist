@@ -36,7 +36,29 @@
             <file>tests/Messenger/PriorityRedisTransportScoreTest.php</file>
             <file>tests/Service/PersistentOutputCacheServicePriorityTest.php</file>
             <file>tests/DependencyInjection/ConfigurationTest.php</file>
+            <file>tests/Functional/Fixtures/KernelTestCaseSentinelTest.php</file>
+        </testsuite>
+        <!--
+          L3 functional suite. Requires either the minikube test-namespace
+          bootstrap (tests/Functional/bootstrap-minikube.sh) or the
+          docker-compose path against a real Redis + MariaDB stack: these
+          tests boot the Pimcore kernel and dispatch GraphQL requests
+          through the controller against fixtures created by
+          pimcore-data-hub:test:load-fixtures.
+
+          The suite is opt-in: phpunit's default invocation runs only the
+          Unit suite. Operators standing up the namespace invoke
+          `phpunit testsuite=Functional` manually.
+        -->
+        <testsuite name="Functional">
             <file>tests/Functional/CoverageProbeTest.php</file>
+            <file>tests/Functional/ColdMissTest.php</file>
+            <file>tests/Functional/StaleHitTest.php</file>
+            <file>tests/Functional/FreshHitTest.php</file>
+            <file>tests/Functional/RefreshQueueTest.php</file>
+            <file>tests/Functional/PriorityQueueTest.php</file>
+            <file>tests/Functional/ConcurrencyTest.php</file>
+            <file>tests/Functional/FailureRecoveryTest.php</file>
         </testsuite>
     </testsuites>
     <coverage>
@@ -45,6 +67,6 @@
         </include>
     </coverage>
     <php>
-        <env name="APP_ENV" value="testing"/>
+        <env name="APP_ENV" value="test"/>
     </php>
 </phpunit>

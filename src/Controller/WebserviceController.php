@@ -43,6 +43,8 @@ use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
 use Pimcore\Logger;
 use Pimcore\Model\Factory;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -81,13 +83,17 @@ class WebserviceController extends FrontendController
      */
     private $operationClassifier;
 
+    private readonly ?LoggerInterface $psrLogger;
+
     public function __construct(
         EventDispatcherInterface $eventDispatcher,
         CheckConsumerPermissionsService $permissionsService,
         OutputCacheService $cacheService,
         PersistentOutputCacheService $persistentCacheService,
         FileUploadService $uploadService,
-        OperationClassifier $operationClassifier
+        OperationClassifier $operationClassifier,
+        #[Autowire(service: 'monolog.logger.pimcore')]
+        ?LoggerInterface $psrLogger = null,
     ) {
         $this->eventDispatcher = $eventDispatcher;
         $this->permissionsService = $permissionsService;
@@ -95,6 +101,7 @@ class WebserviceController extends FrontendController
         $this->persistentCacheService = $persistentCacheService;
         $this->uploadService = $uploadService;
         $this->operationClassifier = $operationClassifier;
+        $this->psrLogger = $psrLogger;
     }
 
     /**
@@ -206,6 +213,9 @@ class WebserviceController extends FrontendController
                     usleep(50_000);
                     $pResponse = $this->persistentCacheService->preHandle($request, $responseService);
                     if ($pResponse) {
+                        $this->psrLogger?->info('swr.cold_miss.lock.observed_write', [
+                            'cache_status' => $pResponse->headers->get('X-Pimcore-DataHub-Persistent-Cache', ''),
+                        ]);
                         $responseService->addHitMissHeaders($pResponse, true);
 
                         return $pResponse;
@@ -216,6 +226,9 @@ class WebserviceController extends FrontendController
                 // does not trigger a kernel.terminate refresh against the
                 // response we are about to write inline.
                 $request->attributes->remove('_datahub_persistent_refresh');
+                $this->psrLogger?->info('swr.cold_miss.lock.timeout_fallback', [
+                    'wait_ms_budget' => $waitMs,
+                ]);
             }
         }
 

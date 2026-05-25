@@ -30,6 +30,200 @@ A short introduction video of an output channel based on the GraphQL query langu
 - [Configuration & Deployment](./doc/20_Deployment.md)
 - [Testing](./doc/30_Testing.md)
 
+## Two-tier SWR cache (yageo fork)
+
+This fork ships a stale-while-revalidate (SWR) persistent cache layer on top of
+the standard GraphQL output cache. Operations are classified into one of three
+tiers and the runtime behavior follows from that classification.
+
+### Overview
+
+Two operationally-distinct consumer profiles share the persistent layer:
+
+| Tier            | Membership                                                                    | Cold miss                                                | Stale hit                              | Refresh dedup        |
+| --------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------- | -------------------------------------- | -------------------- |
+| `HERD_GUARDED`  | `operations: { <op>: { tier: herd_guarded, … } }` (BC: `in_progress_queries`) | 503 + `Retry-After`                                      | Serve stale + enqueue refresh          | by `operationName`   |
+| `SWR_ONLY`      | `operations: { <op>: { tier: swr_only, … } }`                                 | Run resolver inline (bounded-wait per-query-hash lock)   | Serve stale + enqueue refresh          | by canonical body hash |
+| `NEITHER`       | not listed in `operations`                                                    | Run resolver inline; standard output cache only          | n/a                                    | n/a                  |
+
+The two SWR tiers differ only in cold-miss policy and refresh-lock granularity.
+`HERD_GUARDED` is intended for retry-aware programmatic consumers where bounded
+latency under cold start matters more than always-on availability; `SWR_ONLY`
+is intended for browsers where a 503 is unacceptable. Operations omitted from
+the classification do not participate in the persistent layer at all.
+
+### Configuration reference
+
+All knobs live under `pimcore_data_hub.graphql`. Per-operation classification
+is the only required surface; the rest have defaults.
+
+```yaml
+pimcore_data_hub:
+    graphql:
+        persistent_output_cache_enabled: true
+
+        # Tier-level payload TTL defaults; per-operation `ttl_override` wins.
+        persistent_output_cache_payload_ttl_by_granularity:
+            single: 86400      # 1 day
+            list:   1209600    # 2 weeks
+
+        # Skip the standard output cache (read + write) for ops that have
+        # their own SWR layer — avoids storing the response twice in Redis.
+        persistent_disable_output_cache_for_guarded: true
+
+        # Per-operation classification. Each entry declares both `tier` and
+        # `granularity` explicitly; unknown keys under an `operations` entry reject at boot.
+        operations:
+            getMyGuardedListing:
+                tier: herd_guarded
+                granularity: list
+            getMyBrowserListing:
+                tier: swr_only
+                granularity: list
+            getMyBrowserItem:
+                tier: swr_only
+                granularity: single
+                ttl_override: 600              # override the granularity default
+                enqueue_dedup_ttl_override: 120 # override `persistent_enqueue_dedupe_ttl`
+                priority_weight: 5             # consumed by weight-banded strategy
+
+        # Refresh queue / Messenger integration.
+        persistent_refresh_queue_enabled: true
+        persistent_enqueue_dedupe_ttl: 60        # per-op dedupe window
+        persistent_refresh_priority_strategy: oldest_refreshed_at_first
+        # Accepted values:
+        #   `oldest_refreshed_at_first` (default) — score = refreshedAt
+        #   `oldest_refreshed_at_first_with_weight_bands` — score = refreshedAt
+        #       - (priority_weight * persistent_refresh_priority_weight_band_seconds)
+        #   `disabled` — insertion-order FIFO equivalent
+        persistent_refresh_priority_weight_band_seconds: 60
+
+        # SWR_ONLY cold-miss bounded wait.
+        swr_cold_miss_lock_wait_ms: 5000
+
+        # ─── BC alias (preserved indefinitely) ───
+        # Each entry folds into `operations` as the synthetic shape
+        #   { tier: herd_guarded, granularity: list,
+        #     ttl_override: null, enqueue_dedup_ttl_override: null,
+        #     priority_weight: 1 }
+        # If an operation name appears in BOTH `in_progress_queries` and an
+        # explicit `operations:` entry, the explicit entry wins and the bundle
+        # emits `pimcore_data_hub.operations_in_progress_conflict` at WARNING
+        # on boot, enumerating the conflicting names.
+        in_progress_queries:
+            - getMyGuardedListing
+```
+
+### Messenger transport contract
+
+Background refresh runs off a Symfony Messenger transport so refresh work does
+not pin FPM workers. The bundle ships the transport factory; the host
+application binds the transport id and DSN in its `messenger.yaml`.
+
+| Surface                 | Value                                                                  |
+| ----------------------- | ---------------------------------------------------------------------- |
+| Message FQCN            | `Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage`        |
+| Transport DSN scheme    | `datahub-priority-redis://<host>:<port>/<db>`                          |
+| Recommended transport id| `datahub_graphql_refresh`                                              |
+| Consumer invocation     | `bin/console messenger:consume datahub_graphql_refresh --memory-limit=512M --time-limit=3600` |
+
+Wire both the transport and the routing in the host's `config/packages/messenger.yaml`:
+
+```yaml
+framework:
+    messenger:
+        transports:
+            datahub_graphql_refresh:
+                dsn: 'datahub-priority-redis://<host>:<port>/<db>'
+                retry_strategy:
+                    max_retries: 3
+                    delay: 1000
+                    multiplier: 2
+        routing:
+            'Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage': datahub_graphql_refresh
+```
+
+The transport is a Redis-backed priority queue (ZSET keyed by `refreshedAt`,
+oldest-stale first). The DSN factory consults the `pass` segment of the DSN
+first and falls back to `REDIS_PASSWORD` when none is supplied — Symfony ships
+no `urlencode:` env-var processor, so embedding a password with URL-reserved
+characters into the DSN at YAML level is not possible; let the factory resolve
+it from env.
+
+**Retry strategy.** Configure the transport in the host's `messenger.yaml`
+under `retry_strategy` — the bundle does not impose one. A sensible default is
+`max_retries: 3` with exponential backoff (`delay: 1000`, `multiplier: 2`)
+yielding 1s/2s/4s. Throwing `Symfony\Component\Messenger\Exception\RecoverableMessageHandlingException`
+from the handler signals contention (another consumer holds the per-op or
+per-hash lock) and triggers a requeue.
+
+**Redis prefix families on the consumer's Redis.** Keep them in
+mind when sizing or inspecting Redis:
+
+| Prefix                         | Owner                          | Role                                                         |
+| ------------------------------ | ------------------------------ | ------------------------------------------------------------ |
+| `datahub_inprogress_*`         | Pimcore Cache marker           | Herd-guard cold-start bookkeeping; cache-marker subsystem.   |
+| `datahub_inprogress:*`         | Symfony Lock resource          | Atomic per-`operationName` (or per-canonical-request) lock.  |
+| `datahub_refresh_priority_*`   | Priority transport             | ZSET (`_queue`) + messages HASH + inflight-visibility HASH.  |
+
+The underscore-suffixed and colon-suffixed `datahub_inprogress` prefixes are
+**not** the same subsystem and must not be conflated when writing new lock
+helpers — anchor against `OutputCacheService::computeOperationLockKey()`
+(colon, Symfony Lock) when serializing by operationName, and against
+`OutputCacheService::lockKeyFor()` (underscore, Pimcore Cache marker) for the
+cache-marker site. Two additional auxiliary prefixes also exist on the same
+Redis instance: `datahub_persistent_refresh_lock_*` for the SWR refresh lock
+acquired on the enqueue path and re-checked by the handler, and
+`datahub_swr_cold_miss_*` for the bounded-wait cold-miss lock used by `SWR_ONLY`
+operations.
+
+### Sizing guidance
+
+The bundle does not prescribe a deployment topology. Run **one Messenger
+consumer process per consumer pod**; replica count, container image, and
+scheduling are deployment concerns out of scope here.
+
+Consumer-pod sizing depends on:
+
+- The resolver-completion-time distribution across the classified operations
+  the consumer handles. Per-`operationName` serialization (for `HERD_GUARDED`)
+  and per-canonical-body serialization (for `SWR_ONLY`) cap intra-key
+  parallelism; cross-operation parallelism is bounded by the number of
+  consumer processes.
+- The product of `payload_ttl` and the peak invalidation rate, which drives
+  the steady-state Redis memory floor for the cached payloads.
+- The `persistent_enqueue_dedupe_ttl` floor on per-operation refresh cadence:
+  combined with cache-key-based hashing, re-saving the same content
+  repeatedly only enqueues one refresh per cache key per dedupe window.
+  Refresh-queue load is wave-shaped — proportional to
+  `(distinct_classes × cache_key_fanout) / dedupe_ttl` over the wave period,
+  not constant-rate.
+
+`payload_ttl` is a tunable. The default of one day balances Redis memory
+against the cost of regenerating cold-evicted entries; longer values reduce
+regeneration but extend the Redis memory floor proportionally to write rate.
+
+### Operator runbook — `REDIS_PASSWORD` rotation
+
+The transport factory reads `REDIS_PASSWORD` once at consumer process startup
+when the DSN does not carry the credential inline. Any deployment that wires
+the consumer pod via `envFrom` over a Kubernetes secret (or any other
+load-on-boot mechanism) MUST restart the consumer pods on rotation —
+`kubectl rollout restart`, a `checksum/secret` annotation on the pod spec,
+or whatever the deployment shape supports. The bundle does not auto-detect
+credential rotation.
+
+### What lives in the deployment
+
+Deployment-side concerns are intentionally out of scope for this README and
+live in the deployment overlay (Helm charts, Kustomize bases, systemd units,
+or equivalent): consumer pod chart name, replica count, resource limits,
+namespace, secret wiring, and the queue-drain policy during partial outages.
+In particular, do **not** add the bundle's transport name to an unrelated
+maintenance worker's queue-list flag to "drain in the interim" — the
+operational drift produced on credential rotation or worker failure is worse
+than a temporarily-accumulating queue.
+
 ## Further Information
 On Pimcore Datahub adapters:
 - [Datahub Simple Rest API](https://pimcore.com/docs/platform/Datahub_Simple_Rest/)

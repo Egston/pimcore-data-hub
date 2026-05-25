@@ -74,6 +74,17 @@ class PriorityRedisTransportFactory implements TransportFactoryInterface
         } elseif (isset($parsed['user']) && $parsed['user'] !== '') {
             $auth = (string)$parsed['user'];
         }
+        if ($auth === null) {
+            // Pimcore-native transports get the password through REDIS_DSN's
+            // url-encoded userinfo segment; this transport assembles its own
+            // DSN, so consult REDIS_PASSWORD directly when no userinfo was
+            // supplied. Encoding REDIS_PASSWORD into the DSN at YAML level
+            // would require a urlencode env processor Symfony doesn't ship.
+            $envPass = getenv('REDIS_PASSWORD');
+            if (is_string($envPass) && $envPass !== '') {
+                $auth = $envPass;
+            }
+        }
 
         $zsetKey = (string)($options['zset_key'] ?? 'datahub_refresh_priority_queue');
         $messagesKey = (string)($options['messages_key'] ?? 'datahub_refresh_priority_messages');

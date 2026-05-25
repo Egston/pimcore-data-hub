@@ -26,6 +26,9 @@ services:
         autowire: true
         autoconfigure: true
 
+    Pimcore\Bundle\DataHubBundle\Lock\:
+        resource: '../../Lock'
+
     Pimcore\Bundle\DataHubBundle\MessageHandler\:
         resource: '../../MessageHandler'
         public: false
@@ -40,3 +43,13 @@ services:
         public: true
         arguments:
             $bundle: "@=service('kernel').getBundle('PimcoreDataHubBundle')"
+
+when@test:
+    services:
+        _defaults:
+            autowire: true
+            autoconfigure: true
+            public: false
+
+        Pimcore\Bundle\DataHubBundle\Tests\Functional\Commands\:
+            resource: '../../../../tests/Functional/Commands'

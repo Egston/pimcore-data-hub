@@ -1,0 +1,30 @@
+{
+    "class": "TestSwrGuardedItem",
+    "parentFolder": "/datahub-tests/swr-guarded-items",
+    "items": [
+        {
+            "key": "guarded-item-1",
+            "category": "alpha",
+            "localized": {
+                "en": { "title": "Guarded Item 1", "body": "First guarded item, English body." },
+                "de": { "title": "Geschuetztes Element 1", "body": "Erstes geschuetztes Element, deutscher Text." }
+            }
+        },
+        {
+            "key": "guarded-item-2",
+            "category": "alpha",
+            "localized": {
+                "en": { "title": "Guarded Item 2", "body": "Second guarded item, English body." },
+                "de": { "title": "Geschuetztes Element 2", "body": "Zweites geschuetztes Element, deutscher Text." }
+            }
+        },
+        {
+            "key": "guarded-item-3",
+            "category": "beta",
+            "localized": {
+                "en": { "title": "Guarded Item 3", "body": "Third guarded item, English body." },
+                "de": { "title": "Geschuetztes Element 3", "body": "Drittes geschuetztes Element, deutscher Text." }
+            }
+        }
+    ]
+}
