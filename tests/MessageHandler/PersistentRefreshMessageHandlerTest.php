@@ -477,4 +477,100 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
 
         self::assertSame(1, $resetCalls, 'DependencyCollector::reset() must run at handler entry');
     }
+
+    private function makeCooldownHandler(
+        OperationClassifier $classifier,
+        LockFactory $lockFactory,
+        WebserviceController $controller,
+        PersistentOutputCacheService $persistentCache
+    ): PersistentRefreshMessageHandler {
+        $resolver = new class($lockFactory) extends LockFactoryResolver {
+            public function __construct(private LockFactory $factory)
+            {
+            }
+
+            public function resolve(): ?object
+            {
+                return $this->factory;
+            }
+        };
+
+        $graphQlService = $this->createMock(GraphQLService::class);
+        $localeService = $this->createMock(LocaleServiceInterface::class);
+        $modelFactory = (new \ReflectionClass(Factory::class))->newInstanceWithoutConstructor();
+        $longRunningHelper = (new \ReflectionClass(LongRunningHelper::class))->newInstanceWithoutConstructor();
+        $responseService = $this->createMock(ResponseServiceInterface::class);
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn(['graphql' => ['persistent_refresh_lock_ttl' => 60]]);
+
+        return new PersistentRefreshMessageHandler(
+            $classifier,
+            $resolver,
+            $controller,
+            $graphQlService,
+            $localeService,
+            $modelFactory,
+            $longRunningHelper,
+            $responseService,
+            $container,
+            null,
+            null,
+            $persistentCache
+        );
+    }
+
+    public function testSuccessfulRefreshOfDeliverAtMessageClearsCooldownSentinel(): void
+    {
+        $classifier = $this->makeClassifier(['OpCooldown' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        $body = '{"operationName":"OpCooldown"}';
+        $expectedHash = hash('sha256', 'client:c1' . "\n" . $body);
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->expects(self::once())->method('clearOperationCooldown')->with($expectedHash);
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpCooldown', time(), null, time() + 21600);
+        $handler($msg);
+    }
+
+    public function testSuccessfulRefreshOfNullDeliverAtMessageDoesNotClearCooldownSentinel(): void
+    {
+        $classifier = $this->makeClassifier(['OpPlain' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->expects(self::never())->method('clearOperationCooldown');
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpPlain"}', 'OpPlain', time(), null, null);
+        $handler($msg);
+    }
+
+    public function testFailedRefreshOfDeliverAtMessageDoesNotClearCooldownSentinel(): void
+    {
+        $classifier = $this->makeClassifier(['OpFail' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->method('webonyxAction')
+            ->willThrowException(new \RuntimeException('controller failure'));
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->expects(self::never())->method('clearOperationCooldown');
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpFail"}', 'OpFail', time(), null, time() + 21600);
+        $handler($msg);
+    }
 }

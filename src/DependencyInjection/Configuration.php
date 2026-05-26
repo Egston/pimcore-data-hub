@@ -115,6 +115,7 @@ class Configuration implements ConfigurationInterface
                                     ->integerNode('ttl_override')->min(1)->defaultNull()->end()
                                     ->integerNode('enqueue_dedup_ttl_override')->min(1)->defaultNull()->end()
                                     ->integerNode('priority_weight')->defaultValue(1)->end()
+                                    ->integerNode('invalidation_cooldown_ttl')->info('seconds to throttle invalidation-triggered refreshes of this operation: the first edit in a window schedules one dated refresh and arms a per-entry cooldown sentinel; further edits within the window are suppressed. null disables throttling (immediate per-edit refresh)')->min(1)->defaultNull()->end()
                                 ->end()
                             ->end()
                             ->defaultValue([])
@@ -236,6 +237,7 @@ class Configuration implements ConfigurationInterface
                 'ttl_override' => null,
                 'enqueue_dedup_ttl_override' => null,
                 'priority_weight' => 1,
+                'invalidation_cooldown_ttl' => null,
             ];
         }
         $graphql['operations'] = $operations;

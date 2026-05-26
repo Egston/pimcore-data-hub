@@ -31,6 +31,8 @@ if (!class_exists('Redis')) {
         public function exec() {}
         public function zAdd($key, $score, $member) {}
         public function zPopMin($key, $count) {}
+        public function zRangeByScore($key, $start, $end, $options = []) {}
+        public function zRem($key, ...$members) {}
         public function zCard($key) {}
         public function hSet($key, $field, $value) {}
         public function hGet($key, $field) {}
@@ -111,6 +113,51 @@ final class FakeRedis extends \Redis
         }
 
         return $picked;
+    }
+
+    /**
+     * Returns members whose score is within [start, end] ascending by score,
+     * honoring the LIMIT option. Only the `-inf` lower bound and a numeric
+     * upper bound (the shape the transport uses) are supported.
+     *
+     * @param array{limit?: array{int, int}} $options
+     *
+     * @return list<string>
+     */
+    public function zRangeByScore($key, $start, $end, $options = []): mixed
+    {
+        if (!isset($this->zsets[$key]) || $this->zsets[$key] === []) {
+            return [];
+        }
+        $min = $start === '-inf' ? -INF : (float)$start;
+        $max = $end === '+inf' ? INF : (float)$end;
+        $matching = [];
+        foreach ($this->zsets[$key] as $member => $score) {
+            if ($score >= $min && $score <= $max) {
+                $matching[(string)$member] = $score;
+            }
+        }
+        asort($matching);
+        $members = array_keys($matching);
+        if (isset($options['limit']) && is_array($options['limit'])) {
+            [$offset, $count] = $options['limit'];
+            $members = array_slice($members, (int)$offset, (int)$count);
+        }
+
+        return array_values(array_map('strval', $members));
+    }
+
+    public function zRem($key, ...$members): mixed
+    {
+        $removed = 0;
+        foreach ($members as $member) {
+            if (isset($this->zsets[$key][$member])) {
+                unset($this->zsets[$key][$member]);
+                ++$removed;
+            }
+        }
+
+        return $this->recordOrReturn($removed);
     }
 
     public function zCard($key): mixed
@@ -399,5 +446,120 @@ final class PriorityRedisTransportTest extends TestCase
 
         $second = iterator_to_array($transport->get());
         self::assertSame('OpMid', $second[0]->getMessage()->operationName);
+    }
+
+    public function testScoreForUsesDeliverAtVerbatimWhenSet(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis, null, 600, 5, 'oldest_refreshed_at_first_with_weight_bands', 60);
+
+        $future = time() + 21600;
+        $scheduled = new PersistentRefreshMessage('c1', '{}', 'OpCooldown', time(), 7, $future);
+
+        // deliverAt wins over both the refreshedAt baseline and weight banding.
+        self::assertSame($future, $transport->scoreFor($scheduled));
+    }
+
+    public function testNullDeliverAtMessagePopsImmediately(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer);
+
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpNow', time() - 5, null)));
+
+        $envelopes = iterator_to_array($transport->get());
+        self::assertCount(1, $envelopes);
+        self::assertSame('OpNow', $envelopes[0]->getMessage()->operationName);
+    }
+
+    public function testFutureDeliverAtMessageDoesNotPopUntilDue(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer);
+
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpScheduled', time(), null, time() + 3600)));
+
+        // The message is in the ZSET but future-scored, so get() must not return it.
+        self::assertSame(1, $transport->getMessageCount());
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    public function testDueDeliverAtMessagePopsOnceWindowElapses(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer);
+
+        // A scheduled message whose deliverAt is already in the past is due.
+        $deliverAt = time() - 1;
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpDue', time() - 7200, null, $deliverAt)));
+
+        $envelopes = iterator_to_array($transport->get());
+        self::assertCount(1, $envelopes);
+        $decoded = $envelopes[0]->getMessage();
+        self::assertSame('OpDue', $decoded->operationName);
+        self::assertSame($deliverAt, $decoded->deliverAt);
+    }
+
+    public function testDueMessagesAmongMixedScheduledOrderByScore(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer);
+
+        // Two due (past-scored) messages and one future-scheduled; the due ones
+        // drain lowest-score-first and the future one stays invisible.
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpDueRecent', time() - 10, null)));
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpDueOldest', time() - 100, null)));
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpFuture', time(), null, time() + 3600)));
+
+        $first = iterator_to_array($transport->get());
+        self::assertSame('OpDueOldest', $first[0]->getMessage()->operationName);
+        $transport->ack($first[0]);
+
+        $second = iterator_to_array($transport->get());
+        self::assertSame('OpDueRecent', $second[0]->getMessage()->operationName);
+        $transport->ack($second[0]);
+
+        // The future-scheduled message is still not due.
+        self::assertSame([], iterator_to_array($transport->get()));
+        self::assertSame(1, $transport->getMessageCount());
+    }
+
+    public function testReapedScheduledMessageRetainsDeliverAt(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer, 60, 5);
+
+        $deliverAt = time() + 3600;
+        $scheduled = new PersistentRefreshMessage('c1', '{}', 'OpScheduled', time(), null, $deliverAt);
+        $encoded = $serializer->encode(new Envelope($scheduled));
+        $redis->hashes[self::MESSAGES] = ['stuck-id' => $encoded['body']];
+        $redis->hashes[self::INFLIGHT] = ['stuck-id' => json_encode(['poppedAt' => time() - 600])];
+
+        // The reaper re-queues stuck-id with its intrinsic score; an absolute
+        // deliverAt must survive so the message stays future-dated, not visible.
+        iterator_to_array($transport->get());
+
+        self::assertArrayHasKey('stuck-id', $redis->zsets[self::ZSET]);
+        self::assertSame($deliverAt, (int)$redis->zsets[self::ZSET]['stuck-id']);
+        self::assertArrayNotHasKey('stuck-id', $redis->hashes[self::INFLIGHT]);
+    }
+
+    public function testMessageScoredAtExactlyNowPopsImmediately(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer);
+
+        $now = time();
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpExactNow', $now, null, $now)));
+
+        $envelopes = iterator_to_array($transport->get());
+        self::assertCount(1, $envelopes);
+        self::assertSame('OpExactNow', $envelopes[0]->getMessage()->operationName);
     }
 }

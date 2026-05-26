@@ -72,7 +72,8 @@ final class PersistentRefreshMessageHandler
         private ResponseServiceInterface $responseService,
         private ContainerBagInterface $container,
         private ?DependencyCollector $dependencyCollector = null,
-        private ?MessageBusInterface $bus = null
+        private ?MessageBusInterface $bus = null,
+        private ?PersistentOutputCacheService $persistentCache = null
     ) {
     }
 
@@ -143,6 +144,7 @@ final class PersistentRefreshMessageHandler
         ));
 
         $controllerSucceeded = false;
+
         try {
             $request = Request::create(
                 '/datahub/graphql',
@@ -195,6 +197,7 @@ final class PersistentRefreshMessageHandler
             // Skipped on failure so the retry path doesn't pile dispatches.
             if ($controllerSucceeded) {
                 $this->reconcileCoalesceFlags($message, $operationName);
+                $this->closeCooldownWindow($message, $operationName);
             }
 
             Logger::info(sprintf(
@@ -244,6 +247,31 @@ final class PersistentRefreshMessageHandler
         } catch (\Throwable $e) {
             $this->logWarning(sprintf(
                 'datahub.refresh_handler: coalesce-flag reconcile failed for %s: %s',
+                $operationName,
+                $e->getMessage()
+            ));
+        }
+    }
+
+    /**
+     * A cooldown-scheduled message (non-null deliverAt) carried the op-cooldown
+     * sentinel that suppressed per-edit refreshes during its window. Clearing it
+     * opens a fresh window so the next edit re-arms and schedules the following
+     * dated refresh. Fail-soft: a clear failure is non-fatal — the sentinel
+     * TTL-expires near deliverAt anyway.
+     */
+    private function closeCooldownWindow(PersistentRefreshMessage $message, string $operationName): void
+    {
+        if ($message->deliverAt === null || $this->persistentCache === null) {
+            return;
+        }
+
+        try {
+            $hash = hash('sha256', 'client:' . $message->client . "\n" . $message->bodyJson);
+            $this->persistentCache->clearOperationCooldown($hash);
+        } catch (\Throwable $e) {
+            $this->logWarning(sprintf(
+                'datahub.refresh_handler: cooldown-window close failed for %s: %s',
                 $operationName,
                 $e->getMessage()
             ));

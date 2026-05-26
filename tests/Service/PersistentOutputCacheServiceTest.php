@@ -894,4 +894,68 @@ final class PersistentOutputCacheServiceTest extends TestCase
         $this->assertNull($service->preHandle($req, $this->makeResponseService()));
         $service->postHandle($req, new JsonResponse(['x' => 1]));
     }
+
+    public function testArmOperationCooldownStoresSentinelTaggedWatermark(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $observed = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$observed) {
+            $observed = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $service->armOperationCooldown('abc123', 21600);
+
+        $this->assertSame(PersistentOutputCacheService::KEY_OP_COOLDOWN_PREFIX . 'abc123', $observed['key']);
+        $this->assertSame(21600, $observed['ttl']);
+        // TAG_WATERMARK (not TAG_COMMON) so clearAll() preserves the sentinel.
+        $this->assertContains(PersistentOutputCacheService::TAG_WATERMARK, $observed['tags']);
+        $this->assertNotContains(PersistentOutputCacheService::TAG_COMMON, $observed['tags']);
+    }
+
+    public function testOperationCooldownArmHasClearRoundTrip(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheLoad', 'cacheSave', 'cacheRemove'])
+            ->getMock();
+
+        $store = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$store) {
+            $store[$key] = $value;
+        });
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use (&$store) {
+            return $store[$key] ?? null;
+        });
+        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store) {
+            unset($store[$key]);
+        });
+
+        $this->assertFalse($service->hasOperationCooldown('hash9'));
+        $service->armOperationCooldown('hash9', 600);
+        $this->assertTrue($service->hasOperationCooldown('hash9'));
+        $service->clearOperationCooldown('hash9');
+        $this->assertFalse($service->hasOperationCooldown('hash9'));
+    }
+
+    public function testHasOperationCooldownReturnsFalseWhenCacheReturnsFalse(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturn(false);
+
+        $this->assertFalse($service->hasOperationCooldown('missinghash'));
+    }
 }

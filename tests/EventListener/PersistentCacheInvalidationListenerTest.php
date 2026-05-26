@@ -20,6 +20,7 @@ namespace Pimcore\Bundle\DataHubBundle\Tests\EventListener;
 use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\EventListener\PersistentCacheInvalidationListener;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Event\AssetEvents;
 use Pimcore\Event\DataObjectEvents;
@@ -39,12 +40,13 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         array $graphqlConfig,
         ?MessageBusInterface $bus,
         PersistentOutputCacheService $cacheService,
-        array &$cacheBacking
+        array &$cacheBacking,
+        ?OperationClassifier $classifier = null
     ): PersistentCacheInvalidationListener {
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn(['graphql' => $graphqlConfig]);
 
-        return new class($cacheService, $container, $bus, $cacheBacking) extends PersistentCacheInvalidationListener {
+        return new class($cacheService, $container, $bus, $cacheBacking, $classifier) extends PersistentCacheInvalidationListener {
             /** @var array<string, mixed> */
             private array $store;
 
@@ -52,9 +54,10 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 PersistentOutputCacheService $cache,
                 ContainerBagInterface $container,
                 ?MessageBusInterface $bus,
-                array &$store
+                array &$store,
+                ?OperationClassifier $classifier
             ) {
-                parent::__construct($cache, $container, $bus);
+                parent::__construct($cache, $container, $bus, $classifier);
                 $this->store = &$store;
             }
 
@@ -68,6 +71,17 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 $this->store[$key] = $value;
             }
         };
+    }
+
+    /**
+     * @param array<string, array<string, mixed>> $operations
+     */
+    private function makeClassifier(array $operations): OperationClassifier
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn(['graphql' => ['operations' => $operations]]);
+
+        return new OperationClassifier($container);
     }
 
     private function makeDataObject(int $id): AbstractObject
@@ -537,6 +551,231 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $bus,
             $cache,
             $store
+        );
+
+        $listener->mark(new DataObjectEvent($object));
+    }
+
+    public function testCooldownOpSchedulesDatedRefreshAndArmsSentinel(): void
+    {
+        $object = $this->makeDataObject(21);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_21';
+
+        $client = 'c1';
+        $canonical = '{"q":"cooldown"}';
+        $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_cd', 'persistent_output_meta_cd'],
+            ],
+            'persistent_output_meta_cd' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->method('hasOperationCooldown')->with($hash)->willReturn(false);
+        $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $before = time();
+        $listener->mark(new DataObjectEvent($object));
+        $after = time();
+
+        self::assertCount(1, $dispatched, 'cooldown op schedules exactly one dated refresh');
+        $msg = $dispatched[0];
+        self::assertInstanceOf(PersistentRefreshMessage::class, $msg);
+        self::assertNotNull($msg->deliverAt, 'scheduled refresh must carry a deliverAt');
+        self::assertGreaterThanOrEqual($before + 21600, $msg->deliverAt);
+        self::assertLessThanOrEqual($after + 21600, $msg->deliverAt);
+
+        self::assertArrayNotHasKey(
+            PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash,
+            $store
+        );
+    }
+
+    public function testCooldownOpSecondInvalidationWithLiveSentinelIsNoOp(): void
+    {
+        $object = $this->makeDataObject(22);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_22';
+
+        $client = 'c1';
+        $canonical = '{"q":"cooldown2"}';
+        $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_cd2', 'persistent_output_meta_cd2'],
+            ],
+            'persistent_output_meta_cd2' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+            ],
+        ];
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::never())->method('dispatch');
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        // Sentinel alive from a prior edit's schedule: must not re-arm, must not
+        // dispatch, and must NOT bump the global watermark (which would cascade-
+        // stale everything and defeat the cooldown).
+        $cache->method('hasOperationCooldown')->with($hash)->willReturn(true);
+        $cache->expects(self::never())->method('armOperationCooldown');
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $listener->mark(new DataObjectEvent($object));
+    }
+
+    public function testNonCooldownOpDispatchesImmediatelyAsRegressionGuard(): void
+    {
+        $object = $this->makeDataObject(23);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_23';
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_nc', 'persistent_output_meta_nc'],
+            ],
+            'persistent_output_meta_nc' => [
+                'client' => 'c1',
+                'canonical' => '{"q":"nocooldown"}',
+                'operation' => 'PlainOp',
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::never())->method('armOperationCooldown');
+
+        // PlainOp is classified but has no invalidation_cooldown_ttl → immediate path.
+        $classifier = $this->makeClassifier([
+            'PlainOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $listener->mark(new DataObjectEvent($object));
+
+        self::assertCount(1, $dispatched);
+        self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
+        self::assertNull($dispatched[0]->deliverAt, 'non-cooldown op must dispatch an immediate (null deliverAt) refresh');
+    }
+
+    public function testAllEntriesCooldownHandledDoesNotBumpWatermark(): void
+    {
+        // When every surviving reverse-index entry is a cooldown op that is
+        // suppressed by a live sentinel, the outer fallback must treat them as
+        // handled (coalesced) and NOT bump the global watermark.
+        $object = $this->makeDataObject(24);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_24';
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_h', 'persistent_output_meta_h'],
+            ],
+            'persistent_output_meta_h' => [
+                'client' => 'c1',
+                'canonical' => '{"q":"handled"}',
+                'operation' => 'CooldownOp',
+            ],
+        ];
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::never())->method('dispatch');
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->method('hasOperationCooldown')->willReturn(true);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
         );
 
         $listener->mark(new DataObjectEvent($object));

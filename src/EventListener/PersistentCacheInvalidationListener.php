@@ -18,6 +18,7 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Event\AssetEvents;
 use Pimcore\Event\DataObjectEvents;
@@ -47,7 +48,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
     public function __construct(
         private PersistentOutputCacheService $persistentCache,
         private ContainerBagInterface $container,
-        private ?MessageBusInterface $bus = null
+        private ?MessageBusInterface $bus = null,
+        private ?OperationClassifier $classifier = null
     ) {
     }
 
@@ -210,7 +212,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
      * Per-tag bus dispatch. The refresh-priority score on each dispatched
      * message is `time()` because no per-entry refreshedAt context is
      * available in the invalidation path — every entry is freshly stale, so
-     * the queue treats them as roughly equivalent and ZPOPMIN orders by
+     * the queue treats them as roughly equivalent and ZRANGEBYSCORE orders by
      * insertion time within the same-second bucket.
      *
      * The richer return shape lets the caller distinguish three
@@ -274,6 +276,46 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                 }
 
                 $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+
+                $cooldown = $operation !== '' && $this->classifier !== null
+                    ? $this->classifier->getInvalidationCooldown($operation)
+                    : null;
+                if ($cooldown !== null) {
+                    if ($this->persistentCache->hasOperationCooldown($hash)) {
+                        // A dated refresh is already queued for this entry's
+                        // window. Counts as handled (coalesced) so the outer
+                        // fallback does not bump the global watermark.
+                        Logger::info(sprintf(
+                            'persistent_cache_invalidation: cooldown active for op=%s; dated refresh already queued',
+                            $operation
+                        ));
+                        ++$result['coalesced'];
+
+                        continue;
+                    }
+                    $this->persistentCache->armOperationCooldown($hash, $cooldown);
+                    $priorityWeight = $this->classifier?->getPriorityWeight($operation);
+                    $this->bus->dispatch(new PersistentRefreshMessage(
+                        client: $client,
+                        bodyJson: $canonical,
+                        operationName: $operation,
+                        refreshedAt: time(),
+                        priorityWeight: $priorityWeight,
+                        deliverAt: time() + $cooldown,
+                    ));
+                    Logger::info(sprintf(
+                        'persistent_cache_invalidation: cooldown refresh scheduled for op=%s in %ds',
+                        $operation,
+                        $cooldown
+                    ));
+                    $result['dispatched'][] = [
+                        'op' => $operation,
+                        'vars' => self::extractVariables($canonical),
+                    ];
+
+                    continue;
+                }
+
                 $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash;
                 $existing = $this->cacheLoad($dedupeKey);
                 if ($existing !== false && $existing !== null) {

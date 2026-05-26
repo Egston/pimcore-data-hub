@@ -166,6 +166,64 @@ during an in-flight refresh:
   *before* those invalidations landed, so its written payload would
   already be stale on commit. The trailing refresh covers them all.
 
+### `datahub_graphql_op_cooldown_<hash>` — the invalidation-cooldown sentinel
+
+- **What it stores:** the literal value `1`. Same shape as the dedupe
+  sentinel and pending flag; presence is the signal.
+- **Set by:** the invalidation listener when it handles the first
+  invalidation in a window for an operation that carries an
+  `invalidation_cooldown_ttl`. Armed *instead of* dispatching an
+  immediate refresh — the listener instead dispatches a single dated
+  refresh message (see *Invalidation cooldown* below).
+- **TTL:** the operation's `invalidation_cooldown_ttl` (6h in
+  production for the translation-verification listings). Tagged
+  `TAG_WATERMARK`, not `TAG_COMMON`, so an SWR-layer `clearAll()`
+  preserves it — otherwise a clear would orphan the queued dated
+  refresh and let the next edit double-dispatch.
+- **Released by:** the worker on successful completion of the dated
+  refresh, opening a fresh window. On failure it is left to TTL-expire
+  near its `deliverAt`.
+- **What it prevents:** a full-listing refresh on every per-edit
+  invalidation of an expensive batch-verification view. While the
+  sentinel is present, further invalidations of the same entry are
+  suppressed — a dated refresh is already queued for the window.
+
+## Invalidation cooldown (per-operation refresh throttle)
+
+Operations carrying an `invalidation_cooldown_ttl` (the coarse
+translation-verification listings) take a throttled path on the
+invalidation side. Operations with a coarse listing granularity carry
+`granularity: list`, so a save on any contributing DataObject class
+would otherwise invalidate the whole listing and trigger a full refresh
+— once per edit. A translator marking items verified one-by-one would
+drive a full refresh per click.
+
+Instead, the first invalidation in a cooldown window:
+
+1. arms the `datahub_graphql_op_cooldown_<hash>` sentinel (TTL = the
+   cooldown window), and
+2. dispatches a single `PersistentRefreshMessage` carrying an absolute
+   `deliverAt = now + cooldown`.
+
+The dated message sits in the priority queue, invisible, until its
+`deliverAt` elapses; it then pops and refreshes the entry against
+then-current data, reflecting every edit made during the window. The
+worker clears the sentinel on success, opening the next window. Further
+invalidations while the sentinel is live are no-ops — a dated refresh is
+already queued.
+
+This is a pure trailing-edge throttle: N edits in one window collapse to
+exactly one refresh, fired `cooldown` after the first edit. There is no
+periodic poller — the dated message *is* the timer; a window with no
+edits queues nothing.
+
+**The read path is unchanged for these operations.** The cooldown guards
+only the invalidation→enqueue side. A targeted invalidation of a
+cooldown op does not move any watermark, so reads continue to serve a
+HIT carrying knowingly-slightly-stale data until the scheduled refresh
+lands. The global-watermark fallback still stales these ops normally
+when it fires.
+
 ## Determining freshness: the watermark
 
 ### What the watermark is

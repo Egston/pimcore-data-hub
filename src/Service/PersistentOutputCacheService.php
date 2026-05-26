@@ -77,6 +77,16 @@ class PersistentOutputCacheService
      */
     public const PENDING_REFRESH_PREFIX = 'datahub_pending_refresh_';
 
+    /**
+     * Per-entry trailing-edge cooldown sentinel for invalidation throttling,
+     * keyed by the same sha256(client+canonical) hash as ENQUEUE_DEDUPE_PREFIX.
+     * Armed by the invalidation listener when it schedules a dated refresh for a
+     * cooldown-configured operation; cleared by the worker after that refresh
+     * lands. While present, further invalidations of the same entry are
+     * suppressed (a dated refresh is already queued for the window).
+     */
+    public const KEY_OP_COOLDOWN_PREFIX = 'datahub_graphql_op_cooldown_';
+
     public const INDEX_ALL = 'datahub_graphql_persistent_index_all';
 
     public const INDEX_OP_PREFIX = 'datahub_graphql_persistent_index_op_';
@@ -331,6 +341,33 @@ class PersistentOutputCacheService
     public function clearAll(): bool
     {
         return $this->cacheClearTag(self::TAG_COMMON);
+    }
+
+    /**
+     * Arm the per-entry invalidation cooldown sentinel for $hash with a TTL of
+     * the operation's cooldown window. Tagged TAG_WATERMARK (not TAG_COMMON) so
+     * an SWR-layer clearAll() preserves it — otherwise a clear would orphan the
+     * already-queued dated refresh and let the next edit double-dispatch.
+     *
+     * @param string $hash sha256('client:'.$client."\n".$canonical) — the same
+     *                      per-entry hash used for the ENQUEUE_DEDUPE_PREFIX sentinel
+     * @param int    $ttl  cooldown window in seconds (the dated message's deliverAt offset)
+     */
+    public function armOperationCooldown(string $hash, int $ttl): void
+    {
+        $this->cacheSave(self::KEY_OP_COOLDOWN_PREFIX . $hash, 1, [self::TAG_WATERMARK], max(1, $ttl));
+    }
+
+    public function hasOperationCooldown(string $hash): bool
+    {
+        $existing = $this->cacheLoad(self::KEY_OP_COOLDOWN_PREFIX . $hash);
+
+        return $existing !== false && $existing !== null;
+    }
+
+    public function clearOperationCooldown(string $hash): void
+    {
+        $this->cacheRemove(self::KEY_OP_COOLDOWN_PREFIX . $hash);
     }
 
     /**
@@ -775,6 +812,11 @@ class PersistentOutputCacheService
     protected function cacheClearTag(string $tag): bool
     {
         return \Pimcore\Cache::clearTag($tag);
+    }
+
+    protected function cacheRemove(string $key): void
+    {
+        \Pimcore\Cache::remove($key);
     }
 
     private function keyPayload(string $clientname, string $canonical): string

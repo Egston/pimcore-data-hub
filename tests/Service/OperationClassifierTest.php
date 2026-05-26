@@ -186,4 +186,29 @@ final class OperationClassifierTest extends TestCase
         self::assertSame(1, $classifier->getPriorityWeight('testOpSingleSwr'));
         self::assertNull($classifier->getPriorityWeight('testOpUnknown'));
     }
+
+    public function testGetInvalidationCooldownReturnsValueWhenSet(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpListSwr' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'invalidation_cooldown_ttl' => 21600,
+                ],
+            ],
+        ]);
+        self::assertSame(21600, $classifier->getInvalidationCooldown('testOpListSwr'));
+    }
+
+    public function testGetInvalidationCooldownReturnsNullWhenUnsetOrUnclassified(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpListSwr' => ['tier' => 'swr_only', 'granularity' => 'list'],
+            ],
+        ]);
+        self::assertNull($classifier->getInvalidationCooldown('testOpListSwr'));
+        self::assertNull($classifier->getInvalidationCooldown('testOpUnknown'));
+    }
 }

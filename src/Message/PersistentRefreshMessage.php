@@ -25,13 +25,21 @@ final class PersistentRefreshMessage
         public readonly ?string $operationName = null,
         public readonly ?int $refreshedAt = null,
         /**
-         * Per-operation priority weight sourced from {@see \Pimcore\Bundle\DataHubBundle\Service\OperationClassifier::getPriorityWeight()}.
-         * Threaded through the message envelope as a forward-compatible scoring input;
-         * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()} currently orders solely by
-         * {@see self::$refreshedAt} and ignores this value. Future scoring strategies that blend staleness with
-         * per-operation weight will consume it without a schema change to the message.
+         * Per-operation priority weight consumed by {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
+         * under the `oldest_refreshed_at_first_with_weight_bands` strategy to offset the score
+         * by `priorityWeight × weightBandSeconds`.
          */
-        public readonly ?int $priorityWeight = null
+        public readonly ?int $priorityWeight = null,
+        /**
+         * Absolute earliest-delivery Unix timestamp for scheduled (delayed) refreshes.
+         * When non-null, {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
+         * uses it verbatim as the queue score, so the message stays invisible to
+         * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::get()} until
+         * `now >= deliverAt`. Encoded as an absolute timestamp (not a relative delay) so the
+         * transport's visibility-timeout reaper re-derives the same due-time from the envelope
+         * and a reaped scheduled message keeps its original schedule. Null = immediate delivery.
+         */
+        public readonly ?int $deliverAt = null
     ) {
     }
 }

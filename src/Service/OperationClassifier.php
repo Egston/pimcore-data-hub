@@ -45,6 +45,9 @@ class OperationClassifier
     /** @var array<string, int> */
     private array $priorityWeights = [];
 
+    /** @var array<string, int|null> */
+    private array $invalidationCooldowns = [];
+
     /** @var array{single: int, list: int} */
     private array $payloadTtlByGranularity;
 
@@ -70,6 +73,9 @@ class OperationClassifier
                 ? (int)$entry['enqueue_dedup_ttl_override']
                 : null;
             $this->priorityWeights[$name] = isset($entry['priority_weight']) ? (int)$entry['priority_weight'] : 1;
+            $this->invalidationCooldowns[$name] = isset($entry['invalidation_cooldown_ttl'])
+                ? (int)$entry['invalidation_cooldown_ttl']
+                : null;
         }
 
         $byGranularity = is_array($graphql['persistent_output_cache_payload_ttl_by_granularity'] ?? null)
@@ -137,5 +143,20 @@ class OperationClassifier
         }
 
         return $this->priorityWeights[$operationName] ?? 1;
+    }
+
+    /**
+     * Returns the per-operation invalidation-cooldown window in seconds, or
+     * null when the operation has no cooldown configured (or is unclassified).
+     * A non-null result opts the operation into the trailing-edge throttle on
+     * the invalidation path; null preserves the immediate per-edit refresh.
+     */
+    public function getInvalidationCooldown(string $operationName): ?int
+    {
+        if (!isset($this->tiers[$operationName])) {
+            return null;
+        }
+
+        return $this->invalidationCooldowns[$operationName] ?? null;
     }
 }
