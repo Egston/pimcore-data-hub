@@ -1,0 +1,54 @@
+{
+    "class": "TestSwrOnlyItem",
+    "parentFolder": "/datahub-tests/swr-only-items",
+    "items": [
+        {
+            "key": "swr-item-1-a",
+            "language": "A",
+            "localized": {
+                "en": { "title": "SWR Item 1 (A)", "body": "First SWR item, variable-set A, English body." },
+                "de": { "title": "SWR-Element 1 (A)", "body": "Erstes SWR-Element, Variantensatz A, deutscher Text." }
+            }
+        },
+        {
+            "key": "swr-item-1-b",
+            "language": "B",
+            "localized": {
+                "en": { "title": "SWR Item 1 (B)", "body": "First SWR item, variable-set B, English body." },
+                "de": { "title": "SWR-Element 1 (B)", "body": "Erstes SWR-Element, Variantensatz B, deutscher Text." }
+            }
+        },
+        {
+            "key": "swr-item-2-a",
+            "language": "A",
+            "localized": {
+                "en": { "title": "SWR Item 2 (A)", "body": "Second SWR item, variable-set A, English body." },
+                "de": { "title": "SWR-Element 2 (A)", "body": "Zweites SWR-Element, Variantensatz A, deutscher Text." }
+            }
+        },
+        {
+            "key": "swr-item-2-b",
+            "language": "B",
+            "localized": {
+                "en": { "title": "SWR Item 2 (B)", "body": "Second SWR item, variable-set B, English body." },
+                "de": { "title": "SWR-Element 2 (B)", "body": "Zweites SWR-Element, Variantensatz B, deutscher Text." }
+            }
+        },
+        {
+            "key": "swr-item-3-a",
+            "language": "A",
+            "localized": {
+                "en": { "title": "SWR Item 3 (A)", "body": "Third SWR item, variable-set A, English body." },
+                "de": { "title": "SWR-Element 3 (A)", "body": "Drittes SWR-Element, Variantensatz A, deutscher Text." }
+            }
+        },
+        {
+            "key": "swr-item-3-b",
+            "language": "B",
+            "localized": {
+                "en": { "title": "SWR Item 3 (B)", "body": "Third SWR item, variable-set B, English body." },
+                "de": { "title": "SWR-Element 3 (B)", "body": "Drittes SWR-Element, Variantensatz B, deutscher Text." }
+            }
+        }
+    ]
+}

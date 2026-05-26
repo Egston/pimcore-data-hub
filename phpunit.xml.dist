@@ -14,10 +14,56 @@
               install. See tests/_bootstrap.php and tests/Service.suite.dist.yml.
             -->
             <file>tests/Command/PersistentCacheClearCommandTest.php</file>
+            <file>tests/Controller/WebserviceControllerTierGateTest.php</file>
+            <file>tests/Controller/WebserviceControllerSwrColdMissTest.php</file>
+            <file>tests/Service/GraphQLRequestCanonicalizerTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceCanonicalizationParityTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceBackendTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceGateTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceColdMissLockTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceTagCollectionTest.php</file>
+            <file>tests/Service/OperationClassifierTest.php</file>
+            <file>tests/Service/DependencyCollectorTest.php</file>
             <file>tests/EventListener/InProgressLockReleaseListenerTest.php</file>
+            <file>tests/EventListener/ObjectLoadListenerTest.php</file>
+            <file>tests/EventListener/DependencyCollectorResetListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheInvalidationListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerTest.php</file>
+            <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerKeyParityTest.php</file>
+            <file>tests/EventListener/PersistentCacheRefreshOnTerminateListenerPriorityTest.php</file>
             <file>tests/Lock/LockSignalRefresherTest.php</file>
+            <file>tests/MessageHandler/PersistentRefreshMessageHandlerTest.php</file>
+            <file>tests/Messenger/PriorityRedisTransportFactoryTest.php</file>
+            <file>tests/Messenger/PriorityRedisTransportTest.php</file>
+            <file>tests/Messenger/PriorityRedisTransportScoreTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServicePriorityTest.php</file>
+            <file>tests/DependencyInjection/ConfigurationTest.php</file>
+            <file>tests/Service/TierTest.php</file>
+            <file>tests/PimcoreDataHubBundleBootTest.php</file>
+            <file>tests/Functional/Fixtures/KernelTestCaseSentinelTest.php</file>
+        </testsuite>
+        <!--
+          L3 functional suite. Requires either the minikube test-namespace
+          bootstrap (tests/Functional/bootstrap-minikube.sh) or the
+          docker-compose path against a real Redis + MariaDB stack: these
+          tests boot the Pimcore kernel and dispatch GraphQL requests
+          through the controller against fixtures created by
+          pimcore-data-hub:test:load-fixtures.
+
+          The suite is opt-in: phpunit's default invocation runs only the
+          Unit suite. Operators standing up the namespace invoke
+          `phpunit testsuite=Functional` manually.
+        -->
+        <testsuite name="Functional">
+            <file>tests/Functional/CoverageProbeTest.php</file>
+            <file>tests/Functional/ColdMissTest.php</file>
+            <file>tests/Functional/StaleHitTest.php</file>
+            <file>tests/Functional/FreshHitTest.php</file>
+            <file>tests/Functional/RefreshQueueTest.php</file>
+            <file>tests/Functional/PriorityQueueTest.php</file>
+            <file>tests/Functional/ConcurrencyTest.php</file>
+            <file>tests/Functional/FailureRecoveryTest.php</file>
         </testsuite>
     </testsuites>
     <coverage>
@@ -26,6 +72,6 @@
         </include>
     </coverage>
     <php>
-        <env name="APP_ENV" value="testing"/>
+        <env name="APP_ENV" value="test"/>
     </php>
 </phpunit>

@@ -17,10 +17,11 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\DataHubBundle\Service;
 
-use GraphQL\Language\AST\DocumentNode;
-use GraphQL\Language\Parser;
-use GraphQL\Language\Printer;
+use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
+use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Logger;
+use Psr\Log\LoggerInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -30,6 +31,9 @@ class PersistentOutputCacheService
     // Tag/key names use '_' instead of ':' — PSR-6 reserves '{}()/\@:' and
     // CacheItem validation throws on any of them in either a key or a tag.
     public const TAG_COMMON = 'datahub_graphql_persistent';
+
+    /** Request attribute carrying the acquired cold-miss lock (or absent when no lock held). */
+    public const REQUEST_ATTR_COLD_MISS_LOCK = '_datahub_swr_cold_miss_lock';
 
     /**
      * Dedicated tag for the singleton invalidation watermark; kept separate from
@@ -43,13 +47,35 @@ class PersistentOutputCacheService
 
     public const TAG_CLIENT_PREFIX = 'datahub_graphql_client_';
 
-    public const KEY_LAST_INVALIDATION = 'datahub_graphql_output_last_invalidation_ts';
+    /** Per-object cache tag (one per `<class>:<id>` recorded during the GraphQL request). */
+    public const TAG_OBJECT_PREFIX = 'datahub_graphql_obj_';
+
+    /** Per-class cache tag (one per distinct element class recorded). */
+    public const TAG_CLASS_PREFIX = 'datahub_graphql_class_';
+
+    /**
+     * Reverse-index prefix mapping a per-object or per-class tag back to the
+     * `<payloadKey, metaKey>` pairs that depend on it. The invalidation
+     * listener iterates this index instead of INDEX_ALL when per-object
+     * tagging is engaged.
+     */
+    public const REVERSE_INDEX_PREFIX = 'taginx_';
+
+    public const KEY_FALLBACK_WATERMARK_TS = 'datahub_graphql_fallback_watermark_ts';
 
     public const PAYLOAD_KEY_PREFIX = 'persistent_output_payload_';
 
     public const META_KEY_PREFIX = 'persistent_output_meta_';
 
     public const ENQUEUE_DEDUPE_PREFIX = 'datahub_enqueue_req_';
+
+    /**
+     * Sibling to ENQUEUE_DEDUPE_PREFIX, keyed by the same sha256 hash. Set
+     * by the listener when an invalidation coalesces against an in-flight
+     * dispatch; cleared by the worker, which fires a trailing refresh when
+     * the flag was set during processing.
+     */
+    public const PENDING_REFRESH_PREFIX = 'datahub_pending_refresh_';
 
     public const INDEX_ALL = 'datahub_graphql_persistent_index_all';
 
@@ -64,14 +90,24 @@ class PersistentOutputCacheService
 
     private int $ttl; // seconds
 
-    private bool $guardOnly = true;
-
-    private array $guardOperations = [];
-
     private int $payloadTtl = 86400;
 
-    public function __construct(ContainerBagInterface $container)
-    {
+    private ?OperationClassifier $operationClassifier;
+
+    private LockFactoryResolver $lockFactoryResolver;
+
+    private ?DependencyCollector $dependencyCollector;
+
+    private readonly ?LoggerInterface $psrLogger;
+
+    public function __construct(
+        ContainerBagInterface $container,
+        ?OperationClassifier $operationClassifier = null,
+        ?LockFactoryResolver $lockFactoryResolver = null,
+        ?DependencyCollector $dependencyCollector = null,
+        #[Autowire(service: 'monolog.logger.pimcore')]
+        ?LoggerInterface $psrLogger = null,
+    ) {
         $cfg = $container->get('pimcore_data_hub');
 
         $graphql = $cfg['graphql'] ?? [];
@@ -81,11 +117,11 @@ class PersistentOutputCacheService
             $ttl = $graphql['output_cache_lifetime'] ?? 30;
         }
         $this->ttl = max(1, (int)$ttl);
-        $this->guardOnly = (bool)($graphql['persistent_output_cache_guard_only'] ?? true);
-        $this->guardOperations = array_values(array_filter((array)($graphql['in_progress_queries'] ?? []), static function ($v) {
-            return is_string($v) && $v !== '';
-        }));
         $this->payloadTtl = max(1, (int)($graphql['persistent_output_cache_payload_ttl'] ?? 86400));
+        $this->operationClassifier = $operationClassifier;
+        $this->lockFactoryResolver = $lockFactoryResolver ?? new LockFactoryResolver();
+        $this->dependencyCollector = $dependencyCollector;
+        $this->psrLogger = $psrLogger;
     }
 
     public function isEnabled(): bool
@@ -127,9 +163,9 @@ class PersistentOutputCacheService
         }
 
         $now = time();
-        $lastInvalidation = (int) ($this->cacheLoad(self::KEY_LAST_INVALIDATION) ?: 0);
+        $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
         $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
-        $isStale = $lastInvalidation > 0 && $refreshedAt > 0 && $refreshedAt < $lastInvalidation;
+        $isStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
         $response = new JsonResponse($payload);
         $responseService->addCorsHeaders($response);
 
@@ -141,6 +177,7 @@ class PersistentOutputCacheService
             $request->attributes->set('_datahub_persistent_refresh', true);
             $request->attributes->set('_datahub_persistent_meta_key', $metaKey);
             $request->attributes->set('_datahub_persistent_payload_key', $payloadKey);
+            $request->attributes->set('_datahub_persistent_refreshed_at', $refreshedAt);
 
             return $response;
         }
@@ -148,8 +185,68 @@ class PersistentOutputCacheService
         // FRESH HIT: extend TTL and return response immediately
         $response->headers->set('X-Pimcore-DataHub-Persistent-Cache', 'HIT');
         $meta['refreshedAt'] = $now;
-        $tags = $this->buildTags($request, $meta['operation'] ?? null);
-        $this->cacheSave($metaKey, $meta, $tags, $this->ttl);
+        $metaTags = $this->buildTags($request, $meta['operation'] ?? null);
+
+        // Meta TTL rolls forward on every HIT but payload TTL runs from the
+        // original write, so a hot query eventually loses its payload while
+        // its meta is still alive. Repaint at half-life amortizes the cost.
+        $rawSavedAt = $meta['payloadSavedAt'] ?? null;
+        $rawTtl = $meta['payloadTtl'] ?? null;
+        $payloadSavedAt = is_int($rawSavedAt) ? $rawSavedAt : 0;
+        $storedPayloadTtl = is_int($rawTtl) ? $rawTtl : 0;
+        if (($rawSavedAt !== null && $payloadSavedAt === 0)
+            || ($rawTtl !== null && $storedPayloadTtl === 0)
+        ) {
+            Logger::warning(sprintf(
+                'datahub.swr.hit_repaint_meta_malformed: op=%s payloadSavedAt=%s payloadTtl=%s',
+                $meta['operation'] ?? '?',
+                var_export($rawSavedAt, true),
+                var_export($rawTtl, true)
+            ));
+        }
+
+        // Mirror savePersistent's full tag set onto both saves when stored
+        // tags are present, so meta and payload remain tag-symmetric. Today
+        // per-object invalidation goes via the reverse-index -> dispatch by
+        // key (not via cache-item tags), so this is consistency hygiene; it
+        // would matter if anything ever called Cache::clearTag('obj_*')
+        // directly.
+        $storedTags = $meta['tags'] ?? null;
+        $storedTagsUsable = is_array($storedTags) && $storedTags !== [];
+        if (!$storedTagsUsable && $storedTags !== null) {
+            Logger::warning(sprintf(
+                'datahub.swr.hit_repaint_tags_malformed: op=%s tags=%s',
+                $meta['operation'] ?? '?',
+                var_export($storedTags, true)
+            ));
+        }
+        $effectiveTags = $storedTagsUsable ? $storedTags : $metaTags;
+
+        if ($payloadSavedAt > 0 && $storedPayloadTtl >= 2
+            && ($now - $payloadSavedAt) >= intdiv($storedPayloadTtl, 2)
+        ) {
+            try {
+                $this->cacheSave($payloadKey, $payload, $effectiveTags, $storedPayloadTtl);
+                $meta['payloadSavedAt'] = $now;
+            } catch (\Throwable $e) {
+                Logger::warning(sprintf(
+                    'datahub.swr.hit_repaint_failed: op=%s client=%s err=%s',
+                    $meta['operation'] ?? '?',
+                    $meta['client'] ?? '?',
+                    $e->getMessage()
+                ));
+            }
+        }
+
+        try {
+            $this->cacheSave($metaKey, $meta, $effectiveTags, $this->ttl);
+        } catch (\Throwable $e) {
+            Logger::warning(sprintf(
+                'datahub.swr.hit_meta_refresh_failed: op=%s err=%s',
+                $meta['operation'] ?? '?',
+                $e->getMessage()
+            ));
+        }
 
         return $response;
     }
@@ -199,41 +296,116 @@ class PersistentOutputCacheService
             return ['applies' => true, 'status' => 'MISS'];
         }
 
-        $lastInvalidation = (int) ($this->cacheLoad(self::KEY_LAST_INVALIDATION) ?: 0);
+        $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
         $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
-        $isStale = $lastInvalidation > 0 && $refreshedAt > 0 && $refreshedAt < $lastInvalidation;
+        $isStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
 
         return ['applies' => true, 'status' => $isStale ? 'STALE' : 'HIT'];
     }
 
     /** Manually set the last invalidation timestamp to now. */
-    public function markOutputInvalidated(?int $ts = null): void
+    public function bumpFallbackWatermark(?int $ts = null): void
     {
         // A caller passing 0 or a negative value almost certainly meant "now",
         // not "the epoch"; an epoch watermark would let `$refreshedAt > 0 &&
-        // $refreshedAt < $lastInvalidation` evaluate to false forever and freeze
+        // $refreshedAt < $fallbackWatermark` evaluate to false forever and freeze
         // every cached entry as FRESH.
         if ($ts === null || $ts <= 0) {
             $ts = time();
         }
-        $this->cacheSave(self::KEY_LAST_INVALIDATION, $ts, [self::TAG_WATERMARK], null);
+        $this->cacheSave(self::KEY_FALLBACK_WATERMARK_TS, $ts, [self::TAG_WATERMARK], null);
     }
 
     /**
      * Drop every persistent-cache entry for this bundle (payloads, meta,
      * indices, per-op/per-client tag indices), bypassing the SWR flow.
      *
-     * The `TAG_WATERMARK`-tagged `KEY_LAST_INVALIDATION` entry is preserved —
+     * The `TAG_WATERMARK`-tagged `KEY_FALLBACK_WATERMARK_TS` entry is preserved —
      * clearing it would make every freshly-written entry look FRESH again
      * until the next external invalidation, which defeats the whole point.
      *
-     * Use this when `markOutputInvalidated()` is not enough — e.g. when the
+     * Use this when `bumpFallbackWatermark()` is not enough — e.g. when the
      * SWR refresh path itself is broken or when errors-only payloads must be
      * evicted immediately.
      */
     public function clearAll(): bool
     {
         return $this->cacheClearTag(self::TAG_COMMON);
+    }
+
+    /**
+     * SWR_ONLY cold-miss lock space. Distinct from the herd-guard atomic-lock
+     * key (`datahub_inprogress:*`) and from the refresh lock
+     * (`datahub_persistent_refresh_lock_*`) — three separate Symfony Lock
+     * resources guarding three independent contention surfaces.
+     *
+     * Returns a lock object on win, null on lose-or-unavailable. Callers MUST
+     * treat null as "no lock held"; the cold-miss path falls back to either a
+     * bounded-wait poll on the winner's cache write or an inline resolver run
+     * after the wait deadline. Either way, the never-503-for-browsers
+     * invariant is preserved: this method never raises.
+     */
+    public function acquireColdMissLock(Request $request, int $lockTtlSeconds): ?object
+    {
+        $factory = $this->lockFactoryResolver->resolve();
+        if (!$factory) {
+            Logger::warning(
+                'DataHub SWR cold-miss: lock factory unavailable, falling back to inline resolver'
+            );
+
+            return null;
+        }
+
+        [$client, $canonical] = $this->clientAndCanonical($request);
+        $metaKey = $this->keyMeta($client, $canonical);
+        $payloadKey = $this->keyPayload($client, $canonical);
+        $resource = 'datahub_swr_cold_miss_' . md5($metaKey . '|' . $payloadKey);
+
+        try {
+            // autoRelease=true so the Lock destructor releases on graceful PHP
+            // shutdown even if the controller's release path doesn't fire.
+            $lock = $factory->createLock($resource, $lockTtlSeconds, true);
+            if ($lock->acquire(false)) {
+                $refreshInterval = max(1, (int) floor($lockTtlSeconds / 2));
+                LockSignalRefresher::arm($lock, $lockTtlSeconds, $refreshInterval);
+                $this->psrLogger?->info('swr.cold_miss.lock.acquired', [
+                    'resource' => $resource,
+                    'lock_ttl_seconds' => $lockTtlSeconds,
+                ]);
+
+                return $lock;
+            }
+        } catch (\Throwable $e) {
+            Logger::warning(
+                'DataHub SWR cold-miss: lock acquire failed: ' . $e->getMessage()
+            );
+        }
+
+        return null;
+    }
+
+    /**
+     * Release a previously acquired cold-miss lock. Swallows release exceptions
+     * with a WARNING log — a stuck renewer holding a lock past its intended
+     * scope is the specific risk this catch-and-log shape guards against.
+     */
+    public function releaseColdMissLock(?object $lock): void
+    {
+        if ($lock === null) {
+            return;
+        }
+
+        try {
+            if (method_exists($lock, 'release')) {
+                $lock->release();
+            }
+        } catch (\Throwable $e) {
+            Logger::warning(
+                'DataHub SWR cold-miss: lock release failed: ' . $e->getMessage()
+            );
+        } finally {
+            LockSignalRefresher::disarm();
+        }
     }
 
     /** Persist a fresh response for the given request. */
@@ -298,18 +470,152 @@ class PersistentOutputCacheService
         $input = json_decode($request->getContent(), true) ?: [];
         $operationName = (string)($input['operationName'] ?? '');
 
+        $baseTags = $this->buildTags($request, $operationName);
+        $collectorTags = $this->collectorTagsForOperation($operationName, $client);
+        $tags = array_values(array_unique([...$baseTags, ...$collectorTags]));
+
+        $payloadTtl = $this->payloadTtl;
+        if ($this->operationClassifier !== null && $operationName !== '') {
+            // Classifier-miss is reachable for legacy in_progress_queries operations folded into operations: at config-merge time.
+            $payloadTtl = $this->operationClassifier->getTtl($operationName) ?? $this->payloadTtl;
+        }
+
+        $now = time();
         $meta = [
-            'refreshedAt' => time(),
+            'refreshedAt' => $now,
             'client' => $client,
             'operation' => $operationName,
             // store canonical request body to allow later refresh scheduling
             'canonical' => $canonical,
+            'payloadSavedAt' => $now,
+            'payloadTtl' => $payloadTtl,
+            'tags' => $tags,
         ];
 
-        $tags = $this->buildTags($request, $operationName);
-        $this->cacheSave($payloadKey, $payload, $tags, $this->payloadTtl);
+        Logger::info(sprintf(
+            'datahub.swr.cache_save: op=%s client=%s granularity=%s collector_tags=%s',
+            $operationName !== '' ? $operationName : '?',
+            $client,
+            $this->granularityLabel($operationName),
+            self::summariseCollectorTags($collectorTags)
+        ));
+
+        $this->cacheSave($payloadKey, $payload, $tags, $payloadTtl);
         $this->cacheSave($metaKey, $meta, $tags, $this->ttl);
         $this->updateIndices($payloadKey, $client, $operationName);
+        $this->updateReverseIndices($collectorTags, $payloadKey, $metaKey);
+    }
+
+    /**
+     * Returns `none` for unregistered ops — diagnostically interesting
+     * because such ops produce zero collector tags.
+     */
+    private function granularityLabel(string $operationName): string
+    {
+        if ($this->operationClassifier === null || $operationName === '') {
+            return 'none';
+        }
+        $granularity = $this->operationClassifier->getGranularity($operationName);
+
+        return $granularity?->value ?? 'none';
+    }
+
+    /**
+     * Strips tag prefixes for readability and folds per-object tags into
+     * `Class×N` counts so listing-shaped queries don't dwarf the log line.
+     *
+     * @param list<string> $collectorTags
+     */
+    private static function summariseCollectorTags(array $collectorTags): string
+    {
+        if ($collectorTags === []) {
+            return '[]';
+        }
+        $classOnly = [];
+        $perClassCounts = [];
+        foreach ($collectorTags as $tag) {
+            if (str_starts_with($tag, DependencyCollector::TAG_CLASS_PREFIX)) {
+                $classOnly[] = self::stripModelPrefix(substr($tag, strlen(DependencyCollector::TAG_CLASS_PREFIX)));
+
+                continue;
+            }
+            if (str_starts_with($tag, DependencyCollector::TAG_OBJECT_PREFIX)) {
+                $suffix = substr($tag, strlen(DependencyCollector::TAG_OBJECT_PREFIX));
+                $lastUnderscore = strrpos($suffix, '_');
+                $class = $lastUnderscore === false ? $suffix : substr($suffix, 0, $lastUnderscore);
+                $cleanClass = self::stripModelPrefix($class);
+                $perClassCounts[$cleanClass] = ($perClassCounts[$cleanClass] ?? 0) + 1;
+            }
+        }
+        sort($classOnly);
+        ksort($perClassCounts);
+        $parts = $classOnly;
+        foreach ($perClassCounts as $class => $count) {
+            $parts[] = $class . '×' . $count;
+        }
+
+        return '[' . implode(', ', $parts) . ']';
+    }
+
+    private static function stripModelPrefix(string $sanitizedClass): string
+    {
+        foreach ([
+            'Pimcore_Model_DataObject_',
+            'Pimcore_Model_Asset_',
+            'Pimcore_Model_Document_',
+        ] as $prefix) {
+            if (str_starts_with($sanitizedClass, $prefix)) {
+                return substr($sanitizedClass, strlen($prefix));
+            }
+        }
+
+        return $sanitizedClass;
+    }
+
+    /**
+     * Resolve the per-object / per-class tag set for the current request from
+     * the DependencyCollector, gated on the operation's granularity. SINGLE
+     * with an empty collector raises an in-flight warning — the canonical
+     * detector for missing POST_LOAD coverage (raw-SQL hydrators bypass the
+     * subscriber and the collector stays empty).
+     *
+     * @return list<string>
+     */
+    private function collectorTagsForOperation(string $operationName, string $client): array
+    {
+        if ($this->dependencyCollector === null || $this->operationClassifier === null || $operationName === '') {
+            return [];
+        }
+        $granularity = $this->operationClassifier->getGranularity($operationName);
+        if ($granularity === null) {
+            return [];
+        }
+        if ($granularity === Granularity::SINGLE && !$this->dependencyCollector->hasRecordedAny()) {
+            $this->logCollectorEmptyOnSave($operationName, $client);
+        }
+
+        return $this->dependencyCollector->tagsForGranularity($granularity);
+    }
+
+    /**
+     * Loud in-flight detector for the missing-POST_LOAD-coverage failure
+     * mode: SINGLE-granularity operations should always record at least one
+     * element before writing to the persistent cache. Raw-SQL hydrators
+     * bypass the POST_LOAD subscriber and the collector stays empty,
+     * producing a write with no per-object tags — invalidation would then
+     * miss it entirely.
+     *
+     * Separated from the call site so tests can observe the trigger
+     * condition without booting the Pimcore kernel (the Logger facade
+     * no-ops when there is no container).
+     */
+    protected function logCollectorEmptyOnSave(string $operationName, string $client): void
+    {
+        Logger::warning(sprintf(
+            'datahub.swr.collector_empty_on_save operation=%s client=%s',
+            $operationName,
+            $client
+        ));
     }
 
     private function buildTags(Request $request, ?string $operationName): array
@@ -366,6 +672,53 @@ class PersistentOutputCacheService
         $this->cacheSave($indexKey, $list, [self::TAG_COMMON], null);
     }
 
+    /**
+     * @param list<string> $tags
+     */
+    private function updateReverseIndices(array $tags, string $payloadKey, string $metaKey): void
+    {
+        foreach ($tags as $tag) {
+            $this->addToReverseIndex($tag, $payloadKey, $metaKey);
+        }
+    }
+
+    private function addToReverseIndex(string $tag, string $payloadKey, string $metaKey): void
+    {
+        $indexKey = self::REVERSE_INDEX_PREFIX . $tag;
+        $list = $this->cacheLoad($indexKey);
+        if (!is_array($list)) {
+            $list = [];
+        }
+        $pair = [$payloadKey, $metaKey];
+        foreach ($list as $existing) {
+            if (is_array($existing) && ($existing[0] ?? null) === $payloadKey) {
+                return;
+            }
+        }
+        $list[] = $pair;
+        if (count($list) > self::MAX_INDEX_SIZE) {
+            $alive = [];
+            foreach ($list as $entry) {
+                if (!is_array($entry) || count($entry) < 2) {
+                    continue;
+                }
+                $v = $this->cacheLoad((string)$entry[0]);
+                if ($v !== false && $v !== null) {
+                    $alive[] = $entry;
+                }
+            }
+            $list = $alive;
+            if (count($list) > self::MAX_INDEX_SIZE) {
+                $list = array_slice($list, -self::MAX_INDEX_SIZE);
+                Logger::warning('persistent_cache: reverse-index truncated at max size', ['tag' => $tag, 'size' => self::MAX_INDEX_SIZE]);
+            }
+        }
+        // Reverse-index entries carry only TAG_COMMON — clearAll() drops them
+        // on cache flush. Per-object tag membership belongs in the index
+        // body, not in the index entry's tag set.
+        $this->cacheSave($indexKey, $list, [self::TAG_COMMON], null);
+    }
+
     private function shouldUseForRequest(Request $request): bool
     {
         if (!$this->enabled) {
@@ -377,18 +730,23 @@ class PersistentOutputCacheService
             return false;
         }
 
-        if ($this->guardOnly) {
-            $input = json_decode($request->getContent(), true) ?: [];
-            $operationName = $input['operationName'] ?? null;
-            if (!$operationName) {
-                return false;
-            }
-            if (!in_array($operationName, $this->guardOperations, true)) {
-                return false;
-            }
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = $input['operationName'] ?? null;
+        if (!$operationName || !is_string($operationName)) {
+            return false;
         }
 
-        return true;
+        if ($this->operationClassifier !== null
+            && $this->operationClassifier->hasOperation($operationName)) {
+            return true;
+        }
+
+        Logger::debug(sprintf(
+            'DataHub persistent cache: gate skipped — operation not in operations tree (operationName=%s)',
+            $operationName
+        ));
+
+        return false;
     }
 
     /**
@@ -421,12 +779,37 @@ class PersistentOutputCacheService
 
     private function keyPayload(string $clientname, string $canonical): string
     {
-        return self::PAYLOAD_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+        return self::keyPayloadFor($clientname, $canonical);
     }
 
     private function keyMeta(string $clientname, string $canonical): string
     {
+        return self::keyMetaFor($clientname, $canonical);
+    }
+
+    public static function keyPayloadFor(string $clientname, string $canonical): string
+    {
+        return self::PAYLOAD_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+    }
+
+    public static function keyMetaFor(string $clientname, string $canonical): string
+    {
         return self::META_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+    }
+
+    /**
+     * SWR-refresh-lock resource shape for the per-query-hash space, computed
+     * from the raw request inputs the message handler observes. Byte-equal to
+     * the listener's legacy `buildRefreshMarkerKey` shape when meta+payload
+     * sidecar attributes are present — that is the contract.
+     */
+    public static function computeSwrRefreshLockKey(string $client, string $bodyJson): string
+    {
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $metaKey = self::keyMetaFor($client, $canonical);
+        $payloadKey = self::keyPayloadFor($client, $canonical);
+
+        return 'datahub_persistent_refresh_lock_' . md5($metaKey . '|' . $payloadKey);
     }
 
     private function clientAndCanonical(Request $request): array
@@ -444,66 +827,35 @@ class PersistentOutputCacheService
             return $cached;
         }
 
-        $payload = json_decode($request->getContent(), true);
-        if (!is_array($payload)) {
-            $payload = [];
-        }
-
-        if (!empty($payload['query']) && is_string($payload['query'])) {
-            $payload['query'] = $this->normalizeQueryAst($payload['query']);
-        }
-
-        $payload = $this->ksortRecursive($payload);
-
-        $canonical = json_encode(
-            $payload,
-            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
-        );
-
-        if (!is_string($canonical)) {
-            $canonical = '{}';
-        }
+        $canonical = self::canonicalizePayloadString((string)$request->getContent());
 
         $request->attributes->set('_datahub_persistent_canonical', $canonical);
 
         return $canonical;
     }
 
-    private function normalizeQueryAst(string $query): string
+    /**
+     * Thin pass-through to {@see GraphQLRequestCanonicalizer::canonicalize}.
+     * Kept as a public static so external callers (functional-suite fixtures,
+     * the SWR-refresh-lock-key helper) keep working without re-grep.
+     */
+    public static function canonicalizePayloadString(string $body): string
     {
-        try {
-            /** @var DocumentNode $ast */
-            $ast = Parser::parse($query);
-
-            return Printer::doPrint($ast);
-        } catch (\Throwable $e) {
-            return trim($query);
-        }
+        return GraphQLRequestCanonicalizer::canonicalize($body);
     }
 
-    private function ksortRecursive(array $value): array
+    /**
+     * Enqueue-dedupe sentinel resource shape for the per-canonical-request
+     * space, computed from raw inputs. Byte-equal to the listener's legacy
+     * `buildEnqueueDedupeKey` shape when meta+payload sidecar attributes are
+     * present — that is the contract.
+     */
+    public static function computeEnqueueDedupeKey(string $client, string $bodyJson): string
     {
-        $isAssoc = static function (array $a): bool {
-            $i = 0;
-            foreach ($a as $k => $_) {
-                if ($k !== $i++) {
-                    return true;
-                }
-            }
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $metaKey = self::keyMetaFor($client, $canonical);
+        $payloadKey = self::keyPayloadFor($client, $canonical);
 
-            return false;
-        };
-
-        if ($isAssoc($value)) {
-            ksort($value);
-        }
-
-        foreach ($value as $k => $v) {
-            if (is_array($v)) {
-                $value[$k] = $this->ksortRecursive($v);
-            }
-        }
-
-        return $value;
+        return self::ENQUEUE_DEDUPE_PREFIX . md5($metaKey . '|' . $payloadKey);
     }
 }

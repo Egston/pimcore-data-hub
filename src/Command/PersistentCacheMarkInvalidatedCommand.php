@@ -23,7 +23,7 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'datahub:graphql:persistent-cache:mark-output-invalidated', description: 'Mark persistent GraphQL cache as stale by updating the last output invalidation timestamp')]
+#[AsCommand(name: 'datahub:graphql:persistent-cache:mark-output-invalidated', description: 'Mark persistent GraphQL cache as stale by bumping the fallback watermark')]
 class PersistentCacheMarkInvalidatedCommand extends Command
 {
     public function __construct(private PersistentOutputCacheService $persistent)
@@ -33,7 +33,7 @@ class PersistentCacheMarkInvalidatedCommand extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $this->persistent->markOutputInvalidated();
+        $this->persistent->bumpFallbackWatermark();
         $output->writeln('<info>Marked persistent GraphQL cache as stale (timestamp updated).</info>');
 
         return Command::SUCCESS;

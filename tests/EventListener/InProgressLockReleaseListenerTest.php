@@ -44,6 +44,14 @@ class InProgressLockReleaseListenerTest extends TestCase
         $this->assertArrayHasKey(KernelEvents::TERMINATE, $events);
     }
 
+    public function testGetSubscribedEventsReturnsPriorityMinus100ForTerminate(): void
+    {
+        $events = InProgressLockReleaseListener::getSubscribedEvents();
+        // Safety-net release must run after PersistentCacheRefreshOnTerminateListener (0).
+        $this->assertSame(['onKernelTerminate', -100], $events[KernelEvents::TERMINATE]);
+        $this->assertSame(['onKernelException', -100], $events[KernelEvents::EXCEPTION]);
+    }
+
     public function testNoOpWhenNoAttributes(): void
     {
         $request = Request::create('/api', 'POST');

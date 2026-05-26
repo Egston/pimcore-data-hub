@@ -37,18 +37,34 @@ use Symfony\Component\HttpFoundation\Request;
  */
 final class PersistentOutputCacheServiceBackendTest extends TestCase
 {
-    private function makeService(array $graphql = []): ArrayBackedPersistentOutputCacheService
+    private function makeClassifier(array $operations = []): OperationClassifier
+    {
+        $c = $this->createMock(ContainerBagInterface::class);
+        $c->method('get')->willReturn(['graphql' => ['operations' => $operations]]);
+
+        return new OperationClassifier($c);
+    }
+
+    private function makeService(array $graphql = [], ?OperationClassifier $classifier = null): ArrayBackedPersistentOutputCacheService
     {
         $defaults = [
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 10,
             'persistent_output_cache_payload_ttl' => 60,
-            'persistent_output_cache_guard_only' => false,
         ];
         $c = $this->createMock(ContainerBagInterface::class);
         $c->method('get')->willReturn(['graphql' => $graphql + $defaults]);
 
-        return new ArrayBackedPersistentOutputCacheService($c);
+        if ($classifier === null) {
+            $classifier = $this->makeClassifier([
+                'TestOp' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+                'Op' => ['tier' => 'swr_only', 'granularity' => 'single'],
+                'OpA' => ['tier' => 'swr_only', 'granularity' => 'single'],
+                'OpB' => ['tier' => 'swr_only', 'granularity' => 'single'],
+            ]);
+        }
+
+        return new ArrayBackedPersistentOutputCacheService($c, $classifier);
     }
 
     private function makeRequest(string $client, string $op, array $variables = []): Request
@@ -131,12 +147,12 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
      * Reading back returned MISS immediately, so `$isStale` was always false
      * and STALE→refresh transitions never fired.
      */
-    public function testMarkOutputInvalidatedWatermarkSurvivesSubsequentLoad(): void
+    public function testBumpFallbackWatermarkSurvivesSubsequentLoad(): void
     {
         $svc = $this->makeService();
-        $svc->markOutputInvalidated(1700000000);
+        $svc->bumpFallbackWatermark(1700000000);
 
-        $item = $svc->pool->getItem(PersistentOutputCacheService::KEY_LAST_INVALIDATION);
+        $item = $svc->pool->getItem(PersistentOutputCacheService::KEY_FALLBACK_WATERMARK_TS);
         $this->assertTrue($item->isHit(), 'Watermark must persist beyond the save call');
         $this->assertSame(1700000000, $item->get());
     }
@@ -186,7 +202,7 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
 
         // 3. invalidate → STALE
         sleep(1);
-        $svc->markOutputInvalidated();
+        $svc->bumpFallbackWatermark();
         $this->assertSame('STALE', $svc->probeStatus($req)['status']);
 
         $req = $this->makeRequest('c1', 'Op');
@@ -269,15 +285,15 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
     }
 
     /**
-     * R3.7 — markOutputInvalidated($ts) with a non-positive $ts clamps to
+     * R3.7 — bumpFallbackWatermark($ts) with a non-positive $ts clamps to
      * time() instead of writing an epoch watermark that would make every
      * cached entry look FRESH until the next mutation event.
      */
-    public function testMarkOutputInvalidatedClampsNonPositiveTimestamp(): void
+    public function testBumpFallbackWatermarkClampsNonPositiveTimestamp(): void
     {
         $svc = $this->makeService();
-        $svc->markOutputInvalidated(0);
-        $wm = $svc->pool->getItem(PersistentOutputCacheService::KEY_LAST_INVALIDATION)->get();
+        $svc->bumpFallbackWatermark(0);
+        $wm = $svc->pool->getItem(PersistentOutputCacheService::KEY_FALLBACK_WATERMARK_TS)->get();
         $this->assertIsInt($wm);
         $this->assertGreaterThan(0, $wm);
         $this->assertGreaterThanOrEqual(time() - 5, $wm);
@@ -285,7 +301,7 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
 
     /**
      * clearAll() evicts every payload, meta, and index entry tagged with
-     * TAG_COMMON but leaves the watermark entry (KEY_LAST_INVALIDATION,
+     * TAG_COMMON but leaves the watermark entry (KEY_FALLBACK_WATERMARK_TS,
      * tagged with TAG_WATERMARK) intact — clearing the watermark would
      * make every freshly-written entry look FRESH again until the next
      * external invalidation event.
@@ -297,13 +313,13 @@ final class PersistentOutputCacheServiceBackendTest extends TestCase
 
         // Seed: one cached payload + a watermark.
         $svc->savePersistent($req, new JsonResponse(['data' => ['ok' => true]]));
-        $svc->markOutputInvalidated(123456789);
+        $svc->bumpFallbackWatermark(123456789);
         $this->assertSame('HIT', $svc->probeStatus($req)['status'], 'precondition: entry is cached');
 
         $this->assertTrue($svc->clearAll(), 'clearAll must return true on success');
 
         $this->assertSame('MISS', $svc->probeStatus($req)['status'], 'payload should be evicted after clearAll');
-        $watermarkItem = $svc->pool->getItem(PersistentOutputCacheService::KEY_LAST_INVALIDATION);
+        $watermarkItem = $svc->pool->getItem(PersistentOutputCacheService::KEY_FALLBACK_WATERMARK_TS);
         $this->assertTrue($watermarkItem->isHit(), 'watermark must survive clearAll');
         $this->assertSame(123456789, $watermarkItem->get(), 'watermark value must be unchanged');
     }
@@ -320,9 +336,9 @@ final class ArrayBackedPersistentOutputCacheService extends PersistentOutputCach
 {
     public TagAwareAdapterInterface $pool;
 
-    public function __construct(ContainerBagInterface $c)
+    public function __construct(ContainerBagInterface $c, ?OperationClassifier $classifier = null)
     {
-        parent::__construct($c);
+        parent::__construct($c, $classifier);
         $this->pool = new TagAwareAdapter(new ArrayAdapter(storeSerialized: true));
     }
 
