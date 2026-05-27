@@ -482,7 +482,8 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         OperationClassifier $classifier,
         LockFactory $lockFactory,
         WebserviceController $controller,
-        PersistentOutputCacheService $persistentCache
+        PersistentOutputCacheService $persistentCache,
+        ?\Symfony\Component\Messenger\MessageBusInterface $bus = null
     ): PersistentRefreshMessageHandler {
         $resolver = new class($lockFactory) extends LockFactoryResolver {
             public function __construct(private LockFactory $factory)
@@ -514,7 +515,7 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
             $responseService,
             $container,
             null,
-            null,
+            $bus,
             $persistentCache
         );
     }
@@ -567,12 +568,155 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         $controller->method('webonyxAction')
             ->willThrowException(new \RuntimeException('controller failure'));
 
+        // Stale + past cooldown so the trailing pop fires; controller then fails.
         $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 1, 'invalidatedAt' => 100]);
+        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(true);
+        $persistentCache->method('isPastCooldown')->willReturn(true);
         $persistentCache->expects(self::never())->method('clearOperationCooldown');
 
         $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
 
         $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpFail"}', 'OpFail', time(), null, time() + 21600);
         $handler($msg);
+    }
+
+    public function testTrailingPopCancelsWhenEntryNoLongerStale(): void
+    {
+        $classifier = $this->makeCooldownClassifier('OpCancel', 21600);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpCancel"}';
+        $hash = PersistentOutputCacheService::entryHashFromBody('c1', $body);
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 200, 'invalidatedAt' => 100]);
+        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(false);
+        $persistentCache->expects(self::once())->method('clearOperationCooldown')->with($hash);
+
+        $bus = $this->createMock(\Symfony\Component\Messenger\MessageBusInterface::class);
+        $bus->expects(self::never())->method('dispatch');
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache, $bus);
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpCancel', time(), null, time() + 21600);
+        $handler($msg);
+    }
+
+    public function testTrailingPopRearmsWhenStaleButWithinCooldown(): void
+    {
+        $classifier = $this->makeCooldownClassifier('OpRearm', 21600);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpRearm"}';
+        $lastRefreshAt = time() - 100;
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn([
+            'refreshedAt' => 1,
+            'invalidatedAt' => 100,
+            'lastRefreshAt' => $lastRefreshAt,
+        ]);
+        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(true);
+        $persistentCache->method('isPastCooldown')->willReturn(false);
+        $persistentCache->expects(self::never())->method('clearOperationCooldown');
+
+        $dispatched = [];
+        $bus = $this->createMock(\Symfony\Component\Messenger\MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new \Symfony\Component\Messenger\Envelope($msg);
+        });
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache, $bus);
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpRearm', time(), null, time() + 21600);
+        $handler($msg);
+
+        self::assertCount(1, $dispatched, 're-arm dispatches exactly one trailing refresh');
+        self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
+        self::assertSame($lastRefreshAt + 21600, $dispatched[0]->deliverAt, 're-arm must date at current lastRefreshAt + cooldown');
+    }
+
+    public function testTrailingPopFiresWhenStaleAndPastCooldown(): void
+    {
+        $classifier = $this->makeCooldownClassifier('OpFire', 21600);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        $body = '{"operationName":"OpFire"}';
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 1, 'invalidatedAt' => 100]);
+        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(true);
+        $persistentCache->method('isPastCooldown')->willReturn(true);
+        $persistentCache->expects(self::once())->method('clearOperationCooldown');
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpFire', time(), null, time() + 21600);
+        $handler($msg);
+    }
+
+    public function testWorkerThreadsRefreshStartTimestampOntoSyntheticRequest(): void
+    {
+        $classifier = $this->makeClassifier(['OpStart' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = new class extends WebserviceController {
+            /** @var mixed */
+            public $captured = 'unset';
+
+            public function __construct()
+            {
+            }
+
+            public function webonyxAction(
+                \Pimcore\Bundle\DataHubBundle\GraphQL\Service $service,
+                \Pimcore\Localization\LocaleServiceInterface $localeService,
+                \Pimcore\Model\Factory $modelFactory,
+                \Symfony\Component\HttpFoundation\Request $request,
+                \Pimcore\Helper\LongRunningHelper $longRunningHelper,
+                \Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface $responseService
+            ) {
+                $this->captured = $request->attributes->get('_datahub_persistent_refresh_started_at');
+
+                return new \Symfony\Component\HttpFoundation\JsonResponse(['data' => ['x' => 1]]);
+            }
+        };
+
+        $handler = $this->makeHandler($classifier, $lockFactory, $controller, ['persistent_refresh_lock_ttl' => 60]);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpStart"}', 'OpStart');
+        $handler($msg);
+
+        self::assertIsInt($controller->captured, 'synthetic request must carry the refresh-start timestamp as an int');
+        self::assertGreaterThan(0, $controller->captured);
+        self::assertEqualsWithDelta(time(), $controller->captured, 2, 'refresh-start timestamp must be close to now');
+    }
+
+    private function makeCooldownClassifier(string $operationName, int $cooldownTtl): OperationClassifier
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => ['operations' => [
+                $operationName => [
+                    'tier' => Tier::SWR_ONLY->value,
+                    'granularity' => Granularity::LIST->value,
+                    'invalidation_cooldown_ttl' => $cooldownTtl,
+                ],
+            ]],
+        ]);
+
+        return new OperationClassifier($container);
     }
 }

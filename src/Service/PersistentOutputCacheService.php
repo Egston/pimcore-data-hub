@@ -192,9 +192,12 @@ class PersistentOutputCacheService
             return $response;
         }
 
-        // FRESH HIT: extend TTL and return response immediately
+        // FRESH HIT: roll the meta TTL forward and return immediately.
+        // `refreshedAt` records the start of a refresh event, not a TTL marker;
+        // advancing it here to completion-`now` would let an edit landing
+        // between a refresh's start and its completion read as not-yet-stale.
+        // The meta re-save below is itself the TTL extension.
         $response->headers->set('X-Pimcore-DataHub-Persistent-Cache', 'HIT');
-        $meta['refreshedAt'] = $now;
         $metaTags = $this->buildTags($request, $meta['operation'] ?? null);
 
         // Meta TTL rolls forward on every HIT but payload TTL runs from the
@@ -314,12 +317,10 @@ class PersistentOutputCacheService
 
     private function isEntryStale(array $meta, int $fallbackWatermark): bool
     {
-        $refreshedAt   = (int)($meta['refreshedAt'] ?? 0);
-        $invalidatedAt = (int)($meta['invalidatedAt'] ?? 0);
+        $refreshedAt    = (int)($meta['refreshedAt'] ?? 0);
         $watermarkStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
-        $entryStale     = $invalidatedAt > 0 && $invalidatedAt > $refreshedAt;
 
-        return $watermarkStale || $entryStale;
+        return $watermarkStale || $this->isEntryStaleByTimestamps($meta);
     }
 
     /**
@@ -330,21 +331,86 @@ class PersistentOutputCacheService
      */
     public function stampInvalidatedAt(string $metaKey, array $meta, int $ts): void
     {
+        $this->stampMetaField($metaKey, $meta, 'invalidatedAt', $ts, 'datahub.swr.stamp_invalidated_at_failed');
+    }
+
+    /**
+     * Writes `lastRefreshAt` into the meta blob via the same fail-soft pattern as
+     * {@see stampInvalidatedAt}. Not currently on any production path — `lastRefreshAt`
+     * is written inline in {@see savePersistent}; this helper is available for future
+     * callers that need to advance the completion clock independently.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function stampLastRefreshAt(string $metaKey, array $meta, int $ts): void
+    {
+        $this->stampMetaField($metaKey, $meta, 'lastRefreshAt', $ts, 'datahub.swr.stamp_last_refresh_at_failed');
+    }
+
+    /**
+     * @param array<string, mixed> $meta
+     */
+    private function stampMetaField(string $metaKey, array $meta, string $field, int $ts, string $errSlug): void
+    {
         try {
-            $meta['invalidatedAt'] = $ts;
+            $meta[$field] = $ts;
             $storedTags = $meta['tags'] ?? null;
             $storedTagsUsable = is_array($storedTags) && $storedTags !== [];
             $tags = $storedTagsUsable ? $storedTags : [self::TAG_COMMON];
             $this->cacheSave($metaKey, $meta, $tags, $this->ttl);
         } catch (\Throwable $e) {
             Logger::warning(sprintf(
-                'datahub.swr.stamp_invalidated_at_failed: key=%s op=%s client=%s err=%s',
+                '%s: key=%s op=%s client=%s err=%s',
+                $errSlug,
                 $metaKey,
                 $meta['operation'] ?? '?',
                 $meta['client'] ?? '?',
                 $e->getMessage()
             ));
         }
+    }
+
+    /**
+     * True when the cooldown window measured from the last completed refresh has
+     * elapsed. An entry never refreshed (`lastRefreshAt` absent) reads as 0 and
+     * is past any positive cooldown — correct, it owes a leading-edge refresh.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function isPastCooldown(array $meta, int $cooldown, ?int $now = null): bool
+    {
+        return ($now ?? time()) - (int)($meta['lastRefreshAt'] ?? 0) >= $cooldown;
+    }
+
+    /**
+     * Re-load the entry meta blob for a (client, body) pair at the point of use.
+     * The worker reads `lastRefreshAt` / `invalidatedAt` from here at pop time so
+     * the self-cancel / re-arm decision converges against current state rather
+     * than a value carried stale on the message.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function loadEntryMeta(string $client, string $bodyJson): ?array
+    {
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $meta = $this->cacheLoad(self::keyMetaFor($client, $canonical));
+
+        return is_array($meta) ? $meta : null;
+    }
+
+    /**
+     * Per-entry staleness predicate: an invalidation recorded after the last
+     * refresh-start means the cached payload predates the edit. Public so the
+     * worker can evaluate the trailing-pop self-cancel decision.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function isEntryStaleByTimestamps(array $meta): bool
+    {
+        $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
+        $invalidatedAt = (int)($meta['invalidatedAt'] ?? 0);
+
+        return $invalidatedAt > 0 && $invalidatedAt > $refreshedAt;
     }
 
     /** Manually set the last invalidation timestamp to now. */
@@ -551,8 +617,16 @@ class PersistentOutputCacheService
         }
 
         $now = time();
+        // `refreshedAt` anchors to the refresh START (the worker stamps the
+        // request attribute before running the resolver) so an edit landing
+        // between start and this completion-write leaves the entry stale on the
+        // next read. A direct first response has no start attribute, so it
+        // anchors to `now` — which is ≈ completion and correct for a first write.
+        $refreshStartedAt = $request->attributes->get('_datahub_persistent_refresh_started_at');
+        $refreshedAt = is_int($refreshStartedAt) && $refreshStartedAt > 0 ? $refreshStartedAt : $now;
         $meta = [
-            'refreshedAt' => $now,
+            'refreshedAt' => $refreshedAt,
+            'lastRefreshAt' => $now,
             'client' => $client,
             'operation' => $operationName,
             // store canonical request body to allow later refresh scheduling

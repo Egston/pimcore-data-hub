@@ -283,32 +283,76 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     ? $this->classifier->getInvalidationCooldown($operation)
                     : null;
                 if ($cooldown !== null) {
-                    if ($this->persistentCache->hasOperationCooldown($hash)) {
-                        // A dated refresh is already queued for this entry's
-                        // window. Counts as handled (coalesced) so the outer
-                        // fallback does not bump the global watermark.
+                    $now = time();
+                    $lastRefreshAt = (int)($meta['lastRefreshAt'] ?? 0);
+                    $priorityWeight = $this->classifier?->getPriorityWeight($operation);
+
+                    // Leading edge: the cooldown window has fully elapsed (or the
+                    // entry was never refreshed). Warm immediately and arm the
+                    // sentinel as the dispatch-dedup mechanism for the new window.
+                    if ($lastRefreshAt === 0 || $lastRefreshAt <= $now - $cooldown) {
+                        $this->persistentCache->armOperationCooldown($hash, $cooldown);
+                        $this->bus->dispatch(new PersistentRefreshMessage(
+                            client: $client,
+                            bodyJson: $canonical,
+                            operationName: $operation,
+                            refreshedAt: $now,
+                            priorityWeight: $priorityWeight,
+                        ));
+                        $this->bus->dispatch(new PersistentRefreshMessage(
+                            client: $client,
+                            bodyJson: $canonical,
+                            operationName: $operation,
+                            refreshedAt: $now,
+                            priorityWeight: $priorityWeight,
+                            deliverAt: $now + $cooldown,
+                        ));
                         Logger::info(sprintf(
-                            'persistent_cache_invalidation: cooldown active for op=%s; dated refresh already queued',
+                            'persistent_cache_invalidation: leading-edge refresh dispatched for op=%s',
+                            $operation
+                        ));
+                        $result['dispatched'][] = [
+                            'op' => $operation,
+                            'vars' => self::extractVariables($canonical),
+                        ];
+
+                        continue;
+                    }
+
+                    // Within cooldown: a trailing refresh is already scheduled
+                    // for this window. Re-arm the pending flag so a late edit is
+                    // not lost, then coalesce.
+                    if ($this->persistentCache->hasOperationCooldown($hash)) {
+                        $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
+                        $this->cacheSave(
+                            1,
+                            $pendingKey,
+                            [PersistentOutputCacheService::TAG_COMMON],
+                            max($enqueueTtl * 10, 600)
+                        );
+                        Logger::info(sprintf(
+                            'persistent_cache_invalidation: cooldown active for op=%s; trailing refresh already queued',
                             $operation
                         ));
                         ++$result['coalesced'];
 
                         continue;
                     }
+
+                    // Within cooldown, no trailing scheduled yet: coalesce to a
+                    // single window-end-dated trailing refresh.
                     $this->persistentCache->armOperationCooldown($hash, $cooldown);
-                    $priorityWeight = $this->classifier?->getPriorityWeight($operation);
                     $this->bus->dispatch(new PersistentRefreshMessage(
                         client: $client,
                         bodyJson: $canonical,
                         operationName: $operation,
-                        refreshedAt: time(),
+                        refreshedAt: $now,
                         priorityWeight: $priorityWeight,
-                        deliverAt: time() + $cooldown,
+                        deliverAt: $lastRefreshAt + $cooldown,
                     ));
                     Logger::info(sprintf(
-                        'persistent_cache_invalidation: cooldown refresh scheduled for op=%s in %ds',
-                        $operation,
-                        $cooldown
+                        'persistent_cache_invalidation: trailing refresh scheduled for op=%s at window end',
+                        $operation
                     ));
                     $result['dispatched'][] = [
                         'op' => $operation,

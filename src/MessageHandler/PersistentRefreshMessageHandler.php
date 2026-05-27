@@ -100,6 +100,10 @@ final class PersistentRefreshMessageHandler
             return;
         }
 
+        if ($message->deliverAt !== null && !$this->shouldFireTrailing($message, $operationName)) {
+            return;
+        }
+
         $factory = $this->lockResolver->resolve();
         if ($factory === null) {
             Logger::warning(
@@ -158,6 +162,9 @@ final class PersistentRefreshMessageHandler
             $request->attributes->set('clientname', $message->client);
             $request->attributes->set('_datahub_persistent_refresh', true);
             $request->attributes->set('_datahub_bypass_in_progress_guard', true);
+            // savePersistent anchors `refreshedAt` to this START so an edit
+            // landing mid-refresh leaves the entry stale on the next read.
+            $request->attributes->set('_datahub_persistent_refresh_started_at', (int)$startedAt);
 
             try {
                 $this->controller->webonyxAction(
@@ -276,6 +283,106 @@ final class PersistentRefreshMessageHandler
                 $e->getMessage()
             ));
         }
+    }
+
+    /**
+     * Trailing-pop self-cancel / re-arm decision for a dated (deliverAt) message.
+     * Re-reads the entry meta at pop time — never carries a stale value on the
+     * message — so the re-arm loop converges:
+     *
+     * - ¬stale            → cancel: clear pending flag + cooldown sentinel, drop.
+     * - stale ∧ pastCooldown   → fire: caller runs the normal refresh.
+     * - stale ∧ ¬pastCooldown  → re-arm: re-dispatch a trailing dated refresh at
+     *   `lastRefreshAt + cooldown`, leave the pending flag set, drop this pop.
+     *
+     * Returns true only on the fire path. Fail-soft: if the service is absent or
+     * meta can't be loaded, fall through to fire so a refresh is never lost.
+     */
+    private function shouldFireTrailing(PersistentRefreshMessage $message, string $operationName): bool
+    {
+        if ($this->persistentCache === null) {
+            return true;
+        }
+
+        try {
+            $meta = $this->persistentCache->loadEntryMeta($message->client, $message->bodyJson);
+            if ($meta === null) {
+                return true;
+            }
+
+            $stale = $this->persistentCache->isEntryStaleByTimestamps($meta);
+            $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
+
+            if (!$stale) {
+                $this->cancelTrailing($hash);
+                Logger::info(sprintf(
+                    'datahub.refresh_handler: trailing refresh cancelled for op=%s (entry no longer stale)',
+                    $operationName
+                ));
+
+                return false;
+            }
+
+            $cooldown = $this->classifier->getInvalidationCooldown($operationName) ?? 0;
+            if ($cooldown > 0 && !$this->persistentCache->isPastCooldown($meta, $cooldown)) {
+                $this->rearmTrailing($message, $meta, $cooldown, $operationName);
+
+                return false;
+            }
+        } catch (\Throwable $e) {
+            $this->logWarning(sprintf(
+                'datahub.refresh_handler: trailing-pop evaluation failed for %s: %s',
+                $operationName,
+                $e->getMessage()
+            ));
+
+            return true;
+        }
+
+        return true;
+    }
+
+    /**
+     * Cancel arm: clear the pending flag and the cooldown sentinel so the next
+     * edit dispatches a fresh leading-edge refresh. The raw pending-flag removal
+     * is isolated in its own catch so a cache fault there cannot flip the
+     * cancel decision back into a fire.
+     */
+    private function cancelTrailing(string $hash): void
+    {
+        try {
+            \Pimcore\Cache::remove(PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash);
+        } catch (\Throwable $e) {
+            $this->logWarning('datahub.refresh_handler: pending-flag clear failed on cancel: ' . $e->getMessage());
+        }
+        $this->persistentCache?->clearOperationCooldown($hash);
+    }
+
+    /**
+     * Re-arm: schedule the next trailing refresh at the current
+     * `lastRefreshAt + cooldown` and leave the pending flag set.
+     *
+     * @param array<string, mixed> $meta
+     */
+    private function rearmTrailing(PersistentRefreshMessage $message, array $meta, int $cooldown, string $operationName): void
+    {
+        if ($this->bus === null) {
+            return;
+        }
+
+        $lastRefreshAt = (int)($meta['lastRefreshAt'] ?? 0);
+        $this->bus->dispatch(new PersistentRefreshMessage(
+            client: $message->client,
+            bodyJson: $message->bodyJson,
+            operationName: $message->operationName,
+            refreshedAt: time(),
+            priorityWeight: $message->priorityWeight,
+            deliverAt: $lastRefreshAt + $cooldown,
+        ));
+        Logger::info(sprintf(
+            'datahub.refresh_handler: trailing refresh re-armed for op=%s at window end',
+            $operationName
+        ));
     }
 
     /**

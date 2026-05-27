@@ -556,8 +556,11 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $listener->mark(new DataObjectEvent($object));
     }
 
-    public function testCooldownOpSchedulesDatedRefreshAndArmsSentinel(): void
+    public function testCooldownOpLeadingEdgeDispatchesImmediatelyAndArmsSentinel(): void
     {
+        // No lastRefreshAt in meta → the entry was never refreshed → leading
+        // edge: warm immediately (null deliverAt) and arm the sentinel as the
+        // new window's dispatch-dedup.
         $object = $this->makeDataObject(21);
         $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
         $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_21';
@@ -574,6 +577,83 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 'client' => $client,
                 'canonical' => $canonical,
                 'operation' => 'CooldownOp',
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $before = time();
+        $listener->mark(new DataObjectEvent($object));
+        $after = time();
+
+        self::assertCount(2, $dispatched, 'leading-edge dispatches exactly two messages: immediate warm + window-end trailing');
+        foreach ($dispatched as $msg) {
+            self::assertInstanceOf(PersistentRefreshMessage::class, $msg);
+        }
+
+        $immediates = array_values(array_filter($dispatched, fn ($m) => $m->deliverAt === null));
+        $trailings = array_values(array_filter($dispatched, fn ($m) => $m->deliverAt !== null));
+
+        self::assertCount(1, $immediates, 'exactly one immediate (null deliverAt) message');
+        self::assertCount(1, $trailings, 'exactly one window-end dated trailing message');
+
+        $trailing = $trailings[0];
+        self::assertGreaterThanOrEqual($before + 21600, $trailing->deliverAt, 'trailing deliverAt must be at least now+cooldown at dispatch time');
+        self::assertLessThanOrEqual($after + 21600, $trailing->deliverAt, 'trailing deliverAt must be at most now+cooldown at dispatch time');
+    }
+
+    public function testCooldownOpWithinWindowSchedulesDatedTrailingRefresh(): void
+    {
+        // lastRefreshAt is recent (inside the cooldown window) and no trailing
+        // is yet scheduled → coalesce to a single window-end-dated trailing
+        // refresh at lastRefreshAt + cooldown.
+        $object = $this->makeDataObject(25);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_25';
+
+        $client = 'c1';
+        $canonical = '{"q":"within"}';
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+        $lastRefreshAt = time() - 100;
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_wn', 'persistent_output_meta_wn'],
+            ],
+            'persistent_output_meta_wn' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+                'lastRefreshAt' => $lastRefreshAt,
             ],
         ];
 
@@ -609,16 +689,12 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $classifier
         );
 
-        $before = time();
         $listener->mark(new DataObjectEvent($object));
-        $after = time();
 
-        self::assertCount(1, $dispatched, 'cooldown op schedules exactly one dated refresh');
+        self::assertCount(1, $dispatched, 'within-window invalidation schedules exactly one dated refresh');
         $msg = $dispatched[0];
         self::assertInstanceOf(PersistentRefreshMessage::class, $msg);
-        self::assertNotNull($msg->deliverAt, 'scheduled refresh must carry a deliverAt');
-        self::assertGreaterThanOrEqual($before + 21600, $msg->deliverAt);
-        self::assertLessThanOrEqual($after + 21600, $msg->deliverAt);
+        self::assertSame($lastRefreshAt + 21600, $msg->deliverAt, 'trailing must be dated at lastRefreshAt + cooldown');
 
         self::assertArrayNotHasKey(
             PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash,
@@ -644,6 +720,9 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 'client' => $client,
                 'canonical' => $canonical,
                 'operation' => 'CooldownOp',
+                // Recent refresh → within cooldown window, so the live sentinel
+                // is the "trailing already scheduled" guard.
+                'lastRefreshAt' => time() - 100,
             ],
         ];
 
@@ -749,6 +828,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 'client' => 'c1',
                 'canonical' => '{"q":"handled"}',
                 'operation' => 'CooldownOp',
+                // within cooldown window
+                'lastRefreshAt' => time() - 100,
             ],
         ];
 
@@ -813,7 +894,6 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $before = time();
 
         $cache = $this->createMock(PersistentOutputCacheService::class);
-        $cache->method('hasOperationCooldown')->with($hash)->willReturn(false);
         $cache->expects(self::once())->method('armOperationCooldown');
         $cache->expects(self::never())->method('bumpFallbackWatermark');
         $cache->expects(self::once())->method('stampInvalidatedAt')
@@ -844,7 +924,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
 
         $listener->mark(new DataObjectEvent($object));
 
-        self::assertCount(1, $dispatched);
+        self::assertCount(2, $dispatched);
     }
 
     public function testCooldownCoalescePathAlsoStampsInvalidatedAt(): void
@@ -865,6 +945,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 'client' => $client,
                 'canonical' => $canonical,
                 'operation' => 'CooldownOp',
+                // within cooldown window
+                'lastRefreshAt' => time() - 100,
             ],
         ];
 
@@ -904,5 +986,240 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         );
 
         $listener->mark(new DataObjectEvent($object));
+    }
+
+    public function testCooldownOpLeadingEdgeAlsoEnqueuesWindowEndDatedTrailing(): void
+    {
+        $object = $this->makeDataObject(41);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_41';
+
+        $client = 'c1';
+        $canonical = '{"q":"leading_trailing"}';
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_lt', 'persistent_output_meta_lt'],
+            ],
+            'persistent_output_meta_lt' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $before = time();
+        $listener->mark(new DataObjectEvent($object));
+        $after = time();
+
+        self::assertCount(2, $dispatched, 'leading-edge (never-refreshed) dispatches immediate warm + window-end trailing');
+
+        $immediates = array_values(array_filter($dispatched, fn ($m) => $m->deliverAt === null));
+        $trailings = array_values(array_filter($dispatched, fn ($m) => $m->deliverAt !== null));
+
+        self::assertCount(1, $immediates, 'exactly one immediate message');
+        self::assertCount(1, $trailings, 'exactly one dated trailing message');
+
+        $trailing = $trailings[0];
+        self::assertGreaterThanOrEqual($before + 21600, $trailing->deliverAt, 'trailing deliverAt must be now+cooldown, not lastRefreshAt+cooldown');
+        self::assertLessThanOrEqual($after + 21600, $trailing->deliverAt, 'trailing deliverAt must be within now+cooldown tolerance');
+
+        foreach ($dispatched as $msg) {
+            self::assertSame($client, $msg->client);
+            self::assertSame($canonical, $msg->bodyJson);
+            self::assertSame('CooldownOp', $msg->operationName);
+        }
+    }
+
+    public function testLeadingEdgeOrphanTimelineIsClosedByWindowEndTrailing(): void
+    {
+        // Two sequential marks through the same listener instance against the
+        // same hash. The first mark hits the "within window, no trailing yet"
+        // branch (lastRefreshAt recent, sentinel absent) — arms the sentinel
+        // and schedules the window-end trailing. The second mark arrives while
+        // the sentinel armed by the first is still live — must coalesce and
+        // write the pending flag rather than scheduling a second trailing.
+        // The causal connection: the second mark's coalesce is only possible
+        // because the first mark called armOperationCooldown.
+        $object = $this->makeDataObject(42);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_42';
+
+        $client = 'c1';
+        $canonical = '{"q":"orphan_close"}';
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+        $lastRefreshAt = time() - 100;
+        $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_oc', 'persistent_output_meta_oc'],
+            ],
+            'persistent_output_meta_oc' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+                'lastRefreshAt' => $lastRefreshAt,
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        // Stateful arm: armOperationCooldown records the hash; hasOperationCooldown
+        // returns true only after it has been armed by this same listener instance.
+        $armed = [];
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->method('armOperationCooldown')
+            ->willReturnCallback(function (string $h) use (&$armed): void {
+                $armed[$h] = true;
+            });
+        $cache->method('hasOperationCooldown')
+            ->willReturnCallback(function (string $h) use (&$armed): bool {
+                return $armed[$h] ?? false;
+            });
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        // First mark: within window, no sentinel yet → arm + schedule trailing.
+        $firstNow = time();
+        $listener->mark(new DataObjectEvent($object));
+
+        $trailings = array_values(array_filter($dispatched, fn ($m) => $m->deliverAt !== null));
+        self::assertCount(1, $trailings, 'first mark schedules exactly one window-end trailing');
+        self::assertSame($lastRefreshAt + 21600, $trailings[0]->deliverAt, 'trailing deliverAt is lastRefreshAt + cooldown');
+        self::assertArrayNotHasKey($pendingKey, $store, 'pending flag must not be written on the first (scheduling) mark');
+
+        // Second mark: sentinel now live (armed by first mark) → coalesce and write pending flag.
+        $listener->mark(new DataObjectEvent($object));
+
+        self::assertCount(1, $dispatched, 'second mark must not dispatch any new message');
+        self::assertArrayHasKey($pendingKey, $store, 'coalesce path must write the pending flag so the worker fires a trailing refresh');
+    }
+
+    public function testCooldownOpPastWindowFiresLeadingEdge(): void
+    {
+        $object = $this->makeDataObject(44);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_44';
+
+        $client = 'c1';
+        $canonical = '{"q":"past_window"}';
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+        $lastRefreshAt = time() - 2 * 21600;
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_pw', 'persistent_output_meta_pw'],
+            ],
+            'persistent_output_meta_pw' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+                'lastRefreshAt' => $lastRefreshAt,
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $before = time();
+        $listener->mark(new DataObjectEvent($object));
+        $after = time();
+
+        self::assertCount(2, $dispatched, 'elapsed-window leading-edge dispatches immediate warm + window-end trailing');
+
+        $immediates = array_values(array_filter($dispatched, fn ($m) => $m->deliverAt === null));
+        $trailings = array_values(array_filter($dispatched, fn ($m) => $m->deliverAt !== null));
+
+        self::assertCount(1, $immediates, 'exactly one immediate message');
+        self::assertCount(1, $trailings, 'exactly one dated trailing message');
+
+        $trailing = $trailings[0];
+        self::assertGreaterThanOrEqual($before + 21600, $trailing->deliverAt, 'elapsed-window trailing must use now+cooldown, not the stale lastRefreshAt+cooldown');
+        self::assertLessThanOrEqual($after + 21600, $trailing->deliverAt, 'trailing deliverAt must be within now+cooldown tolerance');
     }
 }
