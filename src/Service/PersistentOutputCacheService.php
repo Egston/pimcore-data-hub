@@ -175,7 +175,7 @@ class PersistentOutputCacheService
         $now = time();
         $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
         $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
-        $isStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
+        $isStale = $this->isEntryStale($meta, $fallbackWatermark);
         $response = new JsonResponse($payload);
         $responseService->addCorsHeaders($response);
 
@@ -307,10 +307,44 @@ class PersistentOutputCacheService
         }
 
         $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
-        $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
-        $isStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
+        $isStale = $this->isEntryStale($meta, $fallbackWatermark);
 
         return ['applies' => true, 'status' => $isStale ? 'STALE' : 'HIT'];
+    }
+
+    private function isEntryStale(array $meta, int $fallbackWatermark): bool
+    {
+        $refreshedAt   = (int)($meta['refreshedAt'] ?? 0);
+        $invalidatedAt = (int)($meta['invalidatedAt'] ?? 0);
+        $watermarkStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
+        $entryStale     = $invalidatedAt > 0 && $invalidatedAt > $refreshedAt;
+
+        return $watermarkStale || $entryStale;
+    }
+
+    /**
+     * Swallows all failures with a warning — a missed stamp falls back to watermark-only
+     * staleness, never a crash.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function stampInvalidatedAt(string $metaKey, array $meta, int $ts): void
+    {
+        try {
+            $meta['invalidatedAt'] = $ts;
+            $storedTags = $meta['tags'] ?? null;
+            $storedTagsUsable = is_array($storedTags) && $storedTags !== [];
+            $tags = $storedTagsUsable ? $storedTags : [self::TAG_COMMON];
+            $this->cacheSave($metaKey, $meta, $tags, $this->ttl);
+        } catch (\Throwable $e) {
+            Logger::warning(sprintf(
+                'datahub.swr.stamp_invalidated_at_failed: key=%s op=%s client=%s err=%s',
+                $metaKey,
+                $meta['operation'] ?? '?',
+                $meta['client'] ?? '?',
+                $e->getMessage()
+            ));
+        }
     }
 
     /** Manually set the last invalidation timestamp to now. */

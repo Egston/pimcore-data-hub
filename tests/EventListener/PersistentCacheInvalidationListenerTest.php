@@ -780,4 +780,129 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
 
         $listener->mark(new DataObjectEvent($object));
     }
+
+    public function testCooldownImmediateDispatchPathStampsInvalidatedAt(): void
+    {
+        $object = $this->makeDataObject(31);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_31';
+
+        $client = 'c1';
+        $canonical = '{"q":"stamp_immediate"}';
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_si', 'persistent_output_meta_si'],
+            ],
+            'persistent_output_meta_si' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new \Symfony\Component\Messenger\Envelope($msg);
+        });
+
+        $before = time();
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->method('hasOperationCooldown')->with($hash)->willReturn(false);
+        $cache->expects(self::once())->method('armOperationCooldown');
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::once())->method('stampInvalidatedAt')
+            ->with(
+                'persistent_output_meta_si',
+                self::callback(fn ($m) => is_array($m) && ($m['operation'] ?? null) === 'CooldownOp'),
+                self::callback(fn ($ts) => $ts >= $before)
+            );
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $listener->mark(new DataObjectEvent($object));
+
+        self::assertCount(1, $dispatched);
+    }
+
+    public function testCooldownCoalescePathAlsoStampsInvalidatedAt(): void
+    {
+        $object = $this->makeDataObject(32);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_32';
+
+        $client = 'c1';
+        $canonical = '{"q":"stamp_coalesce"}';
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_sc', 'persistent_output_meta_sc'],
+            ],
+            'persistent_output_meta_sc' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+            ],
+        ];
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::never())->method('dispatch');
+
+        $before = time();
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->method('hasOperationCooldown')->with($hash)->willReturn(true);
+        $cache->expects(self::never())->method('armOperationCooldown');
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::once())->method('stampInvalidatedAt')
+            ->with(
+                'persistent_output_meta_sc',
+                self::callback(fn ($m) => is_array($m) && ($m['operation'] ?? null) === 'CooldownOp'),
+                self::callback(fn ($ts) => $ts >= $before)
+            );
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => 21600,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $listener->mark(new DataObjectEvent($object));
+    }
 }
