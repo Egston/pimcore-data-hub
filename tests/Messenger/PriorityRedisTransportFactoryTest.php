@@ -91,4 +91,71 @@ final class PriorityRedisTransportFactoryTest extends TestCase
         $this->expectExceptionMessageMatches('/bogus_strategy/');
         $factory->createTransport('datahub-priority-redis://redis-master:6379/0', [], $this->createMock(SerializerInterface::class));
     }
+
+    public function testFactoryRejectsOffsetBelowWarmBandSpanUnderWeightBands(): void
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'persistent_refresh_priority_strategy' => 'oldest_refreshed_at_first_with_weight_bands',
+                'persistent_refresh_priority_weight_band_seconds' => 60,
+                'persistent_refresh_priority_max_weight' => 100,
+                'persistent_refresh_priority_read_trigger_offset_seconds' => 5999,
+                'persistent_refresh_priority_visibility_timeout' => 600,
+                'persistent_refresh_priority_requeue_score_bump' => 5,
+            ],
+        ]);
+        $factory = new PriorityRedisTransportFactory($container);
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/read_trigger_offset_seconds/');
+        $factory->createTransport('datahub-priority-redis://redis-master:6379/0', [], $this->createMock(SerializerInterface::class));
+    }
+
+    public function testFactoryAcceptsOffsetDominatingWarmBandSpan(): void
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'persistent_refresh_priority_strategy' => 'oldest_refreshed_at_first_with_weight_bands',
+                'persistent_refresh_priority_weight_band_seconds' => 60,
+                'persistent_refresh_priority_max_weight' => 100,
+                'persistent_refresh_priority_read_trigger_offset_seconds' => 6001,
+                'persistent_refresh_priority_visibility_timeout' => 600,
+                'persistent_refresh_priority_requeue_score_bump' => 5,
+            ],
+        ]);
+        $factory = new PriorityRedisTransportFactory($container);
+
+        try {
+            $factory->createTransport('datahub-priority-redis://redis-master:6379/0', [], $this->createMock(SerializerInterface::class));
+        } catch (\InvalidArgumentException $e) {
+            $this->fail('Guard must not fire when offset dominates the warm band span: ' . $e->getMessage());
+        } catch (\Throwable) {
+        }
+        $this->addToAssertionCount(1);
+    }
+
+    public function testFactoryGuardDoesNotApplyUnderPlainOldestFirstStrategy(): void
+    {
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn([
+            'graphql' => [
+                'persistent_refresh_priority_strategy' => 'oldest_refreshed_at_first',
+                'persistent_refresh_priority_weight_band_seconds' => 60,
+                'persistent_refresh_priority_max_weight' => 100,
+                'persistent_refresh_priority_read_trigger_offset_seconds' => 1,
+                'persistent_refresh_priority_visibility_timeout' => 600,
+                'persistent_refresh_priority_requeue_score_bump' => 5,
+            ],
+        ]);
+        $factory = new PriorityRedisTransportFactory($container);
+
+        try {
+            $factory->createTransport('datahub-priority-redis://redis-master:6379/0', [], $this->createMock(SerializerInterface::class));
+        } catch (\InvalidArgumentException $e) {
+            $this->fail('Guard must not fire under oldest_refreshed_at_first strategy: ' . $e->getMessage());
+        } catch (\Throwable) {
+        }
+        $this->addToAssertionCount(1);
+    }
 }

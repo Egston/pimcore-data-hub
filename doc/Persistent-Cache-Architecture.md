@@ -660,7 +660,13 @@ Per-operation overrides (in `operations:` config block):
 
 - `ttl_override` — freshness TTL for this op
 - `enqueue_dedup_ttl_override` — sentinel TTL for this op
-- `priority_weight` — score offset for `oldest_refreshed_at_first_with_weight_bands`
+- `priority_weight` — warm-class weight: score offset applied per unit for
+  invalidation-triggered (speculative) refreshes under the weighted-bands strategy
+- `read_priority_weight` — read-class weight: score offset applied per unit for
+  demand-driven (read-triggered) refreshes under the weighted-bands strategy;
+  defaults to 1 when absent. Reads always sort below warms because the read
+  trigger adds a large fixed offset to the score; `read_priority_weight` only
+  orders reads among themselves.
 - `invalidation_cooldown_ttl` — when set, the invalidation path throttles
   refreshes of this op to once per window via a dated refresh message + the
   `datahub_graphql_op_cooldown_<hash>` sentinel (null = immediate per-edit
@@ -689,7 +695,8 @@ knobs, with bundle defaults:
 | `persistent_refresh_queue_enabled` | false | Use Messenger queue vs inline kernel.terminate |
 | `persistent_enqueue_dedupe_ttl` | 60 | Dispatch dedupe sentinel TTL |
 | `persistent_refresh_priority_strategy` | `oldest_refreshed_at_first` | Queue ordering |
-| `persistent_refresh_priority_weight_band_seconds` | 60 | Band width for weighted strategy |
+| `persistent_refresh_priority_weight_band_seconds` | 60 | Band width applied per unit of warm or read weight under the weighted-bands strategy |
+| `persistent_refresh_priority_max_weight` | 100 | Maximum assignable warm/read weight; bounds the worst-case warm-band span for offset-dominance validation |
 | `persistent_refresh_priority_visibility_timeout` | 600 | Stuck-message reaper threshold |
 | `persistent_refresh_priority_requeue_score_bump` | 5 | Score penalty on re-send |
 | `swr_cold_miss_lock_wait_ms` | 5000 | Cold-miss loser wait |

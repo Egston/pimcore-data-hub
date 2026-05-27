@@ -131,7 +131,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
                 Logger::warning('datahub.refresh_dispatch: band-offset strategy active but OperationClassifier has zero loaded operations — verify bundle config');
             }
             $refreshedAt = null;
-            $priorityWeight = $op !== null ? $this->classifier->getPriorityWeight($op) : null;
+            $priorityWeight = $op !== null ? $this->classifier->getReadPriorityWeight($op) : null;
             if ($strategy === 'oldest_refreshed_at_first' || $strategy === 'oldest_refreshed_at_first_with_weight_bands') {
                 $attr = $request->attributes->get('_datahub_persistent_refreshed_at');
                 $refreshedAt = is_int($attr) && $attr > 0 ? $attr : time();

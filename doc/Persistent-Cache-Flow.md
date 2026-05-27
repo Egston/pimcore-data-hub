@@ -117,8 +117,10 @@ during an in-flight refresh:
 ### `persistent_output_meta_<hash>`
 
 - **What it stores:** a small associative array with `refreshedAt`,
-  the client name, operation name, canonical request body,
-  `payloadSavedAt`, `payloadTtl`, and the tag list.
+  `invalidatedAt` (stamped by the invalidation listener so the per-entry
+  freshness predicate can detect invalidations without relying solely on
+  the global watermark), the client name, operation name, canonical request
+  body, `payloadSavedAt`, `payloadTtl`, and the tag list.
 - **Set by:** `savePersistent` alongside the payload, and re-saved on
   every FRESH HIT (rolls `refreshedAt` forward).
 - **TTL:** controlled by the `ttl` knob (typically shorter than the
@@ -130,10 +132,10 @@ during an in-flight refresh:
 
 - **What it stores:** the literal value `1` — its presence is the
   signal, the value carries no meaning.
-- **Set by:**
-  - the invalidation listener when it dispatches a refresh message;
-  - the read-path terminate listener when it dispatches a refresh
-    after serving a STALE response.
+- **Set by:** the invalidation listener when it dispatches a refresh message.
+  The read path no longer writes this sentinel at dispatch time — transient
+  read duplicates are absorbed by the execution-time freshness guard and the
+  per-entry refresh lock in the worker.
 - **TTL:** `persistent_enqueue_dedupe_ttl`, currently **300 seconds**
   in production config. Per-operation overrides via
   `enqueue_dedup_ttl_override`. **Not renewed in flight** — the value
@@ -298,12 +300,11 @@ gets silently dropped, even when the primary path can't help.
 
 A single bump cascades through the entire cache: every cached query
 becomes STALE on its next read. Every reader then triggers a
-read-path refresh dispatch (one per distinct query). If a popular
-query is accessed by many concurrent clients in the brief window
-after a watermark bump, the dispatch path absorbs the burst via the
-sentinel — only one dispatch lands, the rest see "sentinel present"
-and skip — but the dispatch volume can still be substantial under
-high traffic.
+read-path refresh dispatch (one per distinct query). Transient
+duplicate dispatches for the same query are absorbed by the
+execution-time freshness guard (the worker skips a refresh if the
+entry is already fresh) and the per-entry refresh lock in the worker,
+but the dispatch volume can still be substantial under high traffic.
 
 This is why the primary path is preferred: a per-query dispatch
 only schedules N refreshes (where N = queries that actually depend on
@@ -482,9 +483,20 @@ Messenger Doctrine transport. The ZSET score determines pop order:
 
 - `oldest_refreshed_at_first` (default): score = the entry's
   `refreshedAt` timestamp, so the longest-stale messages pop first.
-- `oldest_refreshed_at_first_with_weight_bands`: same baseline minus
-  `priority_weight × band_seconds`, so higher-weight operations drop
-  into an earlier band.
+- `oldest_refreshed_at_first_with_weight_bands`: two priority classes share
+  **one** band-width knob (`persistent_refresh_priority_weight_band_seconds`).
+  Warm messages (invalidation-triggered) use `priority_weight`; read messages
+  (demand-triggered) use `read_priority_weight`. The score for both classes is
+  the same formula: `refreshedAt − weight × band_seconds`. The read class is
+  separated from the warm class by a large fixed offset
+  (`persistent_refresh_priority_read_trigger_offset_seconds`, default 86400s)
+  **subtracted** from every read message's effective score (ZSET pops
+  lowest-score-first), ensuring every demand-driven read sorts strictly below
+  every speculative warm of the same `refreshedAt`. Within each class,
+  higher-weight operations drop into an earlier band.
+  Constraint: the offset must exceed `persistent_refresh_priority_max_weight ×
+  persistent_refresh_priority_weight_band_seconds`; the factory validates this
+  at startup under the weighted-bands strategy.
 
 A single worker pod runs `messenger:consume` against this transport
 (`replicas: 1` in the worker chart). Worker parallelism is therefore

@@ -105,6 +105,21 @@ class PriorityRedisTransportFactory implements TransportFactoryInterface
         }
         $weightBandSeconds = max(0, (int)($graphql['persistent_refresh_priority_weight_band_seconds'] ?? 60));
         $readTriggerOffsetSeconds = max(0, (int)($graphql['persistent_refresh_priority_read_trigger_offset_seconds'] ?? 86400));
+        $maxWeight = max(1, (int)($graphql['persistent_refresh_priority_max_weight'] ?? 100));
+
+        if ($priorityStrategy === 'oldest_refreshed_at_first_with_weight_bands'
+            && $readTriggerOffsetSeconds <= $maxWeight * $weightBandSeconds
+        ) {
+            throw new \InvalidArgumentException(sprintf(
+                'datahub.priority_transport: persistent_refresh_priority_read_trigger_offset_seconds (%d) must exceed'
+                . ' persistent_refresh_priority_max_weight × persistent_refresh_priority_weight_band_seconds (%d × %d = %d)'
+                . ' so the read class sorts strictly below the warm class under the weighted-bands strategy',
+                $readTriggerOffsetSeconds,
+                $maxWeight,
+                $weightBandSeconds,
+                $maxWeight * $weightBandSeconds
+            ));
+        }
 
         if (!class_exists(\Redis::class)) {
             throw new \RuntimeException('datahub.priority_transport: phpredis extension not installed');

@@ -170,6 +170,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
                     'tier' => 'swr_only',
                     'granularity' => 'list',
                     'priority_weight' => 5,
+                    'read_priority_weight' => 7,
                 ],
             ],
         ];
@@ -196,7 +197,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
         $listener->onKernelTerminate($this->makeTerminateEvent($req));
 
         self::assertCount(1, $dispatched);
-        self::assertSame(5, $dispatched[0]->priorityWeight);
+        self::assertSame(7, $dispatched[0]->priorityWeight);
         self::assertSame(1700001234, $dispatched[0]->refreshedAt);
     }
 
@@ -245,6 +246,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
                     'tier' => 'swr_only',
                     'granularity' => 'list',
                     'priority_weight' => 5,
+                    'read_priority_weight' => 7,
                 ],
             ],
         ];
@@ -271,7 +273,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
         $listener->onKernelTerminate($this->makeTerminateEvent($req));
 
         self::assertCount(1, $dispatched);
-        self::assertSame(5, $dispatched[0]->priorityWeight);
+        self::assertSame(7, $dispatched[0]->priorityWeight);
         self::assertNull($dispatched[0]->refreshedAt);
     }
 
@@ -286,6 +288,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
                     'tier' => 'swr_only',
                     'granularity' => 'list',
                     'priority_weight' => 5,
+                    'read_priority_weight' => 7,
                 ],
             ],
         ];
@@ -312,8 +315,50 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
         $listener->onKernelTerminate($this->makeTerminateEvent($req));
 
         self::assertCount(1, $dispatched);
-        self::assertSame(5, $dispatched[0]->priorityWeight);
+        self::assertSame(7, $dispatched[0]->priorityWeight);
         self::assertSame(1700001234, $dispatched[0]->refreshedAt);
+    }
+
+    public function testReadDispatchCarriesReadWeightNotWarmWeightWhenTheyDiffer(): void
+    {
+        $graphql = [
+            'persistent_refresh_queue_enabled' => true,
+            'persistent_refresh_priority_strategy' => 'oldest_refreshed_at_first_with_weight_bands',
+            'persistent_enqueue_dedupe_ttl' => 60,
+            'operations' => [
+                'OpDivergent' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'priority_weight' => 10,
+                    'read_priority_weight' => 3,
+                ],
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $controller = $this->createMock(WebserviceController::class);
+        $listener = $this->makeListener($graphql, $controller, $bus);
+
+        $req = Request::create('/datahub/graphql', 'POST', [], [], [], [], json_encode([
+            'query' => '{ __typename }',
+            'operationName' => 'OpDivergent',
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $req->attributes->set('clientname', 'c1');
+        $req->attributes->set('_datahub_persistent_refresh', true);
+        $req->attributes->set('_datahub_persistent_refreshed_at', 1700001234);
+
+        $listener->onKernelTerminate($this->makeTerminateEvent($req));
+
+        self::assertCount(1, $dispatched);
+        self::assertSame(3, $dispatched[0]->priorityWeight, 'read dispatch must carry read_priority_weight, not priority_weight (warm)');
+        self::assertNotSame(10, $dispatched[0]->priorityWeight, 'warm priority_weight must not leak into the read dispatch path');
     }
 
     public function testDispatchWithBandStrategyAndEmptyClassifierStillDispatches(): void

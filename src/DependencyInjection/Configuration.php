@@ -114,7 +114,8 @@ class Configuration implements ConfigurationInterface
                                     ->end()
                                     ->integerNode('ttl_override')->min(1)->defaultNull()->end()
                                     ->integerNode('enqueue_dedup_ttl_override')->min(1)->defaultNull()->end()
-                                    ->integerNode('priority_weight')->defaultValue(1)->end()
+                                    ->integerNode('priority_weight')->info('warm-class weight: score offset applied per unit when the weighted-bands strategy is active; higher values pop earlier among same-aged warm messages')->defaultValue(1)->end()
+                                    ->integerNode('read_priority_weight')->info('read-class weight: score offset applied per unit for demand-driven (read-triggered) refreshes under the weighted-bands strategy; higher values pop earlier among same-aged read messages')->defaultValue(1)->end()
                                     ->integerNode('invalidation_cooldown_ttl')->info('seconds to throttle invalidation-triggered refreshes of this operation: the first edit in a window schedules one dated refresh and arms a per-entry cooldown sentinel; further edits within the window are suppressed. null disables throttling (immediate per-edit refresh)')->min(1)->defaultNull()->end()
                                 ->end()
                             ->end()
@@ -127,7 +128,7 @@ class Configuration implements ConfigurationInterface
                         ->integerNode('persistent_refresh_operation_lock_ttl')->info('TTL (seconds) for per-operation lock in the worker when herd guard uses operation-name; set slightly above p99 refresh time')->defaultValue(120)->end()
                         ->integerNode('persistent_enqueue_dedupe_ttl')->info('TTL (seconds) for enqueue dedupe marker to avoid flooding the queue with identical refresh jobs')->defaultValue(60)->end()
                         ->enumNode('persistent_refresh_priority_strategy')
-                            ->info('refresh queue ordering strategy. `oldest_refreshed_at_first` threads the per-entry refreshedAt into the message and the priority transport pops the longest-stale first; `oldest_refreshed_at_first_with_weight_bands` subtracts `priority_weight * persistent_refresh_priority_weight_band_seconds` from the score so higher-weight operations pop earlier among same-aged peers; `disabled` threads no score (insertion-time-ordered, FIFO-equivalent)')
+                            ->info('refresh queue ordering strategy. `oldest_refreshed_at_first` threads the per-entry refreshedAt into the message and the priority transport pops the longest-stale first; `oldest_refreshed_at_first_with_weight_bands` subtracts `priority_weight * persistent_refresh_priority_weight_band_seconds` from the score so higher-weight operations pop earlier among same-aged peers (read-triggered messages use `read_priority_weight` for their band); `disabled` threads no score (insertion-time-ordered, FIFO-equivalent)')
                             ->values(['oldest_refreshed_at_first', 'oldest_refreshed_at_first_with_weight_bands', 'disabled'])
                             ->defaultValue('oldest_refreshed_at_first')
                         ->end()
@@ -136,8 +137,13 @@ class Configuration implements ConfigurationInterface
                             ->min(0)
                             ->defaultValue(60)
                         ->end()
+                        ->integerNode('persistent_refresh_priority_max_weight')
+                            ->info('maximum value an operator may assign to priority_weight or read_priority_weight; bounds the worst-case warm-band span used to validate that the read-trigger-offset dominates all warms regardless of per-op weight assignment')
+                            ->min(1)
+                            ->defaultValue(100)
+                        ->end()
                         ->integerNode('persistent_refresh_priority_read_trigger_offset_seconds')
-                            ->info('seconds subtracted from a read-triggered refresh score so demand-driven reads sort strictly below speculative warms of the same refreshedAt. Hard-guarantee constraint: this MUST exceed `max-expected priority_weight × persistent_refresh_priority_weight_band_seconds` (the warm weight-band span), otherwise the highest-weight warm could still outrank a read. The default (86400) dwarfs any realistic warm band while staying far below time(), so scores never go negative.')
+                            ->info('seconds subtracted from a read-triggered refresh score so demand-driven reads sort strictly below speculative warms of the same refreshedAt. Hard-guarantee constraint: this MUST exceed `persistent_refresh_priority_max_weight × persistent_refresh_priority_weight_band_seconds` (the warm weight-band span); the factory validates this at startup. The default (86400) dwarfs any realistic warm band while staying far below time(), so scores never go negative.')
                             ->min(0)
                             ->defaultValue(86400)
                         ->end()
@@ -242,6 +248,7 @@ class Configuration implements ConfigurationInterface
                 'ttl_override' => null,
                 'enqueue_dedup_ttl_override' => null,
                 'priority_weight' => 1,
+                'read_priority_weight' => 1,
                 'invalidation_cooldown_ttl' => null,
             ];
         }

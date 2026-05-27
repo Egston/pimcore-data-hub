@@ -460,8 +460,6 @@ final class PersistentCacheRefreshOnTerminateListenerTest extends TestCase
 
     public function testIsGuardedByHerdReturnsTrueForClassifierHerdGuardedOp(): void
     {
-        // Pins the B4 parked-defect resolution: isGuardedByHerd must use the
-        // already-injected classifier instead of re-reading in_progress_queries.
         $graphql = [
             'persistent_refresh_queue_enabled' => false,
             'persistent_refresh_lock_enabled' => true,
