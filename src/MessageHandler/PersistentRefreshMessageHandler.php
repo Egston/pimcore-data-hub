@@ -219,7 +219,7 @@ final class PersistentRefreshMessageHandler
     private function reconcileCoalesceFlags(PersistentRefreshMessage $message, string $operationName): void
     {
         try {
-            $hash = hash('sha256', 'client:' . $message->client . "\n" . $message->bodyJson);
+            $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
             $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash;
             $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
 
@@ -267,7 +267,7 @@ final class PersistentRefreshMessageHandler
         }
 
         try {
-            $hash = hash('sha256', 'client:' . $message->client . "\n" . $message->bodyJson);
+            $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
             $this->persistentCache->clearOperationCooldown($hash);
         } catch (\Throwable $e) {
             $this->logWarning(sprintf(

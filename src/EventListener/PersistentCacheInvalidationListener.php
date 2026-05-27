@@ -275,7 +275,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     continue;
                 }
 
-                $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+                $hash = PersistentOutputCacheService::entryHash($client, $canonical);
 
                 $cooldown = $operation !== '' && $this->classifier !== null
                     ? $this->classifier->getInvalidationCooldown($operation)

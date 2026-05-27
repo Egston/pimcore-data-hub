@@ -527,8 +527,10 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         $controller = $this->createMock(WebserviceController::class);
         $controller->expects(self::once())->method('webonyxAction');
 
-        $body = '{"operationName":"OpCooldown"}';
-        $expectedHash = hash('sha256', 'client:c1' . "\n" . $body);
+        // Key-order differs from canonical form so entryHashFromBody's
+        // canonicalisation step is load-bearing in this assertion.
+        $body = '{"variables":{"z":3,"a":1},"operationName":"OpCooldown"}';
+        $expectedHash = PersistentOutputCacheService::entryHashFromBody('c1', $body);
 
         $persistentCache = $this->createMock(PersistentOutputCacheService::class);
         $persistentCache->expects(self::once())->method('clearOperationCooldown')->with($expectedHash);

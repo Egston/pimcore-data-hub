@@ -70,20 +70,20 @@ class PersistentOutputCacheService
     public const ENQUEUE_DEDUPE_PREFIX = 'datahub_enqueue_req_';
 
     /**
-     * Sibling to ENQUEUE_DEDUPE_PREFIX, keyed by the same sha256 hash. Set
-     * by the listener when an invalidation coalesces against an in-flight
-     * dispatch; cleared by the worker, which fires a trailing refresh when
-     * the flag was set during processing.
+     * Sibling to ENQUEUE_DEDUPE_PREFIX, keyed by entryHash(). Set by the
+     * listener when an invalidation coalesces against an in-flight dispatch;
+     * cleared by the worker, which fires a trailing refresh when the flag was
+     * set during processing.
      */
     public const PENDING_REFRESH_PREFIX = 'datahub_pending_refresh_';
 
     /**
      * Per-entry trailing-edge cooldown sentinel for invalidation throttling,
-     * keyed by the same sha256(client+canonical) hash as ENQUEUE_DEDUPE_PREFIX.
-     * Armed by the invalidation listener when it schedules a dated refresh for a
-     * cooldown-configured operation; cleared by the worker after that refresh
-     * lands. While present, further invalidations of the same entry are
-     * suppressed (a dated refresh is already queued for the window).
+     * keyed by entryHash(). Armed by the invalidation listener when it
+     * schedules a dated refresh for a cooldown-configured operation; cleared
+     * by the worker after that refresh lands. While present, further
+     * invalidations of the same entry are suppressed (a dated refresh is
+     * already queued for the window).
      */
     public const KEY_OP_COOLDOWN_PREFIX = 'datahub_graphql_op_cooldown_';
 
@@ -349,8 +349,7 @@ class PersistentOutputCacheService
      * an SWR-layer clearAll() preserves it — otherwise a clear would orphan the
      * already-queued dated refresh and let the next edit double-dispatch.
      *
-     * @param string $hash sha256('client:'.$client."\n".$canonical) — the same
-     *                      per-entry hash used for the ENQUEUE_DEDUPE_PREFIX sentinel
+     * @param string $hash return value of entryHash() or entryHashFromBody()
      * @param int    $ttl  cooldown window in seconds (the dated message's deliverAt offset)
      */
     public function armOperationCooldown(string $hash, int $ttl): void
@@ -840,6 +839,31 @@ class PersistentOutputCacheService
     }
 
     /**
+     * Canonical per-entry identity: bare sha256 digest (no prefix).
+     *
+     * @param string $client    client name from the request
+     * @param string $canonical already-canonical request body
+     */
+    public static function entryHash(string $client, string $canonical): string
+    {
+        return hash('sha256', 'client:' . $client . "\n" . $canonical);
+    }
+
+    /**
+     * Canonicalization-tolerant variant of entryHash(). Use this when the
+     * body may not yet be canonical (e.g. raw handler payload before AST
+     * normalisation); the result is always identical to calling entryHash()
+     * on the already-canonical form.
+     *
+     * @param string $client   client name from the request
+     * @param string $bodyJson raw or canonical request body
+     */
+    public static function entryHashFromBody(string $client, string $bodyJson): string
+    {
+        return self::entryHash($client, self::canonicalizePayloadString($bodyJson));
+    }
+
+    /**
      * SWR-refresh-lock resource shape for the per-query-hash space, computed
      * from the raw request inputs the message handler observes. Byte-equal to
      * the listener's legacy `buildRefreshMarkerKey` shape when meta+payload
@@ -888,16 +912,12 @@ class PersistentOutputCacheService
 
     /**
      * Enqueue-dedupe sentinel resource shape for the per-canonical-request
-     * space, computed from raw inputs. Byte-equal to the listener's legacy
-     * `buildEnqueueDedupeKey` shape when meta+payload sidecar attributes are
-     * present — that is the contract.
+     * space, computed from raw inputs. Canonicalizes before hashing so both
+     * the invalidation-listener path (canonical body) and the terminate-path
+     * (raw body) resolve to the same key.
      */
     public static function computeEnqueueDedupeKey(string $client, string $bodyJson): string
     {
-        $canonical = self::canonicalizePayloadString($bodyJson);
-        $metaKey = self::keyMetaFor($client, $canonical);
-        $payloadKey = self::keyPayloadFor($client, $canonical);
-
-        return self::ENQUEUE_DEDUPE_PREFIX . md5($metaKey . '|' . $payloadKey);
+        return self::ENQUEUE_DEDUPE_PREFIX . self::entryHashFromBody($client, $bodyJson);
     }
 }

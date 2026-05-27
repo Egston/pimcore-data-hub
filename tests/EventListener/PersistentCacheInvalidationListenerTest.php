@@ -208,7 +208,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
 
         $client = 'c1';
         $canonical = '{"q":"pending"}';
-        $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
         $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash;
         $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
 
@@ -258,7 +258,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $client = 'c1';
         $canonical = '{"q":"dup"}';
         $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX
-            . hash('sha256', 'client:' . $client . "\n" . $canonical);
+            . PersistentOutputCacheService::entryHash($client, $canonical);
 
         $store = [
             PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
@@ -564,7 +564,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
 
         $client = 'c1';
         $canonical = '{"q":"cooldown"}';
-        $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
 
         $store = [
             PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
@@ -634,7 +634,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
 
         $client = 'c1';
         $canonical = '{"q":"cooldown2"}';
-        $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+        $hash = PersistentOutputCacheService::entryHash($client, $canonical);
 
         $store = [
             PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
