@@ -590,6 +590,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
 
         $cache = $this->createMock(PersistentOutputCacheService::class);
         $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->method('isPastCooldown')->willReturn(true);
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
 
         $classifier = $this->makeClassifier([
@@ -894,6 +895,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $before = time();
 
         $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->method('isPastCooldown')->willReturn(true);
         $cache->expects(self::once())->method('armOperationCooldown');
         $cache->expects(self::never())->method('bumpFallbackWatermark');
         $cache->expects(self::once())->method('stampInvalidatedAt')
@@ -1018,6 +1020,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         });
 
         $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->method('isPastCooldown')->willReturn(true);
         $cache->expects(self::never())->method('bumpFallbackWatermark');
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
 
@@ -1184,6 +1187,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         });
 
         $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->method('isPastCooldown')->willReturn(true);
         $cache->expects(self::never())->method('bumpFallbackWatermark');
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
 

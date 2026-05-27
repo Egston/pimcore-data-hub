@@ -232,9 +232,10 @@ final class PriorityRedisTransportTest extends TestCase
         int $visibilityTimeout = 600,
         int $requeueScoreBump = 5,
         string $priorityStrategy = 'oldest_refreshed_at_first',
-        int $weightBandSeconds = 60
+        int $weightBandSeconds = 60,
+        int $readTriggerOffsetSeconds = 86400
     ): PriorityRedisTransport {
-        return new class($redis, $serializer ?? new PhpSerializer(), self::ZSET, self::MESSAGES, self::INFLIGHT, $visibilityTimeout, $requeueScoreBump, $priorityStrategy, $weightBandSeconds) extends PriorityRedisTransport {
+        return new class($redis, $serializer ?? new PhpSerializer(), self::ZSET, self::MESSAGES, self::INFLIGHT, $visibilityTimeout, $requeueScoreBump, $priorityStrategy, $weightBandSeconds, $readTriggerOffsetSeconds) extends PriorityRedisTransport {
             /** @var list<string> */
             public array $warnings = [];
 
@@ -547,6 +548,46 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertArrayHasKey('stuck-id', $redis->zsets[self::ZSET]);
         self::assertSame($deliverAt, (int)$redis->zsets[self::ZSET]['stuck-id']);
         self::assertArrayNotHasKey('stuck-id', $redis->hashes[self::INFLIGHT]);
+    }
+
+    public function testReadTriggeredMessageRoundTripsThroughSerializer(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer);
+
+        $sent = new PersistentRefreshMessage('client-x', '{"query":"{__typename}"}', 'OpRead', 1700000000, null, null, true);
+        $transport->send(new Envelope($sent));
+
+        $received = $transport->get();
+        $envelopes = is_array($received) ? $received : iterator_to_array($received);
+        self::assertCount(1, $envelopes);
+        $decoded = $envelopes[0]->getMessage();
+        self::assertInstanceOf(PersistentRefreshMessage::class, $decoded);
+        self::assertTrue($decoded->readTriggered, 'readTriggered must survive serialize → deserialize');
+    }
+
+    public function testReapedReadRetainsReadTriggerOffsetInScore(): void
+    {
+        // Requeue-stays-in-class: the reaper re-derives the score through
+        // scoreFor(deserialized message), so a reaped read keeps its offset. A
+        // future-dated refreshedAt keeps the re-queued read above `now`, so it
+        // stays in the ZSET (not immediately re-popped) and the score is
+        // observable directly.
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer, 60, 5, 'oldest_refreshed_at_first', 60, 86400);
+
+        $refreshedAt = time() + 200000;
+        $read = new PersistentRefreshMessage('c1', '{}', 'OpRead', $refreshedAt, null, null, true);
+        $encoded = $serializer->encode(new Envelope($read));
+        $redis->hashes[self::MESSAGES] = ['stuck-read' => $encoded['body']];
+        $redis->hashes[self::INFLIGHT] = ['stuck-read' => json_encode(['poppedAt' => time() - 600])];
+
+        iterator_to_array($transport->get());
+
+        self::assertArrayHasKey('stuck-read', $redis->zsets[self::ZSET]);
+        self::assertSame($refreshedAt - 86400, (int)$redis->zsets[self::ZSET]['stuck-read'], 'reaped read must re-derive a score that still carries the offset');
     }
 
     public function testMessageScoredAtExactlyNowPopsImmediately(): void

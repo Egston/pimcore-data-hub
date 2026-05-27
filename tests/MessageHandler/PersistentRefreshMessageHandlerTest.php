@@ -571,7 +571,7 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         // Stale + past cooldown so the trailing pop fires; controller then fails.
         $persistentCache = $this->createMock(PersistentOutputCacheService::class);
         $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 1, 'invalidatedAt' => 100]);
-        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(true);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
         $persistentCache->method('isPastCooldown')->willReturn(true);
         $persistentCache->expects(self::never())->method('clearOperationCooldown');
 
@@ -594,7 +594,7 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
 
         $persistentCache = $this->createMock(PersistentOutputCacheService::class);
         $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 200, 'invalidatedAt' => 100]);
-        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(false);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(false);
         $persistentCache->expects(self::once())->method('clearOperationCooldown')->with($hash);
 
         $bus = $this->createMock(\Symfony\Component\Messenger\MessageBusInterface::class);
@@ -623,7 +623,7 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
             'invalidatedAt' => 100,
             'lastRefreshAt' => $lastRefreshAt,
         ]);
-        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(true);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
         $persistentCache->method('isPastCooldown')->willReturn(false);
         $persistentCache->expects(self::never())->method('clearOperationCooldown');
 
@@ -657,7 +657,7 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
 
         $persistentCache = $this->createMock(PersistentOutputCacheService::class);
         $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 1, 'invalidatedAt' => 100]);
-        $persistentCache->method('isEntryStaleByTimestamps')->willReturn(true);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
         $persistentCache->method('isPastCooldown')->willReturn(true);
         $persistentCache->expects(self::once())->method('clearOperationCooldown');
 
@@ -702,6 +702,140 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         self::assertIsInt($controller->captured, 'synthetic request must carry the refresh-start timestamp as an int');
         self::assertGreaterThan(0, $controller->captured);
         self::assertEqualsWithDelta(time(), $controller->captured, 2, 'refresh-start timestamp must be close to now');
+    }
+
+    public function testFreshnessGuardSkipsRefreshWhenEntryFreshWithinCooldown(): void
+    {
+        $classifier = $this->makeCooldownClassifier('OpFresh', 21600);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 200, 'invalidatedAt' => 100, 'lastRefreshAt' => time()]);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(false);
+        $persistentCache->method('isPastCooldown')->willReturn(false);
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        // Un-dated (read+warm duplicate) message: the freshness guard no-ops.
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpFresh"}', 'OpFresh', time(), null, null);
+        $handler($msg);
+    }
+
+    public function testFreshnessGuardFallsThroughToRefreshWhenStale(): void
+    {
+        $classifier = $this->makeCooldownClassifier('OpStale', 21600);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 1, 'invalidatedAt' => 100]);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpStale"}', 'OpStale', time(), null, null);
+        $handler($msg);
+    }
+
+    public function testFreshnessGuardFallsThroughToRefreshWhenStaleByWatermarkOnly(): void
+    {
+        $classifier = $this->makeClassifier(['OpWatermark' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        // Entry is fresh by per-entry timestamps (invalidatedAt <= refreshedAt) but
+        // stale by the global fallback watermark (refreshedAt < fallbackWatermark).
+        // The guard must honour the watermark path and fall through to refresh.
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 100, 'invalidatedAt' => 50]);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpWatermark"}', 'OpWatermark', null, null, null);
+        $handler($msg);
+    }
+
+    public function testFreshnessGuardFallsThroughToRefreshOnNullMeta(): void
+    {
+        $classifier = $this->makeClassifier(['OpNullMeta' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        // null meta is uncertainty → fall through to refresh, never skip.
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(null);
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpNullMeta"}', 'OpNullMeta', time(), null, null);
+        $handler($msg);
+    }
+
+    public function testFreshnessGuardFallsThroughToRefreshOnCacheFault(): void
+    {
+        $classifier = $this->makeClassifier(['OpFault' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        // A cache fault during the guard must not skip the refresh.
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willThrowException(new \RuntimeException('cache down'));
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpFault"}', 'OpFault', time(), null, null);
+        $handler($msg);
+    }
+
+    public function testTrailingPopReDispatchesWarmOnReArm(): void
+    {
+        $classifier = $this->makeCooldownClassifier('OpReWarm', 21600);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpReWarm"}';
+        $lastRefreshAt = time() - 100;
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn([
+            'refreshedAt' => 1,
+            'invalidatedAt' => 100,
+            'lastRefreshAt' => $lastRefreshAt,
+        ]);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
+        $persistentCache->method('isPastCooldown')->willReturn(false);
+
+        $dispatched = [];
+        $bus = $this->createMock(\Symfony\Component\Messenger\MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new \Symfony\Component\Messenger\Envelope($msg);
+        });
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache, $bus);
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpReWarm', time(), null, time() + 21600);
+        $handler($msg);
+
+        self::assertCount(1, $dispatched, 're-arm dispatches exactly one trailing refresh');
+        self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
+        self::assertFalse($dispatched[0]->readTriggered, 'a worker-re-dispatched trailing must be a warm, never a read');
+        self::assertSame($lastRefreshAt + 21600, $dispatched[0]->deliverAt, 're-arm must date at current lastRefreshAt + cooldown');
     }
 
     private function makeCooldownClassifier(string $operationName, int $cooldownTtl): OperationClassifier

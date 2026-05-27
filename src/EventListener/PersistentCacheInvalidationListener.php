@@ -288,10 +288,10 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     $priorityWeight = $this->classifier?->getPriorityWeight($operation);
 
                     // Leading edge: the cooldown window has fully elapsed (or the
-                    // entry was never refreshed). Warm immediately and arm the
-                    // sentinel as the dispatch-dedup mechanism for the new window.
-                    if ($lastRefreshAt === 0 || $lastRefreshAt <= $now - $cooldown) {
-                        $this->persistentCache->armOperationCooldown($hash, $cooldown);
+                    // entry was never refreshed). Warm immediately, then open a
+                    // fresh window: arm the sentinel + schedule the dated trailing
+                    // at now + cooldown.
+                    if ($this->persistentCache->isPastCooldown($meta, $cooldown, $now)) {
                         $this->bus->dispatch(new PersistentRefreshMessage(
                             client: $client,
                             bodyJson: $canonical,
@@ -299,14 +299,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                             refreshedAt: $now,
                             priorityWeight: $priorityWeight,
                         ));
-                        $this->bus->dispatch(new PersistentRefreshMessage(
-                            client: $client,
-                            bodyJson: $canonical,
-                            operationName: $operation,
-                            refreshedAt: $now,
-                            priorityWeight: $priorityWeight,
-                            deliverAt: $now + $cooldown,
-                        ));
+                        $this->openCooldownWindow($hash, $cooldown, $now + $cooldown, $client, $canonical, $operation, $now, $priorityWeight);
                         Logger::info(sprintf(
                             'persistent_cache_invalidation: leading-edge refresh dispatched for op=%s',
                             $operation
@@ -341,15 +334,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
 
                     // Within cooldown, no trailing scheduled yet: coalesce to a
                     // single window-end-dated trailing refresh.
-                    $this->persistentCache->armOperationCooldown($hash, $cooldown);
-                    $this->bus->dispatch(new PersistentRefreshMessage(
-                        client: $client,
-                        bodyJson: $canonical,
-                        operationName: $operation,
-                        refreshedAt: $now,
-                        priorityWeight: $priorityWeight,
-                        deliverAt: $lastRefreshAt + $cooldown,
-                    ));
+                    $this->openCooldownWindow($hash, $cooldown, $lastRefreshAt + $cooldown, $client, $canonical, $operation, $now, $priorityWeight);
                     Logger::info(sprintf(
                         'persistent_cache_invalidation: trailing refresh scheduled for op=%s at window end',
                         $operation
@@ -400,6 +385,36 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
         }
 
         return $result;
+    }
+
+    /**
+     * Open a cooldown window: arm the per-entry sentinel and enqueue the dated
+     * trailing refresh in one structural step.
+     *
+     * `$deliverAt` is an explicit parameter, never computed here: the call sites
+     * are deliberately asymmetric (leading-edge passes `now + cooldown`;
+     * within-window passes `lastRefreshAt + cooldown`). Computing it internally
+     * would re-introduce the leading-edge-pops-immediately defect.
+     */
+    private function openCooldownWindow(
+        string $hash,
+        int $cooldownTtl,
+        int $deliverAt,
+        string $client,
+        string $canonical,
+        string $operation,
+        int $refreshedAt,
+        ?int $priorityWeight
+    ): void {
+        $this->persistentCache->armOperationCooldown($hash, $cooldownTtl);
+        $this->bus->dispatch(new PersistentRefreshMessage(
+            client: $client,
+            bodyJson: $canonical,
+            operationName: $operation,
+            refreshedAt: $refreshedAt,
+            priorityWeight: $priorityWeight,
+            deliverAt: $deliverAt,
+        ));
     }
 
     /**

@@ -28,7 +28,8 @@ final class PriorityRedisTransportScoreTest extends TestCase
 {
     private function makeTransport(
         string $priorityStrategy = 'oldest_refreshed_at_first',
-        int $weightBandSeconds = 60
+        int $weightBandSeconds = 60,
+        int $readTriggerOffsetSeconds = 86400
     ): PriorityRedisTransport {
         return new PriorityRedisTransport(
             new FakeRedis(),
@@ -39,7 +40,8 @@ final class PriorityRedisTransportScoreTest extends TestCase
             600,
             5,
             $priorityStrategy,
-            $weightBandSeconds
+            $weightBandSeconds,
+            $readTriggerOffsetSeconds
         );
     }
 
@@ -106,5 +108,51 @@ final class PriorityRedisTransportScoreTest extends TestCase
         $transport = $this->makeTransport('bogus_strategy', 60);
         $this->expectException(\LogicException::class);
         $transport->scoreFor(new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, 1));
+    }
+
+    public function testReadTriggeredMessageSubtractsOffsetUnderPlainStrategy(): void
+    {
+        $transport = $this->makeTransport('oldest_refreshed_at_first', 60, 86400);
+        $read = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, null, null, true);
+        self::assertSame(1234567890 - 86400, $transport->scoreFor($read));
+    }
+
+    public function testReadTriggeredMessageSubtractsOffsetUnderBandStrategy(): void
+    {
+        $transport = $this->makeTransport('oldest_refreshed_at_first_with_weight_bands', 60, 86400);
+        $read = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, 7, null, true);
+        self::assertSame(1234567890 - 420 - 86400, $transport->scoreFor($read));
+    }
+
+    public function testWarmMessageDoesNotSubtractOffset(): void
+    {
+        $transport = $this->makeTransport('oldest_refreshed_at_first', 60, 86400);
+        $warm = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, null, null, false);
+        self::assertSame(1234567890, $transport->scoreFor($warm));
+    }
+
+    public function testDatedMessageScoreIsDeliverAtVerbatim(): void
+    {
+        $deliverAt = time() + 3600;
+        $transport = $this->makeTransport('oldest_refreshed_at_first', 60, 86400);
+        $dated = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, null, $deliverAt);
+        self::assertSame($deliverAt, $transport->scoreFor($dated));
+    }
+
+    public function testReadWithLowestWeightStillScoresBelowHighestWeightWarm(): void
+    {
+        // Hard-guarantee proof at the default offset: a read carrying the
+        // lowest plausible warm-weight (1) sorts strictly below a warm carrying
+        // a high weight (10), at the same refreshedAt, under weight bands.
+        $transport = $this->makeTransport('oldest_refreshed_at_first_with_weight_bands', 60, 86400);
+        $read = new PersistentRefreshMessage('c1', '{}', 'OpRead', 1234567890, 1, null, true);
+        $warm = new PersistentRefreshMessage('c1', '{}', 'OpWarm', 1234567890, 10, null, false);
+        self::assertLessThan($transport->scoreFor($warm), $transport->scoreFor($read));
+    }
+
+    public function testReadTriggeredWithDeliverAtThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, null, time() + 21600, true);
     }
 }

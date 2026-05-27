@@ -122,13 +122,6 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
             if (isset($in['operationName']) && is_string($in['operationName'])) {
                 $op = $in['operationName'];
             }
-            $enqueueTtl = max(1, (int)($graphql['persistent_enqueue_dedupe_ttl'] ?? 60));
-            $dedupeKey = $this->buildEnqueueDedupeKey($request);
-            $existingEnqueue = $this->cacheLoad($dedupeKey);
-            if ($existingEnqueue !== false && $existingEnqueue !== null) {
-                return;
-            }
-            $this->cacheSave(1, $dedupeKey, ['datahub_graphql_persistent'], $enqueueTtl);
             $strategy = (string)($graphql['persistent_refresh_priority_strategy'] ?? 'oldest_refreshed_at_first');
             if ($strategy === 'oldest_refreshed_at_first_with_weight_bands'
                 && !$this->emittedEmptyClassifierWarning
@@ -143,7 +136,14 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
                 $attr = $request->attributes->get('_datahub_persistent_refreshed_at');
                 $refreshedAt = is_int($attr) && $attr > 0 ? $attr : time();
             }
-            $this->bus->dispatch(new PersistentRefreshMessage($client, $payload, $op, $refreshedAt, $priorityWeight));
+            $this->bus->dispatch(new PersistentRefreshMessage(
+                client: $client,
+                bodyJson: $payload,
+                operationName: $op,
+                refreshedAt: $refreshedAt,
+                priorityWeight: $priorityWeight,
+                readTriggered: true,
+            ));
             Logger::info(sprintf(
                 'datahub.refresh_dispatch: enqueued op=%s client=%s vars=%s request_uri=%s ua=%s',
                 $op ?? '?',
@@ -177,25 +177,6 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         }
 
         return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
-    }
-
-    /**
-     * Read helper – separated for testability so the dedupe path can be
-     * exercised without booting the Pimcore kernel.
-     *
-     * @return mixed
-     */
-    protected function cacheLoad(string $key)
-    {
-        return PimcoreCache::load($key);
-    }
-
-    /**
-     * @param mixed $value
-     */
-    protected function cacheSave($value, string $key, array $tags, int $ttl): void
-    {
-        PimcoreCache::save($value, $key, $tags, $ttl, 1, true);
     }
 
     /**
@@ -316,13 +297,5 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         $body = (string)$request->getContent();
 
         return PersistentOutputCacheService::computeSwrRefreshLockKey($client, $body);
-    }
-
-    private function buildEnqueueDedupeKey(Request $request): string
-    {
-        $client = (string)$request->attributes->get('clientname', '');
-        $body = (string)$request->getContent();
-
-        return PersistentOutputCacheService::computeEnqueueDedupeKey($client, $body);
     }
 }

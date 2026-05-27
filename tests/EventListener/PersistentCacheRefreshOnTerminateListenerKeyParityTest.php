@@ -106,26 +106,6 @@ final class PersistentCacheRefreshOnTerminateListenerKeyParityTest extends TestC
         self::assertSame($serviceKey, $listenerKey);
     }
 
-    public function testBuildEnqueueDedupeKeyReturnsSameKeyAsComputeEnqueueDedupeKey(): void
-    {
-        $client = 'c1';
-        $body = (string)json_encode([
-            'query' => 'query Q { a }',
-            'variables' => ['z' => 3, 'a' => 1],
-        ]);
-
-        $listener = $this->makeListener();
-        $request = $this->makeRequest($client, $body);
-
-        $rm = new \ReflectionMethod($listener, 'buildEnqueueDedupeKey');
-        $rm->setAccessible(true);
-
-        $listenerKey = (string)$rm->invoke($listener, $request);
-        $serviceKey = PersistentOutputCacheService::computeEnqueueDedupeKey($client, $body);
-
-        self::assertSame($serviceKey, $listenerKey);
-    }
-
     public function testEntryHashFromBodyEqualsEntryHashOfCanonicalForm(): void
     {
         $client = 'c1';

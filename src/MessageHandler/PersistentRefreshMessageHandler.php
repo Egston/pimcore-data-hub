@@ -100,7 +100,7 @@ final class PersistentRefreshMessageHandler
             return;
         }
 
-        if ($message->deliverAt !== null && !$this->shouldFireTrailing($message, $operationName)) {
+        if (!$this->shouldRunRefresh($message, $operationName)) {
             return;
         }
 
@@ -286,6 +286,64 @@ final class PersistentRefreshMessageHandler
     }
 
     /**
+     * Unified pre-lock gate deciding whether this message proceeds to acquire
+     * the lock and run the resolver.
+     *
+     * - A dated (deliverAt) message is a trailing pop: delegate to
+     *   {@see self::shouldFireTrailing()}, which self-cancels or re-arms based
+     *   on current entry state.
+     * - An un-dated message passes the execution-time freshness guard: if the
+     *   entry is already fresh and, when a cooldown applies, within that cooldown
+     *   of its last refresh, the refresh is a no-op and we return without running
+     *   the resolver.
+     *
+     * Fail-loud-toward-work: on absent service, null meta, or any cache fault
+     * the guard falls through to refresh so a needed refresh is never skipped
+     * on uncertainty.
+     */
+    private function shouldRunRefresh(PersistentRefreshMessage $message, string $operationName): bool
+    {
+        if ($message->deliverAt !== null) {
+            return $this->shouldFireTrailing($message, $operationName);
+        }
+
+        if ($this->persistentCache === null) {
+            return true;
+        }
+
+        try {
+            $meta = $this->persistentCache->loadEntryMeta($message->client, $message->bodyJson);
+            if ($meta === null) {
+                return true;
+            }
+
+            if ($this->persistentCache->isEntryStaleWithWatermark($meta)) {
+                return true;
+            }
+
+            $cooldown = $this->classifier->getInvalidationCooldown($operationName) ?? 0;
+            if ($cooldown > 0 && $this->persistentCache->isPastCooldown($meta, $cooldown)) {
+                return true;
+            }
+        } catch (\Throwable $e) {
+            $this->logWarning(sprintf(
+                'datahub.refresh_handler: freshness-guard evaluation failed for %s: %s',
+                $operationName,
+                $e->getMessage()
+            ));
+
+            return true;
+        }
+
+        Logger::debug(sprintf(
+            'datahub.refresh_handler: refresh skipped for op=%s (entry already fresh within cooldown)',
+            $operationName
+        ));
+
+        return false;
+    }
+
+    /**
      * Trailing-pop self-cancel / re-arm decision for a dated (deliverAt) message.
      * Re-reads the entry meta at pop time — never carries a stale value on the
      * message — so the re-arm loop converges:
@@ -310,7 +368,7 @@ final class PersistentRefreshMessageHandler
                 return true;
             }
 
-            $stale = $this->persistentCache->isEntryStaleByTimestamps($meta);
+            $stale = $this->persistentCache->isEntryStaleWithWatermark($meta);
             $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
 
             if (!$stale) {
@@ -371,17 +429,33 @@ final class PersistentRefreshMessageHandler
         }
 
         $lastRefreshAt = (int)($meta['lastRefreshAt'] ?? 0);
-        $this->bus->dispatch(new PersistentRefreshMessage(
-            client: $message->client,
-            bodyJson: $message->bodyJson,
-            operationName: $message->operationName,
-            refreshedAt: time(),
-            priorityWeight: $message->priorityWeight,
-            deliverAt: $lastRefreshAt + $cooldown,
-        ));
+        $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
+        $this->openCooldownWindow($hash, $cooldown, $lastRefreshAt + $cooldown, $message);
         Logger::info(sprintf(
             'datahub.refresh_handler: trailing refresh re-armed for op=%s at window end',
             $operationName
+        ));
+    }
+
+    /**
+     * Open (or re-arm) a cooldown window: arm the per-entry sentinel and enqueue
+     * the dated trailing refresh in one structural step.
+     *
+     * `$deliverAt` is an explicit parameter, never computed here — the re-arm site
+     * passes `lastRefreshAt + cooldown`, deliberately distinct from the listener's
+     * leading-edge `now + cooldown`. The trailing carries `readTriggered: false`
+     * (a worker re-dispatch is a warm, never a read).
+     */
+    private function openCooldownWindow(string $hash, int $cooldownTtl, int $deliverAt, PersistentRefreshMessage $template): void
+    {
+        $this->persistentCache?->armOperationCooldown($hash, $cooldownTtl);
+        $this->bus?->dispatch(new PersistentRefreshMessage(
+            client: $template->client,
+            bodyJson: $template->bodyJson,
+            operationName: $template->operationName,
+            refreshedAt: time(),
+            priorityWeight: $template->priorityWeight,
+            deliverAt: $deliverAt,
         ));
     }
 

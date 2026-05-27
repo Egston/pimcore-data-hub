@@ -399,6 +399,21 @@ class PersistentOutputCacheService
     }
 
     /**
+     * Watermark-aware staleness check: combines the global fallback watermark
+     * with the per-entry timestamp comparison. Matches the read-path predicate
+     * in {@see self::preHandle()} exactly so the freshness guard and the serve
+     * path agree on what is stale.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function isEntryStaleWithWatermark(array $meta): bool
+    {
+        $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
+
+        return $this->isEntryStale($meta, $fallbackWatermark);
+    }
+
+    /**
      * Per-entry staleness predicate: an invalidation recorded after the last
      * refresh-start means the cached payload predates the edit. Public so the
      * worker can evaluate the trailing-pop self-cancel decision.

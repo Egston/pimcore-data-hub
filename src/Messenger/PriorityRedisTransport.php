@@ -76,7 +76,8 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
         private int $visibilityTimeout,
         private int $requeueScoreBump,
         private string $priorityStrategy,
-        private int $weightBandSeconds
+        private int $weightBandSeconds,
+        private int $readTriggerOffsetSeconds
     ) {
     }
 
@@ -283,6 +284,15 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
      * branches: the score is the absolute due-time verbatim. Weight banding is
      * a priority among due messages; a scheduled message's due-time is when it
      * becomes eligible at all, so banding must not perturb it.
+     *
+     * A read-triggered message (`PersistentRefreshMessage::$readTriggered` and
+     * no deliverAt) has a read-trigger offset (`$readTriggerOffsetSeconds`)
+     * subtracted from its score under both banded/timestamp strategies, so every
+     * demand-driven read sorts strictly below every speculative warm of the same
+     * refreshedAt. The hard-guarantee constraint `offset > priority_weight ×
+     * $weightBandSeconds` (enforced by the config default) keeps a read below
+     * even the highest-weight warm; the offset is sourced from config so it stays
+     * coupled to the weight-band tuning rather than hardcoded.
      */
     public function scoreFor(object $message): int
     {
@@ -291,11 +301,20 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
         }
 
         return match ($this->priorityStrategy) {
-            'oldest_refreshed_at_first' => $this->baseScore($message),
-            'oldest_refreshed_at_first_with_weight_bands' => $this->baseScore($message) - ($this->weightFor($message) * $this->weightBandSeconds),
+            'oldest_refreshed_at_first' => $this->baseScore($message) - $this->readTriggerOffsetFor($message),
+            'oldest_refreshed_at_first_with_weight_bands' => $this->baseScore($message) - ($this->weightFor($message) * $this->weightBandSeconds) - $this->readTriggerOffsetFor($message),
             'disabled' => $this->baseScore($message),
             default => throw new \LogicException('datahub.priority_transport: unsupported priority strategy "' . $this->priorityStrategy . '"'),
         };
+    }
+
+    private function readTriggerOffsetFor(object $message): int
+    {
+        if ($message instanceof PersistentRefreshMessage && $message->readTriggered) {
+            return $this->readTriggerOffsetSeconds;
+        }
+
+        return 0;
     }
 
     private function baseScore(object $message): int

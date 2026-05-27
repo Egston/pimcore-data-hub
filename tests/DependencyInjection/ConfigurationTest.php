@@ -430,4 +430,20 @@ final class ConfigurationTest extends TestCase
         self::assertSame('operation', $graphql['herd_guard_key_strategy']);
         self::assertArrayNotHasKey('_herd_guard_alias_conflicts', $graphql);
     }
+
+    public function testReadTriggerOffsetDefaultDominatesWarmBandSpan(): void
+    {
+        // Hard-guarantee constraint: the default read-trigger offset must exceed
+        // the warm weight-band span (max-expected priority_weight × band seconds),
+        // so every read sorts strictly below every warm. With the default band of
+        // 60s, even a generous max weight of 100 yields a 6000s span — the default
+        // offset of 86400 dominates it by an order of magnitude.
+        $graphql = $this->process([]);
+        $offset = $graphql['persistent_refresh_priority_read_trigger_offset_seconds'];
+        $band = $graphql['persistent_refresh_priority_weight_band_seconds'];
+
+        self::assertSame(86400, $offset);
+        self::assertSame(60, $band);
+        self::assertGreaterThan($band * 100, $offset, 'default offset must dominate the max plausible warm-band span');
+    }
 }

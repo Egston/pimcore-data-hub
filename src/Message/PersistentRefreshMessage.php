@@ -39,7 +39,20 @@ final class PersistentRefreshMessage
          * transport's visibility-timeout reaper re-derives the same due-time from the envelope
          * and a reaped scheduled message keeps its original schedule. Null = immediate delivery.
          */
-        public readonly ?int $deliverAt = null
+        public readonly ?int $deliverAt = null,
+        /**
+         * Read-vs-warm discriminator. True only for refreshes triggered by a genuine
+         * HTTP read on kernel.terminate; false (the default) for every speculative warm
+         * dispatched from the invalidation listener or re-dispatched by the worker.
+         * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
+         * subtracts a constant read-trigger offset from a read's score so demand-driven
+         * reads sort strictly below every warm of the same refreshedAt. Reads must not
+         * carry a deliverAt; the constructor enforces this as an invariant.
+         */
+        public readonly bool $readTriggered = false
     ) {
+        if ($this->readTriggered && $this->deliverAt !== null) {
+            throw new \InvalidArgumentException('A read-triggered refresh cannot be scheduled (deliverAt must be null).');
+        }
     }
 }

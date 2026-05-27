@@ -104,6 +104,7 @@ class PriorityRedisTransportFactory implements TransportFactoryInterface
             ));
         }
         $weightBandSeconds = max(0, (int)($graphql['persistent_refresh_priority_weight_band_seconds'] ?? 60));
+        $readTriggerOffsetSeconds = max(0, (int)($graphql['persistent_refresh_priority_read_trigger_offset_seconds'] ?? 86400));
 
         if (!class_exists(\Redis::class)) {
             throw new \RuntimeException('datahub.priority_transport: phpredis extension not installed');
@@ -126,7 +127,8 @@ class PriorityRedisTransportFactory implements TransportFactoryInterface
             $visibilityTimeout,
             $requeueScoreBump,
             $priorityStrategy,
-            $weightBandSeconds
+            $weightBandSeconds,
+            $readTriggerOffsetSeconds
         );
     }
 
