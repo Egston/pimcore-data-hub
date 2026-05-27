@@ -504,6 +504,36 @@ the worker.
 | Reverse index entry malformed | Listener logs per-entry warning, skips the entry; never amplifies a data-shape bug into a global watermark bump. | Surface the warnings in logs; bad entries naturally cycle out as their payloads age out. |
 | Bundle-level fatal (entire SWR layer broken) | `clearAll()` drops every payload + meta + reverse-index entry, **preserving** the watermark so freshly-written entries don't all look FRESH until the next external invalidation. | Re-enable SWR, traffic warms the cache organically. |
 
+## Observability
+
+The layer narrates every decision through `\Pimcore\Logger` (the Pimcore
+application logger) under four greppable message prefixes — one per
+moving part:
+
+| Prefix | Emitted by | What it tells you |
+|---|---|---|
+| `persistent_cache_invalidation` | the invalidation listener | which entries an edit invalidated; per-query dispatch vs. coalesce vs. watermark-bump; cooldown arm / "dated refresh already queued" decisions |
+| `datahub.refresh_dispatch` | the read path (`kernel.terminate`) | a stale read enqueued a refresh (operation / client / variables / request URI) |
+| `datahub.refresh_handler` | the refresh worker | a queued refresh started / completed (duration, peak memory), lock-contention requeues, trailing-refresh and cooldown-window-close dispatches |
+| `datahub.swr` | `PersistentOutputCacheService` | cache-save / HIT-repaint outcomes and malformed-meta guards on the read path |
+
+These lines land wherever the application logger's Monolog handler is
+configured to write — commonly `var/log/<kernel-env>.log`, plus a
+`var/log/<kernel-env>-debug.log` variant when the deployment enables a
+debug-level file handler. To watch all four live:
+
+```
+tail -f var/log/<kernel-env>-debug.log \
+  | grep -iE "datahub\.(refresh_handler|refresh_dispatch|swr)|persistent_cache_invalidation"
+```
+
+Use the **debug** log: several lines — notably the `refresh_handler`
+message-drop reasons (unclassified op, missing operation name) and the
+malformed-reverse-index guards — are emitted at `debug` level and won't
+appear in an error-only log. Note that `refresh_handler` lines originate
+in the worker process, so they only share a log file with the dispatch /
+invalidation side if the worker and FPM write to the same path.
+
 ## Tuning notes
 
 ### Where actual values live
