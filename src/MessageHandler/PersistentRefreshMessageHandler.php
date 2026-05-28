@@ -22,6 +22,9 @@ use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownRefreshPolicy;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownTrailingDecisionKind;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\DependencyCollector;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
@@ -61,6 +64,8 @@ use Symfony\Component\Messenger\MessageBusInterface;
 #[AsMessageHandler]
 final class PersistentRefreshMessageHandler
 {
+    private ?CooldownRefreshPolicy $policy;
+
     public function __construct(
         private OperationClassifier $classifier,
         private LockFactoryResolver $lockResolver,
@@ -72,8 +77,12 @@ final class PersistentRefreshMessageHandler
         private ResponseServiceInterface $responseService,
         private ContainerBagInterface $container,
         private ?DependencyCollector $dependencyCollector = null,
-        private ?MessageBusInterface $bus = null
+        private ?MessageBusInterface $bus = null,
+        private ?PersistentOutputCacheService $persistentCache = null,
+        private ?CooldownWindowDispatcher $cooldownDispatcher = null,
+        ?CooldownRefreshPolicy $policy = null,
     ) {
+        $this->policy = $policy ?? ($persistentCache !== null ? new CooldownRefreshPolicy($persistentCache) : null);
     }
 
     public function __invoke(PersistentRefreshMessage $message): void
@@ -96,6 +105,12 @@ final class PersistentRefreshMessageHandler
                 $operationName
             ));
 
+            return;
+        }
+
+        $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
+
+        if (!$this->shouldRunRefresh($message, $operationName, $hash)) {
             return;
         }
 
@@ -132,7 +147,7 @@ final class PersistentRefreshMessageHandler
         // one PHP process) so without this the peak would be cumulative.
         memory_reset_peak_usage();
         $memBefore = memory_get_usage(true);
-        $varsSummary = self::summariseVariables($message->bodyJson);
+        $varsSummary = PersistentOutputCacheService::summariseVariables($message->bodyJson);
         Logger::info(sprintf(
             'datahub.refresh_handler: started op=%s client=%s tier=%s vars=%s mem_before_mb=%.1f',
             $operationName,
@@ -143,6 +158,7 @@ final class PersistentRefreshMessageHandler
         ));
 
         $controllerSucceeded = false;
+
         try {
             $request = Request::create(
                 '/datahub/graphql',
@@ -156,6 +172,9 @@ final class PersistentRefreshMessageHandler
             $request->attributes->set('clientname', $message->client);
             $request->attributes->set('_datahub_persistent_refresh', true);
             $request->attributes->set('_datahub_bypass_in_progress_guard', true);
+            // savePersistent anchors `refreshedAt` to this START so an edit
+            // landing mid-refresh leaves the entry stale on the next read.
+            $request->attributes->set('_datahub_persistent_refresh_started_at', (int)$startedAt);
 
             try {
                 $this->controller->webonyxAction(
@@ -194,7 +213,8 @@ final class PersistentRefreshMessageHandler
             // was set during processing — dispatch a trailing refresh.
             // Skipped on failure so the retry path doesn't pile dispatches.
             if ($controllerSucceeded) {
-                $this->reconcileCoalesceFlags($message, $operationName);
+                $this->reconcileCoalesceFlags($message, $operationName, $hash);
+                $this->closeCooldownWindow($message, $operationName, $hash);
             }
 
             Logger::info(sprintf(
@@ -213,20 +233,19 @@ final class PersistentRefreshMessageHandler
      * Wrapped in try/catch: a cache failure here is non-fatal — the dedupe
      * sentinel expires on its own TTL, costing a brief coalesce window.
      */
-    private function reconcileCoalesceFlags(PersistentRefreshMessage $message, string $operationName): void
+    private function reconcileCoalesceFlags(PersistentRefreshMessage $message, string $operationName, string $hash): void
     {
         try {
-            $hash = hash('sha256', 'client:' . $message->client . "\n" . $message->bodyJson);
-            $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash;
-            $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
+            if ($this->persistentCache === null) {
+                return;
+            }
 
-            $pending = \Pimcore\Cache::load($pendingKey);
-            $hasPending = $pending !== false && $pending !== null;
+            $hasPending = $this->persistentCache->loadPendingFlag($hash);
 
             if ($hasPending) {
-                \Pimcore\Cache::remove($pendingKey);
+                $this->persistentCache->clearPendingFlag($hash);
             }
-            \Pimcore\Cache::remove($dedupeKey);
+            $this->persistentCache->clearEnqueueDedupe($hash);
 
             if ($hasPending && $this->bus !== null) {
                 $this->bus->dispatch(new PersistentRefreshMessage(
@@ -243,11 +262,199 @@ final class PersistentRefreshMessageHandler
             }
         } catch (\Throwable $e) {
             $this->logWarning(sprintf(
-                'datahub.refresh_handler: coalesce-flag reconcile failed for %s: %s',
+                'datahub.refresh_handler: coalesce-flag reconcile or trailing-dispatch failed for %s: %s',
                 $operationName,
                 $e->getMessage()
             ));
         }
+    }
+
+    /**
+     * A cooldown-scheduled message (non-null deliverAt) carried the op-cooldown
+     * sentinel that suppressed per-edit refreshes during its window. Clearing it
+     * opens a fresh window so the next edit re-arms and schedules the following
+     * dated refresh. Fail-soft: a clear failure is non-fatal — the sentinel
+     * TTL-expires near deliverAt anyway.
+     */
+    private function closeCooldownWindow(PersistentRefreshMessage $message, string $operationName, string $hash): void
+    {
+        if ($message->deliverAt === null || $this->persistentCache === null) {
+            return;
+        }
+
+        try {
+            $this->persistentCache->clearOperationCooldown($hash);
+        } catch (\Throwable $e) {
+            $this->logWarning(sprintf(
+                'datahub.refresh_handler: cooldown-window close failed for %s: %s',
+                $operationName,
+                $e->getMessage()
+            ));
+        }
+    }
+
+    /**
+     * Unified pre-lock gate deciding whether this message proceeds to acquire
+     * the lock and run the resolver.
+     *
+     * - A dated (deliverAt) message is a trailing pop: delegate to
+     *   {@see self::shouldFireTrailing()}, which self-cancels or re-arms based
+     *   on current entry state.
+     * - An un-dated message passes the execution-time freshness guard: if the
+     *   entry is already fresh and, when a cooldown applies, within that cooldown
+     *   of its last refresh, the refresh is a no-op and we return without running
+     *   the resolver.
+     *
+     * Fail-loud-toward-work: on absent service, null meta, or any cache fault
+     * the guard falls through to refresh so a needed refresh is never skipped
+     * on uncertainty.
+     */
+    private function shouldRunRefresh(PersistentRefreshMessage $message, string $operationName, string $hash): bool
+    {
+        if ($message->deliverAt !== null) {
+            return $this->shouldFireTrailing($message, $operationName, $hash);
+        }
+
+        if ($this->persistentCache === null) {
+            return true;
+        }
+
+        try {
+            $meta = $this->persistentCache->loadEntryMeta($message->client, $message->bodyJson);
+            if ($meta === null) {
+                return true;
+            }
+
+            if ($this->persistentCache->isEntryStaleWithWatermark($meta)) {
+                return true;
+            }
+
+            $cooldown = $this->classifier->getInvalidationCooldown($operationName) ?? 0;
+            if ($cooldown > 0 && $this->persistentCache->isPastCooldown($meta, $cooldown)) {
+                return true;
+            }
+        } catch (\Throwable $e) {
+            $this->logWarning(sprintf(
+                'datahub.refresh_handler: freshness-guard evaluation failed for %s: %s',
+                $operationName,
+                $e->getMessage()
+            ));
+
+            return true;
+        }
+
+        Logger::debug(sprintf(
+            'datahub.refresh_handler: refresh skipped for op=%s (entry already fresh within cooldown)',
+            $operationName
+        ));
+
+        return false;
+    }
+
+    /**
+     * Trailing-pop self-cancel / re-arm decision for a dated (deliverAt) message.
+     * Re-reads the entry meta at pop time — never carries a stale value on the
+     * message — so the re-arm loop converges:
+     *
+     * - ¬stale            → cancel: clear pending flag + cooldown sentinel, drop.
+     * - stale ∧ pastCooldown   → fire: caller runs the normal refresh.
+     * - stale ∧ ¬pastCooldown  → re-arm: re-dispatch a trailing dated refresh at
+     *   `lastRefreshAt + cooldown`, leave the pending flag set, drop this pop.
+     *
+     * Returns true only on the fire path. Fail-soft: if the service is absent or
+     * meta can't be loaded, fall through to fire so a refresh is never lost.
+     */
+    private function shouldFireTrailing(PersistentRefreshMessage $message, string $operationName, string $hash): bool
+    {
+        if ($this->persistentCache === null || $this->policy === null) {
+            return true;
+        }
+
+        try {
+            $meta = $this->persistentCache->loadEntryMeta($message->client, $message->bodyJson);
+            if ($meta === null) {
+                return true;
+            }
+
+            $cooldown = $this->classifier->getInvalidationCooldown($operationName) ?? 0;
+            // The decision policy assumes a positive cooldown for its REARM
+            // arm to be meaningful. A zero/unconfigured cooldown collapses to
+            // a binary stale/¬stale split, so route only `cooldown > 0` cases
+            // through the policy and keep the cooldown=0 path as a direct
+            // stale check identical to the legacy branch.
+            if ($cooldown <= 0) {
+                if (!$this->persistentCache->isEntryStaleWithWatermark($meta)) {
+                    return $this->cancelTrailingWithLog($hash, $operationName);
+                }
+
+                return true;
+            }
+
+            $decision = $this->policy->decideOnTrailingPop($meta, $cooldown);
+
+            switch ($decision->kind) {
+                case CooldownTrailingDecisionKind::CANCEL:
+                    return $this->cancelTrailingWithLog($hash, $operationName);
+
+                case CooldownTrailingDecisionKind::REARM:
+                    return $this->rearmTrailing($message, (int) $decision->deliverAt, $cooldown, $operationName, $hash);
+
+                case CooldownTrailingDecisionKind::FIRE:
+                    return true;
+
+                default:
+                    throw new \LogicException('unreachable: unhandled CooldownTrailingDecisionKind ' . $decision->kind->value . ' for op=' . $operationName);
+            }
+        } catch (\Throwable $e) {
+            $this->logWarning(sprintf(
+                'datahub.refresh_handler: trailing-pop evaluation failed for %s: %s',
+                $operationName,
+                $e->getMessage()
+            ));
+
+            return true;
+        }
+    }
+
+    /**
+     * Cancel arm: clear the pending flag and the cooldown sentinel so the next
+     * edit dispatches a fresh leading-edge refresh. The raw pending-flag removal
+     * is isolated in its own catch so a cache fault there cannot flip the
+     * cancel decision back into a fire.
+     */
+    private function cancelTrailing(string $hash): void
+    {
+        try {
+            $this->persistentCache?->clearPendingFlag($hash);
+        } catch (\Throwable $e) {
+            $this->logWarning('datahub.refresh_handler: pending-flag clear failed on cancel: ' . $e->getMessage());
+        }
+        $this->persistentCache?->clearOperationCooldown($hash);
+    }
+
+    private function cancelTrailingWithLog(string $hash, string $operationName): false
+    {
+        $this->cancelTrailing($hash);
+        Logger::info(sprintf(
+            'datahub.refresh_handler: trailing refresh cancelled for op=%s (entry no longer stale)',
+            $operationName
+        ));
+
+        return false;
+    }
+
+    // Leaves the pending flag set so the re-arm loop converges.
+    private function rearmTrailing(PersistentRefreshMessage $message, int $deliverAt, int $cooldown, string $operationName, string $hash): false
+    {
+        if ($this->cooldownDispatcher !== null) {
+            $this->cooldownDispatcher->open($hash, $cooldown, $deliverAt, $message);
+            Logger::info(sprintf(
+                'datahub.refresh_handler: trailing refresh re-armed for op=%s at window end',
+                $operationName
+            ));
+        }
+
+        return false;
     }
 
     /**
@@ -262,29 +469,6 @@ final class PersistentRefreshMessageHandler
         $graphql = $cfg['graphql'] ?? [];
 
         return is_array($graphql) ? $graphql : [];
-    }
-
-    /**
-     * Compact representation of the request `variables` for log lines. Returns
-     * a short JSON blob trimmed to 200 chars so verbose filter payloads don't
-     * blow the line length. Falls back to `?` when the body is unparseable.
-     */
-    private static function summariseVariables(string $bodyJson): string
-    {
-        $decoded = json_decode($bodyJson, true);
-        if (!is_array($decoded)) {
-            return '?';
-        }
-        $vars = $decoded['variables'] ?? null;
-        if (!is_array($vars) || $vars === []) {
-            return '{}';
-        }
-        $json = json_encode($vars, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            return '?';
-        }
-
-        return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
     }
 
     protected function logWarning(string $message): void

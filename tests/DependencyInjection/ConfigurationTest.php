@@ -137,6 +137,7 @@ final class ConfigurationTest extends TestCase
         self::assertNull($graphql['operations']['testOpListGuarded']['ttl_override']);
         self::assertNull($graphql['operations']['testOpListGuarded']['enqueue_dedup_ttl_override']);
         self::assertSame(1, $graphql['operations']['testOpListGuarded']['priority_weight']);
+        self::assertSame(1, $graphql['operations']['testOpListGuarded']['read_priority_weight']);
     }
 
     public function testInProgressQueriesMemberAlsoInOperationsExplicitEntryWins(): void
@@ -429,5 +430,47 @@ final class ConfigurationTest extends TestCase
         ]);
         self::assertSame('operation', $graphql['herd_guard_key_strategy']);
         self::assertArrayNotHasKey('_herd_guard_alias_conflicts', $graphql);
+    }
+
+    public function testReadTriggerOffsetDefaultDominatesWarmBandSpan(): void
+    {
+        $graphql = $this->process([]);
+        $offset = $graphql['persistent_refresh_priority_read_trigger_offset_seconds'];
+        $band = $graphql['persistent_refresh_priority_weight_band_seconds'];
+        $maxWeight = $graphql['persistent_refresh_priority_max_weight'];
+
+        self::assertSame(86400, $offset);
+        self::assertSame(60, $band);
+        self::assertGreaterThan($maxWeight * $band, $offset, 'default offset must dominate the max plausible warm-band span');
+    }
+
+    public function testMaxWeightDefaultsTo100(): void
+    {
+        $graphql = $this->process([]);
+        self::assertSame(100, $graphql['persistent_refresh_priority_max_weight']);
+    }
+
+    public function testReadPriorityWeightDefaultsToOne(): void
+    {
+        $graphql = $this->process([
+            'operations' => [
+                'testOpListSwr' => ['tier' => 'swr_only', 'granularity' => 'list'],
+            ],
+        ]);
+        self::assertSame(1, $graphql['operations']['testOpListSwr']['read_priority_weight']);
+    }
+
+    public function testReadPriorityWeightAccepted(): void
+    {
+        $graphql = $this->process([
+            'operations' => [
+                'testOpListSwr' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'read_priority_weight' => 7,
+                ],
+            ],
+        ]);
+        self::assertSame(7, $graphql['operations']['testOpListSwr']['read_priority_weight']);
     }
 }

@@ -106,23 +106,59 @@ final class PersistentCacheRefreshOnTerminateListenerKeyParityTest extends TestC
         self::assertSame($serviceKey, $listenerKey);
     }
 
-    public function testBuildEnqueueDedupeKeyReturnsSameKeyAsComputeEnqueueDedupeKey(): void
+    public function testEntryHashFromBodyEqualsEntryHashOfCanonicalForm(): void
     {
         $client = 'c1';
-        $body = (string)json_encode([
+        $rawBody = (string)json_encode([
             'query' => 'query Q { a }',
             'variables' => ['z' => 3, 'a' => 1],
         ]);
+        $canonical = PersistentOutputCacheService::canonicalizePayloadString($rawBody);
 
-        $listener = $this->makeListener();
-        $request = $this->makeRequest($client, $body);
+        self::assertSame(
+            PersistentOutputCacheService::entryHash($client, $canonical),
+            PersistentOutputCacheService::entryHashFromBody($client, $rawBody)
+        );
+    }
 
-        $rm = new \ReflectionMethod($listener, 'buildEnqueueDedupeKey');
-        $rm->setAccessible(true);
+    public function testEntryHashFromBodyNormalisesQueryWhitespace(): void
+    {
+        $client = 'c1';
+        // Extra internal whitespace — canonicalizer prints via AST so this must collapse.
+        $rawBody = '{"query":"query Q {  a }"}';
+        $canonical = PersistentOutputCacheService::canonicalizePayloadString($rawBody);
 
-        $listenerKey = (string)$rm->invoke($listener, $request);
-        $serviceKey = PersistentOutputCacheService::computeEnqueueDedupeKey($client, $body);
+        self::assertSame(
+            PersistentOutputCacheService::entryHash($client, $canonical),
+            PersistentOutputCacheService::entryHashFromBody($client, $rawBody)
+        );
+    }
 
-        self::assertSame($serviceKey, $listenerKey);
+    public function testEntryHashClientIsolation(): void
+    {
+        $body = (string)json_encode(['query' => 'query Q { a }']);
+        $canonical = PersistentOutputCacheService::canonicalizePayloadString($body);
+
+        self::assertNotSame(
+            PersistentOutputCacheService::entryHash('c1', $canonical),
+            PersistentOutputCacheService::entryHash('c2', $canonical)
+        );
+    }
+
+    public function testInvalidationListenerCooldownKeyAndTerminateEnqueueDedupeKeyShareOneEntryIdentity(): void
+    {
+        $client = 'c1';
+        $rawBody = (string)json_encode([
+            'query' => 'query Q { a }',
+            'variables' => ['z' => 3, 'a' => 1],
+        ]);
+        $canonical = PersistentOutputCacheService::canonicalizePayloadString($rawBody);
+
+        $invalidationHash = PersistentOutputCacheService::entryHash($client, $canonical);
+
+        $terminateDedupeKey = PersistentOutputCacheService::computeEnqueueDedupeKey($client, $rawBody);
+        $terminateHash = substr($terminateDedupeKey, strlen(PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX));
+
+        self::assertSame($invalidationHash, $terminateHash);
     }
 }

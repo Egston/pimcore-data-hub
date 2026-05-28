@@ -34,8 +34,12 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  * set alongside `datahub_persistent_*` cache markers and the Symfony Lock
  * resource space). Member ids are opaque UUID-v4.
  *
- * - ZSET `<zset_key>` — score: refreshedAt unix-seconds, member: message id.
- *   ZPOPMIN returns the lowest score first (longest-stale wins).
+ * - ZSET `<zset_key>` — score: a unix-seconds baseline sourced from
+ *   `PersistentRefreshMessage::$scoreBaseline` (or `time()` when unset), or an
+ *   absolute `deliverAt` due-time for scheduled refreshes; member: message id.
+ *   `get()` reads the lowest-scored member whose score is `<= now` via
+ *   ZRANGEBYSCORE, so future-dated (scheduled) members stay invisible until
+ *   due while past-dated members drain longest-stale-first.
  * - HASH `<messages_key>` — id to serialized envelope bytes (framework default
  *   transport serializer).
  * - HASH `<inflight_key>` — id to `{"poppedAt": <unix-ts>}`. Reaper scans this
@@ -46,20 +50,24 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  * - `send()`: ZADD + HSET in MULTI/EXEC. On retry (id already in inflight)
  *   the ZSET score is bumped by the requeue-score knob so contended messages
  *   sink behind fresher arrivals.
- * - `get()`: ZPOPMIN + HGET messages + HSET inflight in MULTI/EXEC.
+ * - `get()`: ZRANGEBYSCORE (read due member) then ZREM + HGET messages +
+ *   HSET inflight in MULTI/EXEC.
  * - `ack()`/`reject()`: HDEL on both messages and inflight in MULTI/EXEC.
  *
  * Score source rule: under the default `oldest_refreshed_at_first` strategy,
- * `scoreFor()` reads `PersistentRefreshMessage::$refreshedAt` when non-null,
+ * `scoreFor()` reads `PersistentRefreshMessage::$scoreBaseline` when non-null,
  * else `time()`. Under `oldest_refreshed_at_first_with_weight_bands`, the
- * score is `refreshedAt - (priorityWeight * weightBandSeconds)` so higher-weight
- * messages drop into an earlier band and ZPOPMIN pops them first among
+ * score is `scoreBaseline - (priorityWeight * weightBandSeconds)` so higher-weight
+ * messages drop into an earlier band and ZRANGEBYSCORE pops them first among
  * same-aged peers; `priorityWeight = null` falls back to the classifier's
  * neutral default of `1`. No other message types are special-cased;
  * non-Persistent messages get `time()` and behave FIFO-equivalent.
  */
 class PriorityRedisTransport implements TransportInterface, MessageCountAwareInterface
 {
+    // hGet is queued second in the get() pipeline (after zRem) → body at this index.
+    private const BODY_RESULT_INDEX = 1;
+
     public function __construct(
         private \Redis $redis,
         private SerializerInterface $serializer,
@@ -69,7 +77,8 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
         private int $visibilityTimeout,
         private int $requeueScoreBump,
         private string $priorityStrategy,
-        private int $weightBandSeconds
+        private int $weightBandSeconds,
+        private int $readTriggerOffsetSeconds
     ) {
     }
 
@@ -77,23 +86,37 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
     {
         $this->reapStuckInflight();
 
+        // ZRANGEBYSCORE with an upper bound of `now` is the scheduled-delivery
+        // gate: a future-scored member (a cooldown-throttled refresh dated via
+        // PersistentRefreshMessage::$deliverAt) is invisible until due, while
+        // every normal refresh (score <= now) is returned immediately. The
+        // explicit ZREM that follows replaces the atomicity ZPOPMIN gave us.
+        // The race window is between this pre-MULTI read and the ZREM inside
+        // the MULTI/EXEC below; non-atomic ZRANGEBYSCORE+ZREM is safe only at
+        // replicas: 1, so a Lua wrap is required to scale past one consumer.
         try {
-            $popped = $this->redis->zPopMin($this->zsetKey, 1);
+            $candidates = $this->redis->zRangeByScore(
+                $this->zsetKey,
+                '-inf',
+                (string)time(),
+                ['limit' => [0, 1]]
+            );
         } catch (\Throwable $e) {
-            throw new TransportException('datahub.priority_transport: zPopMin failed: ' . $e->getMessage(), 0, $e);
+            throw new TransportException('datahub.priority_transport: zRangeByScore failed: ' . $e->getMessage(), 0, $e);
         }
 
-        if (!is_array($popped) || $popped === []) {
+        if (!is_array($candidates) || $candidates === []) {
             return [];
         }
 
-        $id = (string)array_key_first($popped);
+        $id = (string)($candidates[0] ?? '');
         if ($id === '') {
             return [];
         }
 
         try {
             $this->redis->multi();
+            $this->redis->zRem($this->zsetKey, $id);
             $this->redis->hGet($this->messagesKey, $id);
             $this->redis->hSet(
                 $this->inflightKey,
@@ -105,7 +128,7 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
             throw new TransportException('datahub.priority_transport: get pipeline failed: ' . $e->getMessage(), 0, $e);
         }
 
-        if (!is_array($pipelineResult) || $pipelineResult === [] || $pipelineResult[0] === false || !is_string($pipelineResult[0])) {
+        if (!is_array($pipelineResult) || count($pipelineResult) < 2 || $pipelineResult[self::BODY_RESULT_INDEX] === false || !is_string($pipelineResult[self::BODY_RESULT_INDEX])) {
             $this->logWarning('datahub.priority_transport: torn write — id ' . $id . ' in ZSET but absent from messages HASH; discarding');
 
             try {
@@ -117,7 +140,7 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
             return [];
         }
 
-        $body = $pipelineResult[0];
+        $body = $pipelineResult[self::BODY_RESULT_INDEX];
 
         try {
             $envelope = $this->serializer->decode(['body' => $body]);
@@ -246,7 +269,7 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
      * Score-extraction hook for the priority queue.
      *
      * Under `oldest_refreshed_at_first` (the default), the canonical source of
-     * truth is `PersistentRefreshMessage::$refreshedAt`; otherwise falls back
+     * truth is `PersistentRefreshMessage::$scoreBaseline`; otherwise falls back
      * to `time()` so non-Persistent messages and Persistent messages with no
      * per-entry context are still ordered against now.
      *
@@ -257,21 +280,48 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
      * — never `0`, which would collide with an explicit `priority_weight: 0`
      * declaration and silently merge an unclassified op into the "no-bias"
      * band an operator picked for a classified op.
+     *
+     * A non-null `PersistentRefreshMessage::$deliverAt` short-circuits both
+     * branches: the score is the absolute due-time verbatim. Weight banding is
+     * a priority among due messages; a scheduled message's due-time is when it
+     * becomes eligible at all, so banding must not perturb it.
+     *
+     * A read-triggered message (`PersistentRefreshMessage::$readTriggered` and
+     * no deliverAt) has a read-trigger offset (`$readTriggerOffsetSeconds`)
+     * subtracted from its score under both banded/timestamp strategies, so every
+     * demand-driven read sorts strictly below every speculative warm of the same
+     * scoreBaseline. The hard-guarantee constraint `offset > priority_weight ×
+     * $weightBandSeconds` (enforced by the config default) keeps a read below
+     * even the highest-weight warm; the offset is sourced from config so it stays
+     * coupled to the weight-band tuning rather than hardcoded.
      */
     public function scoreFor(object $message): int
     {
+        if ($message instanceof PersistentRefreshMessage && $message->deliverAt !== null) {
+            return $message->deliverAt;
+        }
+
         return match ($this->priorityStrategy) {
-            'oldest_refreshed_at_first' => $this->baseScore($message),
-            'oldest_refreshed_at_first_with_weight_bands' => $this->baseScore($message) - ($this->weightFor($message) * $this->weightBandSeconds),
+            'oldest_refreshed_at_first' => $this->baseScore($message) - $this->readTriggerOffsetFor($message),
+            'oldest_refreshed_at_first_with_weight_bands' => $this->baseScore($message) - ($this->weightFor($message) * $this->weightBandSeconds) - $this->readTriggerOffsetFor($message),
             'disabled' => $this->baseScore($message),
             default => throw new \LogicException('datahub.priority_transport: unsupported priority strategy "' . $this->priorityStrategy . '"'),
         };
     }
 
+    private function readTriggerOffsetFor(object $message): int
+    {
+        if ($message instanceof PersistentRefreshMessage && $message->readTriggered) {
+            return $this->readTriggerOffsetSeconds;
+        }
+
+        return 0;
+    }
+
     private function baseScore(object $message): int
     {
-        if ($message instanceof PersistentRefreshMessage && $message->refreshedAt !== null) {
-            return $message->refreshedAt;
+        if ($message instanceof PersistentRefreshMessage && $message->scoreBaseline !== null) {
+            return $message->scoreBaseline;
         }
 
         return time();
@@ -336,6 +386,10 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
             if (is_string($body) && $body !== '') {
                 try {
                     $envelope = $this->serializer->decode(['body' => $body]);
+                    // Re-deriving the score from the envelope preserves an
+                    // absolute deliverAt across a reap, so a reaped scheduled
+                    // refresh keeps its original due-time instead of drifting
+                    // later each reap.
                     $score = $this->scoreFor($envelope->getMessage());
                 } catch (\Throwable) {
                     $score = $now;

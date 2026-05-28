@@ -186,4 +186,109 @@ final class OperationClassifierTest extends TestCase
         self::assertSame(1, $classifier->getPriorityWeight('testOpSingleSwr'));
         self::assertNull($classifier->getPriorityWeight('testOpUnknown'));
     }
+
+    public function testGetReadPriorityWeightReturnsConfiguredValue(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpListSwr' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'read_priority_weight' => 9,
+                ],
+            ],
+        ]);
+        self::assertSame(9, $classifier->getReadPriorityWeight('testOpListSwr'));
+    }
+
+    public function testGetReadPriorityWeightDefaultsToOneWhenAbsent(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpListSwr' => ['tier' => 'swr_only', 'granularity' => 'list'],
+            ],
+        ]);
+        self::assertSame(1, $classifier->getReadPriorityWeight('testOpListSwr'));
+    }
+
+    public function testGetReadPriorityWeightReturnsNullForUnclassifiedOp(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpListSwr' => ['tier' => 'swr_only', 'granularity' => 'list'],
+            ],
+        ]);
+        self::assertNull($classifier->getReadPriorityWeight('testOpUnknown'));
+    }
+
+    public function testBandWeightForWithReadTriggeredFalseReturnsWarmWeight(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpBandWeight' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'priority_weight' => 7,
+                    'read_priority_weight' => 9,
+                ],
+            ],
+        ]);
+        self::assertSame(7, $classifier->bandWeightFor('testOpBandWeight', false));
+    }
+
+    public function testBandWeightForWithReadTriggeredTrueReturnsReadWeight(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpBandWeight' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'priority_weight' => 7,
+                    'read_priority_weight' => 9,
+                ],
+            ],
+        ]);
+        self::assertSame(9, $classifier->bandWeightFor('testOpBandWeight', true));
+    }
+
+    public function testBandWeightForUnclassifiedReturnsNull(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpBandWeight' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'priority_weight' => 7,
+                    'read_priority_weight' => 9,
+                ],
+            ],
+        ]);
+        self::assertNull($classifier->bandWeightFor('testOpUnknown', true));
+        self::assertNull($classifier->bandWeightFor('testOpUnknown', false));
+    }
+
+    public function testGetInvalidationCooldownReturnsValueWhenSet(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpListSwr' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'invalidation_cooldown_ttl' => 21600,
+                ],
+            ],
+        ]);
+        self::assertSame(21600, $classifier->getInvalidationCooldown('testOpListSwr'));
+    }
+
+    public function testGetInvalidationCooldownReturnsNullWhenUnsetOrUnclassified(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpListSwr' => ['tier' => 'swr_only', 'granularity' => 'list'],
+            ],
+        ]);
+        self::assertNull($classifier->getInvalidationCooldown('testOpListSwr'));
+        self::assertNull($classifier->getInvalidationCooldown('testOpUnknown'));
+    }
 }

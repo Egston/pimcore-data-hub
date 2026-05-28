@@ -894,4 +894,703 @@ final class PersistentOutputCacheServiceTest extends TestCase
         $this->assertNull($service->preHandle($req, $this->makeResponseService()));
         $service->postHandle($req, new JsonResponse(['x' => 1]));
     }
+
+    public function testArmOperationCooldownStoresSentinelTaggedWatermark(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $observed = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$observed) {
+            $observed = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $service->armOperationCooldown('abc123', 21600);
+
+        $this->assertSame(PersistentOutputCacheService::KEY_OP_COOLDOWN_PREFIX . 'abc123', $observed['key']);
+        $this->assertSame(21600, $observed['ttl']);
+        // TAG_WATERMARK (not TAG_COMMON) so clearAll() preserves the sentinel.
+        $this->assertContains(PersistentOutputCacheService::TAG_WATERMARK, $observed['tags']);
+        $this->assertNotContains(PersistentOutputCacheService::TAG_COMMON, $observed['tags']);
+    }
+
+    public function testOperationCooldownArmHasClearRoundTrip(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheLoad', 'cacheSave', 'cacheRemove'])
+            ->getMock();
+
+        $store = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$store) {
+            $store[$key] = $value;
+        });
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use (&$store) {
+            return $store[$key] ?? null;
+        });
+        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store) {
+            unset($store[$key]);
+        });
+
+        $this->assertFalse($service->hasOperationCooldown('hash9'));
+        $service->armOperationCooldown('hash9', 600);
+        $this->assertTrue($service->hasOperationCooldown('hash9'));
+        $service->clearOperationCooldown('hash9');
+        $this->assertFalse($service->hasOperationCooldown('hash9'));
+    }
+
+    public function testHasOperationCooldownReturnsFalseWhenCacheReturnsFalse(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturn(false);
+
+        $this->assertFalse($service->hasOperationCooldown('missinghash'));
+    }
+
+    public function testIsEntryStaleEntryPathAloneFiresWithoutWatermark(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $now = time();
+        $meta = [
+            'refreshedAt'   => $now - 100,
+            'invalidatedAt' => $now - 50,
+            'client' => 'c1',
+            'operation' => 'TestOp',
+        ];
+        $payload = ['data' => ['x' => 1]];
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload) {
+            if ($key === 'datahub_graphql_fallback_watermark_ts') {
+                return 0;
+            }
+            if (str_starts_with($key, 'persistent_output_meta_')) {
+                return $meta;
+            }
+            if (str_starts_with($key, 'persistent_output_payload_')) {
+                return $payload;
+            }
+
+            return null;
+        });
+        $service->method('cacheSave')->willReturnCallback(function () {
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $response = $service->preHandle($request, $this->makeResponseService());
+
+        $this->assertInstanceOf(JsonResponse::class, $response);
+        $this->assertSame('STALE', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
+        $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_refresh'));
+    }
+
+    public function testIsEntryStaleEqualTimestampReadAsFresh(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $now = time();
+        $meta = [
+            'refreshedAt'   => $now,
+            'invalidatedAt' => $now,
+            'client' => 'c1',
+            'operation' => 'TestOp',
+        ];
+        $payload = ['data' => ['x' => 1]];
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload) {
+            if ($key === 'datahub_graphql_fallback_watermark_ts') {
+                return 0;
+            }
+            if (str_starts_with($key, 'persistent_output_meta_')) {
+                return $meta;
+            }
+            if (str_starts_with($key, 'persistent_output_payload_')) {
+                return $payload;
+            }
+
+            return null;
+        });
+        $service->method('cacheSave')->willReturnCallback(function () {
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $response = $service->preHandle($request, $this->makeResponseService());
+
+        $this->assertInstanceOf(JsonResponse::class, $response);
+        $this->assertSame('HIT', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
+    }
+
+    public function testIsEntryStaleWatermarkPathPreservesBackCompat(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $now = time();
+        $meta = [
+            'refreshedAt' => $now - 100,
+            'client' => 'c1',
+            'operation' => 'TestOp',
+        ];
+        $payload = ['data' => ['x' => 1]];
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload, $now) {
+            if ($key === 'datahub_graphql_fallback_watermark_ts') {
+                return $now;
+            }
+            if (str_starts_with($key, 'persistent_output_meta_')) {
+                return $meta;
+            }
+            if (str_starts_with($key, 'persistent_output_payload_')) {
+                return $payload;
+            }
+
+            return null;
+        });
+        $service->method('cacheSave')->willReturnCallback(function () {
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $response = $service->preHandle($request, $this->makeResponseService());
+
+        $this->assertInstanceOf(JsonResponse::class, $response);
+        $this->assertSame('STALE', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
+    }
+
+    public function testIsEntryStaleReturnsFreshWhenInvalidatedAtNotExceedsRefreshedAt(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $now = time();
+        $meta = [
+            'refreshedAt'   => $now,
+            'invalidatedAt' => $now - 50,
+            'client' => 'c1',
+            'operation' => 'TestOp',
+        ];
+        $payload = ['data' => ['x' => 1]];
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload) {
+            if ($key === 'datahub_graphql_fallback_watermark_ts') {
+                return 0;
+            }
+            if (str_starts_with($key, 'persistent_output_meta_')) {
+                return $meta;
+            }
+            if (str_starts_with($key, 'persistent_output_payload_')) {
+                return $payload;
+            }
+
+            return null;
+        });
+
+        $saves = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saves) {
+            $saves[] = $key;
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $response = $service->preHandle($request, $this->makeResponseService());
+
+        $this->assertInstanceOf(JsonResponse::class, $response);
+        $this->assertSame('HIT', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
+    }
+
+    public function testPreHandleReturnsStaleForPerEntryInvalidatedAtWithoutWatermark(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $now = time();
+        $meta = [
+            'refreshedAt'   => $now - 200,
+            'invalidatedAt' => $now - 100,
+            'client' => 'c1',
+            'operation' => 'TestOp',
+        ];
+        $payload = ['data' => ['x' => 1]];
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload) {
+            if ($key === 'datahub_graphql_fallback_watermark_ts') {
+                return 0;
+            }
+            if (str_starts_with($key, 'persistent_output_meta_')) {
+                return $meta;
+            }
+            if (str_starts_with($key, 'persistent_output_payload_')) {
+                return $payload;
+            }
+
+            return null;
+        });
+        $service->method('cacheSave')->willReturnCallback(function () {
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $response = $service->preHandle($request, $this->makeResponseService());
+
+        $this->assertInstanceOf(JsonResponse::class, $response);
+        $this->assertSame('STALE', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
+        $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_refresh'));
+    }
+
+    public function testProbeStatusReportsStaleForPerEntryInvalidatedAt(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $now = time();
+        $meta = [
+            'refreshedAt'   => $now - 200,
+            'invalidatedAt' => $now - 100,
+            'client' => 'c1',
+        ];
+        $payload = ['data' => ['x' => 1]];
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta, $payload) {
+            if ($key === 'datahub_graphql_fallback_watermark_ts') {
+                return 0;
+            }
+            if (str_contains($key, 'meta_')) {
+                return $meta;
+            }
+            if (str_contains($key, 'payload_')) {
+                return $payload;
+            }
+
+            return null;
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $probe = $service->probeStatus($request);
+
+        $this->assertTrue($probe['applies']);
+        $this->assertSame('STALE', $probe['status']);
+    }
+
+    public function testStampInvalidatedAtWritesIntoMetaBlobPreservingExistingKeys(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+                'persistent_output_cache_lifetime' => 60,
+            ])])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $now = time();
+        $meta = [
+            'refreshedAt' => $now - 100,
+            'client'      => 'c1',
+            'operation'   => 'SomeOp',
+            'tags'        => ['datahub_graphql_persistent', 'datahub_graphql_op_SomeOp'],
+        ];
+
+        $saved = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
+            $saved[] = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $service->stampInvalidatedAt('persistent_output_meta_abc', $meta, $now);
+
+        $this->assertCount(1, $saved);
+        $this->assertSame('persistent_output_meta_abc', $saved[0]['key']);
+        $this->assertArrayHasKey('invalidatedAt', $saved[0]['value']);
+        $this->assertSame($now, $saved[0]['value']['invalidatedAt']);
+        $this->assertArrayHasKey('refreshedAt', $saved[0]['value'], 'existing meta keys must be preserved');
+        $this->assertSame($now - 100, $saved[0]['value']['refreshedAt']);
+        $this->assertArrayHasKey('client', $saved[0]['value']);
+        $this->assertSame(['datahub_graphql_persistent', 'datahub_graphql_op_SomeOp'], $saved[0]['tags']);
+    }
+
+    public function testStampInvalidatedAtFallsBackToTagCommonWhenMetaHasNoTags(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+                'persistent_output_cache_lifetime' => 60,
+            ])])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $now = time();
+        $meta = [
+            'refreshedAt' => $now - 100,
+            'client'      => 'c1',
+            'operation'   => 'SomeOp',
+        ];
+
+        $saved = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
+            $saved[] = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $service->stampInvalidatedAt('persistent_output_meta_abc', $meta, $now);
+
+        $this->assertCount(1, $saved);
+        $this->assertSame([PersistentOutputCacheService::TAG_COMMON], $saved[0]['tags']);
+    }
+
+    public function testStampInvalidatedAtSwallowsCacheSaveFailure(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+                'persistent_output_cache_lifetime' => 60,
+            ])])
+            ->onlyMethods(['cacheSave'])
+            ->getMock();
+
+        $service->method('cacheSave')->willThrowException(new \RuntimeException('cache down'));
+
+        $meta = ['refreshedAt' => time() - 100, 'operation' => 'Op'];
+
+        $this->expectNotToPerformAssertions();
+        $service->stampInvalidatedAt('some_meta_key', $meta, time());
+    }
+
+    public function testWindowEndsAtReturnsLastRefreshAtPlusCooldown(): void
+    {
+        $service = new PersistentOutputCacheService($this->makeContainer([
+            'persistent_output_cache_enabled' => true,
+        ]));
+
+        $lastRefreshAt = 1_000_000;
+        $cooldown = 3600;
+        $meta = ['lastRefreshAt' => $lastRefreshAt];
+
+        $this->assertSame($lastRefreshAt + $cooldown, $service->windowEndsAt($meta, $cooldown));
+        $this->assertSame($cooldown, $service->windowEndsAt([], $cooldown), 'absent lastRefreshAt treated as 0');
+    }
+
+    public function testClearPendingFlagRaisesOnCacheFault(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheRemove'])
+            ->getMock();
+
+        $service->method('cacheRemove')->willThrowException(new \RuntimeException('cache down'));
+
+        $this->expectException(\RuntimeException::class);
+        $service->clearPendingFlag('somehash');
+    }
+
+    public function testLoadPendingFlagReturnsTrueWhenCacheHit(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturn('1');
+
+        $this->assertTrue($service->loadPendingFlag('somehash'));
+    }
+
+    public function testLoadPendingFlagReturnsFalseWhenCacheMiss(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturn(false);
+
+        $this->assertFalse($service->loadPendingFlag('somehash'));
+    }
+
+    public function testClearEnqueueDedupeRaisesOnCacheFault(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheRemove'])
+            ->getMock();
+
+        $service->method('cacheRemove')->willThrowException(new \RuntimeException('cache down'));
+
+        $this->expectException(\RuntimeException::class);
+        $service->clearEnqueueDedupe('somehash');
+    }
+
+    /**
+     * @dataProvider providePastCooldownCases
+     */
+    public function testIsPastCooldown(?int $lastRefreshAt, int $cooldown, int $now, bool $expected): void
+    {
+        $service = new PersistentOutputCacheService($this->makeContainer([
+            'persistent_output_cache_enabled' => true,
+        ]));
+
+        $meta = $lastRefreshAt === null ? ['operation' => 'Op'] : ['lastRefreshAt' => $lastRefreshAt];
+
+        $this->assertSame($expected, $service->isPastCooldown($meta, $cooldown, $now));
+    }
+
+    public static function providePastCooldownCases(): array
+    {
+        return [
+            'absent lastRefreshAt is past any cooldown' => [null, 600, 1_000_000, true],
+            'inside window is not past' => [1_000_000, 600, 1_000_300, false],
+            'exactly at boundary is past (>=)' => [1_000_000, 600, 1_000_600, true],
+            'beyond window is past' => [1_000_000, 600, 1_000_900, true],
+        ];
+    }
+
+    public function testSavePersistentRefreshedAtReadsStartAttributeWhenPresent(): void
+    {
+        $service = $this->makeSaveCapturingService();
+        $saved = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
+            $saved[] = compact('key', 'value');
+        });
+
+        $start = time() - 5;
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'Op']);
+        $request->attributes->set('_datahub_persistent_refresh_started_at', $start);
+
+        $before = time();
+        $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
+        $after = time();
+
+        $meta = $this->onlyMeta($saved);
+        $this->assertArrayHasKey('lastRefreshAt', $meta, 'savePersistent must write lastRefreshAt into meta');
+        $this->assertSame($start, $meta['refreshedAt'], 'refreshedAt must anchor to the refresh-start attribute');
+        $this->assertGreaterThanOrEqual($before, $meta['lastRefreshAt']);
+        $this->assertLessThanOrEqual($after, $meta['lastRefreshAt']);
+        $this->assertNotSame($meta['refreshedAt'], $meta['lastRefreshAt'], 'start and completion clocks must be distinct here');
+    }
+
+    public function testSavePersistentRefreshedAtFallsBackToNowWhenStartAttributeAbsent(): void
+    {
+        $service = $this->makeSaveCapturingService();
+        $saved = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
+            $saved[] = compact('key', 'value');
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'Op']);
+
+        $before = time();
+        $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
+        $after = time();
+
+        $meta = $this->onlyMeta($saved);
+        $this->assertGreaterThanOrEqual($before, $meta['refreshedAt']);
+        $this->assertLessThanOrEqual($after, $meta['refreshedAt']);
+        $this->assertSame($meta['refreshedAt'], $meta['lastRefreshAt'], 'first-write start ≈ completion');
+    }
+
+    public function testFreshHitRepaintLeavesRefreshedAtUnchanged(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'herd_guarded', 'granularity' => 'list'],
+        ]);
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $refreshedAt = time() - 7;
+        $meta = [
+            'refreshedAt' => $refreshedAt,
+            'client' => 'c1',
+            'operation' => 'TestOp',
+            'tags' => ['datahub_graphql_persistent'],
+        ];
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta) {
+            if (str_starts_with($key, 'persistent_output_meta_')) {
+                return $meta;
+            }
+            if (str_starts_with($key, 'persistent_output_payload_')) {
+                return ['data' => ['x' => 1]];
+            }
+
+            return null;
+        });
+
+        $saves = [];
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saves) {
+            $saves[] = compact('key', 'value');
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $response = $service->preHandle($request, $this->makeResponseService());
+
+        $this->assertSame('HIT', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
+        $metaSave = $this->onlyMeta($saves);
+        $this->assertSame($refreshedAt, $metaSave['refreshedAt'], 'FRESH-HIT repaint must not advance refreshedAt (it is a refresh-event clock, not a TTL marker)');
+    }
+
+    public function testPreHandleReportsStaleForEditLandingMidRefresh(): void
+    {
+        // With refreshedAt anchored to the refresh START (S), an edit recorded
+        // at t where S < t < completion must leave the entry STALE on the next read.
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 10,
+        ];
+        $classifier = $this->makeClassifier([
+            'TestOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $start = 1_000_000;
+        $edit = 1_000_003;   // S < t
+        $meta = [
+            'refreshedAt'   => $start,
+            'invalidatedAt' => $edit,
+            'client' => 'c1',
+            'operation' => 'TestOp',
+        ];
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use ($meta) {
+            if ($key === 'datahub_graphql_fallback_watermark_ts') {
+                return 0;
+            }
+            if (str_starts_with($key, 'persistent_output_meta_')) {
+                return $meta;
+            }
+            if (str_starts_with($key, 'persistent_output_payload_')) {
+                return ['data' => ['x' => 1]];
+            }
+
+            return null;
+        });
+        $service->method('cacheSave')->willReturnCallback(function () {
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TestOp']);
+        $response = $service->preHandle($request, $this->makeResponseService());
+
+        $this->assertSame('STALE', $response->headers->get('X-Pimcore-DataHub-Persistent-Cache'));
+        $this->assertTrue((bool)$request->attributes->get('_datahub_persistent_refresh'));
+    }
+
+    private function makeSaveCapturingService(): PersistentOutputCacheService
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 12,
+            'persistent_output_cache_payload_ttl' => 3456,
+        ];
+        $classifier = $this->makeClassifier([
+            'Op' => ['tier' => 'swr_only', 'granularity' => 'single'],
+        ]);
+
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+        $service->method('cacheLoad')->willReturn(null);
+
+        return $service;
+    }
+
+    /**
+     * @param list<array{key: string, value: mixed}> $saved
+     *
+     * @return array<string, mixed>
+     */
+    private function onlyMeta(array $saved): array
+    {
+        foreach ($saved as $call) {
+            if (str_starts_with($call['key'], 'persistent_output_meta_')) {
+                return $call['value'];
+            }
+        }
+        $this->fail('no meta save observed');
+    }
 }

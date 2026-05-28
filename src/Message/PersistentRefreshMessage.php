@@ -23,15 +23,36 @@ final class PersistentRefreshMessage
         public readonly string $client,
         public readonly string $bodyJson,
         public readonly ?string $operationName = null,
-        public readonly ?int $refreshedAt = null,
+        public readonly ?int $scoreBaseline = null,
         /**
-         * Per-operation priority weight sourced from {@see \Pimcore\Bundle\DataHubBundle\Service\OperationClassifier::getPriorityWeight()}.
-         * Threaded through the message envelope as a forward-compatible scoring input;
-         * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()} currently orders solely by
-         * {@see self::$refreshedAt} and ignores this value. Future scoring strategies that blend staleness with
-         * per-operation weight will consume it without a schema change to the message.
+         * Per-operation priority weight consumed by {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
+         * under the `oldest_refreshed_at_first_with_weight_bands` strategy to offset the score
+         * by `priorityWeight × weightBandSeconds`.
          */
-        public readonly ?int $priorityWeight = null
+        public readonly ?int $priorityWeight = null,
+        /**
+         * Absolute earliest-delivery Unix timestamp for scheduled (delayed) refreshes.
+         * When non-null, {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
+         * uses it verbatim as the queue score, so the message stays invisible to
+         * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::get()} until
+         * `now >= deliverAt`. Encoded as an absolute timestamp (not a relative delay) so the
+         * transport's visibility-timeout reaper re-derives the same due-time from the envelope
+         * and a reaped scheduled message keeps its original schedule. Null = immediate delivery.
+         */
+        public readonly ?int $deliverAt = null,
+        /**
+         * Read-vs-warm discriminator. True only for refreshes triggered by a genuine
+         * HTTP read on kernel.terminate; false (the default) for every speculative warm
+         * dispatched from the invalidation listener or re-dispatched by the worker.
+         * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
+         * subtracts a constant read-trigger offset from a read's score so demand-driven
+         * reads sort strictly below every warm of the same scoreBaseline. Reads must not
+         * carry a deliverAt; the constructor enforces this as an invariant.
+         */
+        public readonly bool $readTriggered = false
     ) {
+        if ($this->readTriggered && $this->deliverAt !== null) {
+            throw new \InvalidArgumentException('A read-triggered refresh cannot be scheduled (deliverAt must be null).');
+        }
     }
 }

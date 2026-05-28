@@ -25,14 +25,14 @@ use Pimcore\Bundle\DataHubBundle\Tests\Functional\Fixtures\KernelTestCase;
  * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport}:
  *
  *  - Under `oldest_refreshed_at_first`, three messages with non-monotonic
- *    refreshedAt timestamps drain lowest-score-first.
+ *    scoreBaseline values drain lowest-score-first.
  *  - Under `oldest_refreshed_at_first_with_weight_bands`, a per-op
  *    priority_weight bumps a later-refreshed message ahead of an earlier
  *    sibling.
  *
  * Assertions correlate each ZSET id's score back to the decoded envelope's
- * `refreshedAt` (and, under the band strategy, the `priorityWeight` offset)
- * via {@see KernelTestCase::envelopeRefreshedAtById()}. A transport bug that
+ * `scoreBaseline` (and, under the band strategy, the `priorityWeight` offset)
+ * via {@see KernelTestCase::envelopeScoreBaselineById()}. A transport bug that
  * preserved the sorted score set but scrambled id→envelope pairings would
  * break the per-row correlation here without surfacing on score sequence
  * alone.
@@ -49,21 +49,21 @@ final class PriorityQueueTest extends KernelTestCase
         $bus->dispatch($this->newMessage('getTestSwrOnlyItemListing', $t90));
         $bus->dispatch($this->newMessage('getTestSwrOnlyItemListing', $t60));
 
-        $rows = $this->envelopeRefreshedAtById();
+        $rows = $this->envelopeScoreBaselineById();
         self::assertCount(3, $rows);
 
         foreach ($rows as $id => $row) {
             self::assertEqualsWithDelta(
-                $row['message']->refreshedAt,
+                $row['message']->scoreBaseline,
                 $row['score'],
                 1,
-                'id ' . $id . ': score must match envelope refreshedAt under default strategy'
+                'id ' . $id . ': score must match envelope scoreBaseline under default strategy'
             );
         }
 
         $scores = array_values(array_map(static fn (array $row): float => $row['score'], $rows));
         sort($scores);
-        self::assertEqualsWithDelta($t90, $scores[0], 1, 'sorted-score regression floor: oldest refreshedAt yields the lowest ZSET score');
+        self::assertEqualsWithDelta($t90, $scores[0], 1, 'sorted-score regression floor: oldest scoreBaseline yields the lowest ZSET score');
     }
 
     public function testBandStrategyBumpsHigherWeightAheadOfEarlierSibling(): void
@@ -74,15 +74,15 @@ final class PriorityQueueTest extends KernelTestCase
         $bus->dispatch($this->newMessage('getTestSwrGuardedItemListing', $t30, 1));
         $bus->dispatch($this->newMessage('getTestSwrGuardedItemListing', $t10, 5));
 
-        $rows = $this->envelopeRefreshedAtById();
+        $rows = $this->envelopeScoreBaselineById();
         self::assertCount(2, $rows);
 
         foreach ($rows as $id => $row) {
             self::assertEqualsWithDelta(
-                $row['message']->refreshedAt - (($row['message']->priorityWeight ?? 1) * 60),
+                $row['message']->scoreBaseline - (($row['message']->priorityWeight ?? 1) * 60),
                 $row['score'],
                 1,
-                'id ' . $id . ': score must match band-offset transform of envelope refreshedAt and priorityWeight'
+                'id ' . $id . ': score must match band-offset transform of envelope scoreBaseline and priorityWeight'
             );
         }
     }

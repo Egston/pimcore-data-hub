@@ -117,8 +117,10 @@ during an in-flight refresh:
 ### `persistent_output_meta_<hash>`
 
 - **What it stores:** a small associative array with `refreshedAt`,
-  the client name, operation name, canonical request body,
-  `payloadSavedAt`, `payloadTtl`, and the tag list.
+  `invalidatedAt` (stamped by the invalidation listener so the per-entry
+  freshness predicate can detect invalidations without relying solely on
+  the global watermark), the client name, operation name, canonical request
+  body, `payloadSavedAt`, `payloadTtl`, and the tag list.
 - **Set by:** `savePersistent` alongside the payload, and re-saved on
   every FRESH HIT (rolls `refreshedAt` forward).
 - **TTL:** controlled by the `ttl` knob (typically shorter than the
@@ -130,10 +132,10 @@ during an in-flight refresh:
 
 - **What it stores:** the literal value `1` — its presence is the
   signal, the value carries no meaning.
-- **Set by:**
-  - the invalidation listener when it dispatches a refresh message;
-  - the read-path terminate listener when it dispatches a refresh
-    after serving a STALE response.
+- **Set by:** the invalidation listener when it dispatches a refresh message.
+  The read path no longer writes this sentinel at dispatch time — transient
+  read duplicates are absorbed by the execution-time freshness guard and the
+  per-entry refresh lock in the worker.
 - **TTL:** `persistent_enqueue_dedupe_ttl`, currently **300 seconds**
   in production config. Per-operation overrides via
   `enqueue_dedup_ttl_override`. **Not renewed in flight** — the value
@@ -165,6 +167,64 @@ during an in-flight refresh:
   refresh is mid-flight. The current refresh started reading data
   *before* those invalidations landed, so its written payload would
   already be stale on commit. The trailing refresh covers them all.
+
+### `datahub_graphql_op_cooldown_<hash>` — the invalidation-cooldown sentinel
+
+- **What it stores:** the literal value `1`. Same shape as the dedupe
+  sentinel and pending flag; presence is the signal.
+- **Set by:** the invalidation listener when it handles the first
+  invalidation in a window for an operation that carries an
+  `invalidation_cooldown_ttl`. Armed *instead of* dispatching an
+  immediate refresh — the listener instead dispatches a single dated
+  refresh message (see *Invalidation cooldown* below).
+- **TTL:** the operation's `invalidation_cooldown_ttl` (6h in
+  production for the translation-verification listings). Tagged
+  `TAG_WATERMARK`, not `TAG_COMMON`, so an SWR-layer `clearAll()`
+  preserves it — otherwise a clear would orphan the queued dated
+  refresh and let the next edit double-dispatch.
+- **Released by:** the worker on successful completion of the dated
+  refresh, opening a fresh window. On failure it is left to TTL-expire
+  near its `deliverAt`.
+- **What it prevents:** a full-listing refresh on every per-edit
+  invalidation of an expensive batch-verification view. While the
+  sentinel is present, further invalidations of the same entry are
+  suppressed — a dated refresh is already queued for the window.
+
+## Invalidation cooldown (per-operation refresh throttle)
+
+Operations carrying an `invalidation_cooldown_ttl` (the coarse
+translation-verification listings) take a throttled path on the
+invalidation side. Operations with a coarse listing granularity carry
+`granularity: list`, so a save on any contributing DataObject class
+would otherwise invalidate the whole listing and trigger a full refresh
+— once per edit. A translator marking items verified one-by-one would
+drive a full refresh per click.
+
+Instead, the first invalidation in a cooldown window:
+
+1. arms the `datahub_graphql_op_cooldown_<hash>` sentinel (TTL = the
+   cooldown window), and
+2. dispatches a single `PersistentRefreshMessage` carrying an absolute
+   `deliverAt = now + cooldown`.
+
+The dated message sits in the priority queue, invisible, until its
+`deliverAt` elapses; it then pops and refreshes the entry against
+then-current data, reflecting every edit made during the window. The
+worker clears the sentinel on success, opening the next window. Further
+invalidations while the sentinel is live are no-ops — a dated refresh is
+already queued.
+
+This is a pure trailing-edge throttle: N edits in one window collapse to
+exactly one refresh, fired `cooldown` after the first edit. There is no
+periodic poller — the dated message *is* the timer; a window with no
+edits queues nothing.
+
+**The read path is unchanged for these operations.** The cooldown guards
+only the invalidation→enqueue side. A targeted invalidation of a
+cooldown op does not move any watermark, so reads continue to serve a
+HIT carrying knowingly-slightly-stale data until the scheduled refresh
+lands. The global-watermark fallback still stales these ops normally
+when it fires.
 
 ## Determining freshness: the watermark
 
@@ -240,12 +300,11 @@ gets silently dropped, even when the primary path can't help.
 
 A single bump cascades through the entire cache: every cached query
 becomes STALE on its next read. Every reader then triggers a
-read-path refresh dispatch (one per distinct query). If a popular
-query is accessed by many concurrent clients in the brief window
-after a watermark bump, the dispatch path absorbs the burst via the
-sentinel — only one dispatch lands, the rest see "sentinel present"
-and skip — but the dispatch volume can still be substantial under
-high traffic.
+read-path refresh dispatch (one per distinct query). Transient
+duplicate dispatches for the same query are absorbed by the
+execution-time freshness guard (the worker skips a refresh if the
+entry is already fresh) and the per-entry refresh lock in the worker,
+but the dispatch volume can still be substantial under high traffic.
 
 This is why the primary path is preferred: a per-query dispatch
 only schedules N refreshes (where N = queries that actually depend on
@@ -424,9 +483,20 @@ Messenger Doctrine transport. The ZSET score determines pop order:
 
 - `oldest_refreshed_at_first` (default): score = the entry's
   `refreshedAt` timestamp, so the longest-stale messages pop first.
-- `oldest_refreshed_at_first_with_weight_bands`: same baseline minus
-  `priority_weight × band_seconds`, so higher-weight operations drop
-  into an earlier band.
+- `oldest_refreshed_at_first_with_weight_bands`: two priority classes share
+  **one** band-width knob (`persistent_refresh_priority_weight_band_seconds`).
+  Warm messages (invalidation-triggered) use `priority_weight`; read messages
+  (demand-triggered) use `read_priority_weight`. The score for both classes is
+  the same formula: `refreshedAt − weight × band_seconds`. The read class is
+  separated from the warm class by a large fixed offset
+  (`persistent_refresh_priority_read_trigger_offset_seconds`, default 86400s)
+  **subtracted** from every read message's effective score (ZSET pops
+  lowest-score-first), ensuring every demand-driven read sorts strictly below
+  every speculative warm of the same `refreshedAt`. Within each class,
+  higher-weight operations drop into an earlier band.
+  Constraint: the offset must exceed `persistent_refresh_priority_max_weight ×
+  persistent_refresh_priority_weight_band_seconds`; the factory validates this
+  at startup under the weighted-bands strategy.
 
 A single worker pod runs `messenger:consume` against this transport
 (`replicas: 1` in the worker chart). Worker parallelism is therefore
@@ -445,6 +515,36 @@ the worker.
 | Sentinel TTL expires mid-refresh (because refresh is unusually long, or queue is unusually deep) | New invalidations after the expiry trigger fresh dispatches → duplicate refresh messages queue behind the in-flight one → wasted work, no correctness loss | Tune `persistent_enqueue_dedupe_ttl` to comfortably exceed worst-case (queue wait + refresh duration). See *Tuning notes* below. |
 | Reverse index entry malformed | Listener logs per-entry warning, skips the entry; never amplifies a data-shape bug into a global watermark bump. | Surface the warnings in logs; bad entries naturally cycle out as their payloads age out. |
 | Bundle-level fatal (entire SWR layer broken) | `clearAll()` drops every payload + meta + reverse-index entry, **preserving** the watermark so freshly-written entries don't all look FRESH until the next external invalidation. | Re-enable SWR, traffic warms the cache organically. |
+
+## Observability
+
+The layer narrates every decision through `\Pimcore\Logger` (the Pimcore
+application logger) under four greppable message prefixes — one per
+moving part:
+
+| Prefix | Emitted by | What it tells you |
+|---|---|---|
+| `persistent_cache_invalidation` | the invalidation listener | which entries an edit invalidated; per-query dispatch vs. coalesce vs. watermark-bump; cooldown arm / "dated refresh already queued" decisions |
+| `datahub.refresh_dispatch` | the read path (`kernel.terminate`) | a stale read enqueued a refresh (operation / client / variables / request URI) |
+| `datahub.refresh_handler` | the refresh worker | a queued refresh started / completed (duration, peak memory), lock-contention requeues, trailing-refresh and cooldown-window-close dispatches |
+| `datahub.swr` | `PersistentOutputCacheService` | cache-save / HIT-repaint outcomes and malformed-meta guards on the read path |
+
+These lines land wherever the application logger's Monolog handler is
+configured to write — commonly `var/log/<kernel-env>.log`, plus a
+`var/log/<kernel-env>-debug.log` variant when the deployment enables a
+debug-level file handler. To watch all four live:
+
+```
+tail -f var/log/<kernel-env>-debug.log \
+  | grep -iE "datahub\.(refresh_handler|refresh_dispatch|swr)|persistent_cache_invalidation"
+```
+
+Use the **debug** log: several lines — notably the `refresh_handler`
+message-drop reasons (unclassified op, missing operation name) and the
+malformed-reverse-index guards — are emitted at `debug` level and won't
+appear in an error-only log. Note that `refresh_handler` lines originate
+in the worker process, so they only share a log file with the dispatch /
+invalidation side if the worker and FPM write to the same path.
 
 ## Tuning notes
 

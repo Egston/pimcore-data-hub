@@ -490,6 +490,7 @@ All prefixes defined as `PersistentOutputCacheService` constants:
 | `META_KEY_PREFIX` | `persistent_output_meta_` | Per-entry metadata (refreshedAt, tags, ...) |
 | `ENQUEUE_DEDUPE_PREFIX` | `datahub_enqueue_req_` | Dispatch-dedupe sentinel |
 | `PENDING_REFRESH_PREFIX` | `datahub_pending_refresh_` | Coalesce flag (worker reads → trailing dispatch) |
+| `KEY_OP_COOLDOWN_PREFIX` | `datahub_graphql_op_cooldown_` | Invalidation-cooldown sentinel (per entry, tagged `TAG_WATERMARK`) |
 | `KEY_FALLBACK_WATERMARK_TS` | `datahub_graphql_fallback_watermark_ts` | Global watermark |
 | `REVERSE_INDEX_PREFIX` | `taginx_` | Tag → list of (payloadKey, metaKey) pairs |
 | `INDEX_ALL` | `datahub_graphql_persistent_index_all` | Membership: all keys |
@@ -579,7 +580,11 @@ Send: MULTI / ZADD + HSET messages / EXEC. On re-send (id already in
 inflight) the score is bumped by `persistent_refresh_priority_requeue_score_bump`
 to demote contended messages so freshly-stale ones drain first.
 
-Get: ZPOPMIN + HGET messages + HSET inflight in MULTI/EXEC.
+Get: ZRANGEBYSCORE (lowest-scored member with score `<= now`, LIMIT 1)
+then ZREM + HGET messages + HSET inflight in MULTI/EXEC. The
+score-bounded read is the scheduled-delivery gate (see below); the
+non-atomic ZRANGEBYSCORE+ZREM is safe only at `replicas: 1` (a Lua wrap
+would be required to scale the refresh worker past one consumer).
 
 Ack / reject: HDEL on both messages and inflight.
 
@@ -590,6 +595,24 @@ Score strategies (`persistent_refresh_priority_strategy`):
 | `oldest_refreshed_at_first` (default) | `PersistentRefreshMessage::refreshedAt` — longest-stale pops first |
 | `oldest_refreshed_at_first_with_weight_bands` | same minus `priority_weight × band_seconds` — higher-weight ops drop into earlier bands |
 | `disabled` | no scoring — FIFO equivalent |
+
+### Scheduled (delayed) delivery
+
+A `PersistentRefreshMessage` carrying a non-null `deliverAt` (an absolute
+Unix timestamp) short-circuits the score strategies: its queue score *is*
+its `deliverAt`. Because `get()` reads only members whose score is
+`<= now` via ZRANGEBYSCORE, a future-dated message stays invisible until
+its due-time elapses, then pops and runs like any other message —
+preserving longest-stale-first ordering among all due messages. This is
+the primitive the per-operation invalidation cooldown is built on: one
+dated refresh per window instead of one per edit (see the cooldown
+section of `Persistent-Cache-Flow.md`).
+
+`deliverAt` is encoded as an absolute timestamp rather than a relative
+delay so the reaper's score re-derivation (it decodes the stuck
+envelope and re-runs `scoreFor`) reproduces the same due-time — a reaped
+scheduled message keeps its original schedule instead of drifting later
+each reap.
 
 Reaper / visibility timeout: `persistent_refresh_priority_visibility_timeout`
 (600s) re-queues messages stuck in `inflight` longer than the
@@ -637,11 +660,21 @@ Per-operation overrides (in `operations:` config block):
 
 - `ttl_override` — freshness TTL for this op
 - `enqueue_dedup_ttl_override` — sentinel TTL for this op
-- `priority_weight` — score offset for `oldest_refreshed_at_first_with_weight_bands`
+- `priority_weight` — warm-class weight: score offset applied per unit for
+  invalidation-triggered (speculative) refreshes under the weighted-bands strategy
+- `read_priority_weight` — read-class weight: score offset applied per unit for
+  demand-driven (read-triggered) refreshes under the weighted-bands strategy;
+  defaults to 1 when absent. Reads always sort below warms because the read
+  trigger adds a large fixed offset to the score; `read_priority_weight` only
+  orders reads among themselves.
+- `invalidation_cooldown_ttl` — when set, the invalidation path throttles
+  refreshes of this op to once per window via a dated refresh message + the
+  `datahub_graphql_op_cooldown_<hash>` sentinel (null = immediate per-edit
+  refresh). Used for the coarse translation-verification listings.
 
 Built into `OperationClassifier` at boot; consulted by
-`savePersistent` (TTL), the listener (dedupe TTL), and the transport
-(priority weight).
+`savePersistent` (TTL), the listener (dedupe TTL, cooldown), and the
+transport (priority weight).
 
 ## Configuration knobs
 
@@ -662,7 +695,8 @@ knobs, with bundle defaults:
 | `persistent_refresh_queue_enabled` | false | Use Messenger queue vs inline kernel.terminate |
 | `persistent_enqueue_dedupe_ttl` | 60 | Dispatch dedupe sentinel TTL |
 | `persistent_refresh_priority_strategy` | `oldest_refreshed_at_first` | Queue ordering |
-| `persistent_refresh_priority_weight_band_seconds` | 60 | Band width for weighted strategy |
+| `persistent_refresh_priority_weight_band_seconds` | 60 | Band width applied per unit of warm or read weight under the weighted-bands strategy |
+| `persistent_refresh_priority_max_weight` | 100 | Maximum assignable warm/read weight; bounds the worst-case warm-band span for offset-dominance validation |
 | `persistent_refresh_priority_visibility_timeout` | 600 | Stuck-message reaper threshold |
 | `persistent_refresh_priority_requeue_score_bump` | 5 | Score penalty on re-send |
 | `swr_cold_miss_lock_wait_ms` | 5000 | Cold-miss loser wait |

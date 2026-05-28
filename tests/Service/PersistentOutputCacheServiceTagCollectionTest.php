@@ -265,8 +265,15 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
         self::assertSame([['EmptyOp', 'c1']], $observed);
     }
 
-    public function testSavePersistentListGranularityWithEmptyCollectorDoesNotWarn(): void
+    public function testSavePersistentListGranularityWithEmptyCollectorAlsoLogsWarning(): void
     {
+        // A LIST op that resolves without firing POST_LOAD on any element produces
+        // a cache write with no per-class tags — no reverse-index entry is added,
+        // and invalidation can never find this query. Previously the warning was
+        // scoped to SINGLE granularity, leaving LIST as a silent failure surface;
+        // the symptom was a listing that stayed served from cache forever despite
+        // editor saves. Warning must fire for any classified op with an empty
+        // collector.
         $graphql = [
             'persistent_output_cache_enabled' => true,
             'persistent_output_cache_lifetime' => 12,
@@ -285,7 +292,9 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
             ->getMock();
         $service->method('cacheLoad')->willReturn(null);
         $service->method('cacheSave');
-        $service->expects(self::never())->method('logCollectorEmptyOnSave');
+        $service->expects(self::once())
+            ->method('logCollectorEmptyOnSave')
+            ->with('EmptyListOp', 'c1');
 
         $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'EmptyListOp']);
         $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));

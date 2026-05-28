@@ -70,12 +70,22 @@ class PersistentOutputCacheService
     public const ENQUEUE_DEDUPE_PREFIX = 'datahub_enqueue_req_';
 
     /**
-     * Sibling to ENQUEUE_DEDUPE_PREFIX, keyed by the same sha256 hash. Set
-     * by the listener when an invalidation coalesces against an in-flight
-     * dispatch; cleared by the worker, which fires a trailing refresh when
-     * the flag was set during processing.
+     * Sibling to ENQUEUE_DEDUPE_PREFIX, keyed by entryHash(). Set by the
+     * listener when an invalidation coalesces against an in-flight dispatch;
+     * cleared by the worker, which fires a trailing refresh when the flag was
+     * set during processing.
      */
     public const PENDING_REFRESH_PREFIX = 'datahub_pending_refresh_';
+
+    /**
+     * Per-entry trailing-edge cooldown sentinel for invalidation throttling,
+     * keyed by entryHash(). Armed by the invalidation listener when it
+     * schedules a dated refresh for a cooldown-configured operation; cleared
+     * by the worker after that refresh lands. While present, further
+     * invalidations of the same entry are suppressed (a dated refresh is
+     * already queued for the window).
+     */
+    public const KEY_OP_COOLDOWN_PREFIX = 'datahub_graphql_op_cooldown_';
 
     public const INDEX_ALL = 'datahub_graphql_persistent_index_all';
 
@@ -165,7 +175,7 @@ class PersistentOutputCacheService
         $now = time();
         $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
         $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
-        $isStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
+        $isStale = $this->isEntryStale($meta, $fallbackWatermark);
         $response = new JsonResponse($payload);
         $responseService->addCorsHeaders($response);
 
@@ -182,9 +192,12 @@ class PersistentOutputCacheService
             return $response;
         }
 
-        // FRESH HIT: extend TTL and return response immediately
+        // FRESH HIT: roll the meta TTL forward and return immediately.
+        // `refreshedAt` records the start of a refresh event, not a TTL marker;
+        // advancing it here to completion-`now` would let an edit landing
+        // between a refresh's start and its completion read as not-yet-stale.
+        // The meta re-save below is itself the TTL extension.
         $response->headers->set('X-Pimcore-DataHub-Persistent-Cache', 'HIT');
-        $meta['refreshedAt'] = $now;
         $metaTags = $this->buildTags($request, $meta['operation'] ?? null);
 
         // Meta TTL rolls forward on every HIT but payload TTL runs from the
@@ -297,10 +310,121 @@ class PersistentOutputCacheService
         }
 
         $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
-        $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
-        $isStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
+        $isStale = $this->isEntryStale($meta, $fallbackWatermark);
 
         return ['applies' => true, 'status' => $isStale ? 'STALE' : 'HIT'];
+    }
+
+    private function isEntryStale(array $meta, int $fallbackWatermark): bool
+    {
+        $refreshedAt    = (int)($meta['refreshedAt'] ?? 0);
+        $watermarkStale = $fallbackWatermark > 0 && $refreshedAt > 0 && $refreshedAt < $fallbackWatermark;
+
+        return $watermarkStale || $this->isEntryStaleByTimestamps($meta);
+    }
+
+    /**
+     * Swallows all failures with a warning — a missed stamp falls back to watermark-only
+     * staleness, never a crash.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function stampInvalidatedAt(string $metaKey, array $meta, int $ts): void
+    {
+        $this->stampMetaField($metaKey, $meta, 'invalidatedAt', $ts, 'datahub.swr.stamp_invalidated_at_failed');
+    }
+
+    /**
+     * @param array<string, mixed> $meta
+     */
+    private function stampMetaField(string $metaKey, array $meta, string $field, int $ts, string $errSlug): void
+    {
+        try {
+            $meta[$field] = $ts;
+            $storedTags = $meta['tags'] ?? null;
+            $storedTagsUsable = is_array($storedTags) && $storedTags !== [];
+            $tags = $storedTagsUsable ? $storedTags : [self::TAG_COMMON];
+            $this->cacheSave($metaKey, $meta, $tags, $this->ttl);
+        } catch (\Throwable $e) {
+            Logger::warning(sprintf(
+                '%s: key=%s op=%s client=%s err=%s',
+                $errSlug,
+                $metaKey,
+                $meta['operation'] ?? '?',
+                $meta['client'] ?? '?',
+                $e->getMessage()
+            ));
+        }
+    }
+
+    /**
+     * True when the cooldown window measured from the last completed refresh has
+     * elapsed. An entry never refreshed (`lastRefreshAt` absent) reads as 0 and
+     * is past any positive cooldown — correct, it owes a leading-edge refresh.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function isPastCooldown(array $meta, int $cooldown, ?int $now = null): bool
+    {
+        return ($now ?? time()) - (int)($meta['lastRefreshAt'] ?? 0) >= $cooldown;
+    }
+
+    /**
+     * Returns the window-end timestamp derived from `lastRefreshAt + $cooldown`.
+     * The leading-edge dispatch arm in {@see PersistentCacheInvalidationListener}
+     * intentionally uses `now + $cooldown` instead — do NOT route that site
+     * through this helper.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function windowEndsAt(array $meta, int $cooldown): int
+    {
+        return (int)($meta['lastRefreshAt'] ?? 0) + $cooldown;
+    }
+
+    /**
+     * Re-load the entry meta blob for a (client, body) pair at the point of use.
+     * The worker reads `lastRefreshAt` / `invalidatedAt` from here at pop time so
+     * the self-cancel / re-arm decision converges against current state rather
+     * than a value carried stale on the message.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function loadEntryMeta(string $client, string $bodyJson): ?array
+    {
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $meta = $this->cacheLoad(self::keyMetaFor($client, $canonical));
+
+        return is_array($meta) ? $meta : null;
+    }
+
+    /**
+     * Watermark-aware staleness check: combines the global fallback watermark
+     * with the per-entry timestamp comparison. Matches the read-path predicate
+     * in {@see self::preHandle()} exactly so the freshness guard and the serve
+     * path agree on what is stale.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function isEntryStaleWithWatermark(array $meta): bool
+    {
+        $fallbackWatermark = (int) ($this->cacheLoad(self::KEY_FALLBACK_WATERMARK_TS) ?: 0);
+
+        return $this->isEntryStale($meta, $fallbackWatermark);
+    }
+
+    /**
+     * Per-entry staleness predicate: an invalidation recorded after the last
+     * refresh-start means the cached payload predates the edit.
+     *
+     * @param array<string, mixed> $meta
+     */
+    private function isEntryStaleByTimestamps(array $meta): bool
+    {
+        $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
+        $invalidatedAt = (int)($meta['invalidatedAt'] ?? 0);
+
+        return $invalidatedAt > 0 && $invalidatedAt > $refreshedAt;
     }
 
     /** Manually set the last invalidation timestamp to now. */
@@ -331,6 +455,62 @@ class PersistentOutputCacheService
     public function clearAll(): bool
     {
         return $this->cacheClearTag(self::TAG_COMMON);
+    }
+
+    /**
+     * Arm the per-entry invalidation cooldown sentinel for $hash with a TTL of
+     * the operation's cooldown window. Tagged TAG_WATERMARK (not TAG_COMMON) so
+     * an SWR-layer clearAll() preserves it — otherwise a clear would orphan the
+     * already-queued dated refresh and let the next edit double-dispatch.
+     *
+     * @param string $hash return value of entryHash() or entryHashFromBody()
+     * @param int    $ttl  cooldown window in seconds (the dated message's deliverAt offset)
+     */
+    public function armOperationCooldown(string $hash, int $ttl): void
+    {
+        $this->cacheSave(self::KEY_OP_COOLDOWN_PREFIX . $hash, 1, [self::TAG_WATERMARK], max(1, $ttl));
+    }
+
+    public function hasOperationCooldown(string $hash): bool
+    {
+        $existing = $this->cacheLoad(self::KEY_OP_COOLDOWN_PREFIX . $hash);
+
+        return $existing !== false && $existing !== null;
+    }
+
+    public function clearOperationCooldown(string $hash): void
+    {
+        $this->cacheRemove(self::KEY_OP_COOLDOWN_PREFIX . $hash);
+    }
+
+    public function loadPendingFlag(string $hash): bool
+    {
+        $value = $this->cacheLoad(self::PENDING_REFRESH_PREFIX . $hash);
+
+        return $value !== false && $value !== null;
+    }
+
+    /**
+     * Re-throws any exception propagated by the underlying cache layer (e.g. key
+     * validation, write-lock acquisition, PHP errors). Callers with a narrow
+     * decision-affecting catch — currently {@see PersistentRefreshMessageHandler::cancelTrailing()}
+     * — must NOT swallow internally; the fault must reach the caller's catch so
+     * the cancel decision stays consistent with whatever side-effect did or did
+     * not happen.
+     */
+    public function clearPendingFlag(string $hash): void
+    {
+        $this->cacheRemove(self::PENDING_REFRESH_PREFIX . $hash);
+    }
+
+    /**
+     * Re-throw shape is symmetric with {@see clearPendingFlag}: any exception from
+     * the cache layer propagates to the caller. Callers in decision-affecting
+     * catches must not swallow internally.
+     */
+    public function clearEnqueueDedupe(string $hash): void
+    {
+        $this->cacheRemove(self::ENQUEUE_DEDUPE_PREFIX . $hash);
     }
 
     /**
@@ -481,8 +661,16 @@ class PersistentOutputCacheService
         }
 
         $now = time();
+        // `refreshedAt` anchors to the refresh START (the worker stamps the
+        // request attribute before running the resolver) so an edit landing
+        // between start and this completion-write leaves the entry stale on the
+        // next read. A direct first response has no start attribute, so it
+        // anchors to `now` — which is ≈ completion and correct for a first write.
+        $refreshStartedAt = $request->attributes->get('_datahub_persistent_refresh_started_at');
+        $refreshedAt = is_int($refreshStartedAt) && $refreshStartedAt > 0 ? $refreshStartedAt : $now;
         $meta = [
-            'refreshedAt' => $now,
+            'refreshedAt' => $refreshedAt,
+            'lastRefreshAt' => $now,
             'client' => $client,
             'operation' => $operationName,
             // store canonical request body to allow later refresh scheduling
@@ -518,6 +706,29 @@ class PersistentOutputCacheService
         $granularity = $this->operationClassifier->getGranularity($operationName);
 
         return $granularity?->value ?? 'none';
+    }
+
+    /**
+     * Compact representation of the request `variables` for log lines. Returns
+     * a short JSON blob trimmed to 200 chars so verbose filter payloads don't
+     * blow the line length. Falls back to `?` when the body is unparseable.
+     */
+    public static function summariseVariables(string $bodyJson): string
+    {
+        $decoded = json_decode($bodyJson, true);
+        if (!is_array($decoded)) {
+            return '?';
+        }
+        $vars = $decoded['variables'] ?? null;
+        if (!is_array($vars) || $vars === []) {
+            return '{}';
+        }
+        $json = json_encode($vars, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            return '?';
+        }
+
+        return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
     }
 
     /**
@@ -574,10 +785,12 @@ class PersistentOutputCacheService
 
     /**
      * Resolve the per-object / per-class tag set for the current request from
-     * the DependencyCollector, gated on the operation's granularity. SINGLE
-     * with an empty collector raises an in-flight warning — the canonical
-     * detector for missing POST_LOAD coverage (raw-SQL hydrators bypass the
-     * subscriber and the collector stays empty).
+     * the DependencyCollector, gated on the operation's granularity. Any
+     * granularity with an empty collector raises an in-flight warning — the
+     * canonical detector for missing POST_LOAD coverage (raw-SQL hydrators
+     * bypass the subscriber and the collector stays empty). A LIST op with an
+     * empty collector is just as broken as a SINGLE one: its reverse-index
+     * entry is never written and invalidation can never find it.
      *
      * @return list<string>
      */
@@ -590,7 +803,7 @@ class PersistentOutputCacheService
         if ($granularity === null) {
             return [];
         }
-        if ($granularity === Granularity::SINGLE && !$this->dependencyCollector->hasRecordedAny()) {
+        if (!$this->dependencyCollector->hasRecordedAny()) {
             $this->logCollectorEmptyOnSave($operationName, $client);
         }
 
@@ -599,11 +812,11 @@ class PersistentOutputCacheService
 
     /**
      * Loud in-flight detector for the missing-POST_LOAD-coverage failure
-     * mode: SINGLE-granularity operations should always record at least one
-     * element before writing to the persistent cache. Raw-SQL hydrators
-     * bypass the POST_LOAD subscriber and the collector stays empty,
-     * producing a write with no per-object tags — invalidation would then
-     * miss it entirely.
+     * mode: every classified op should record at least one element before
+     * writing to the persistent cache. Raw-SQL hydrators bypass the
+     * POST_LOAD subscriber and the collector stays empty, producing a write
+     * with no per-object or per-class tags — the reverse-index entry is
+     * never created and invalidation can never find this query later.
      *
      * Separated from the call site so tests can observe the trigger
      * condition without booting the Pimcore kernel (the Logger facade
@@ -777,6 +990,11 @@ class PersistentOutputCacheService
         return \Pimcore\Cache::clearTag($tag);
     }
 
+    protected function cacheRemove(string $key): void
+    {
+        \Pimcore\Cache::remove($key);
+    }
+
     private function keyPayload(string $clientname, string $canonical): string
     {
         return self::keyPayloadFor($clientname, $canonical);
@@ -795,6 +1013,31 @@ class PersistentOutputCacheService
     public static function keyMetaFor(string $clientname, string $canonical): string
     {
         return self::META_KEY_PREFIX . hash('sha256', 'client:' . $clientname . "\n" . $canonical);
+    }
+
+    /**
+     * Canonical per-entry identity: bare sha256 digest (no prefix).
+     *
+     * @param string $client    client name from the request
+     * @param string $canonical already-canonical request body
+     */
+    public static function entryHash(string $client, string $canonical): string
+    {
+        return hash('sha256', 'client:' . $client . "\n" . $canonical);
+    }
+
+    /**
+     * Canonicalization-tolerant variant of entryHash(). Use this when the
+     * body may not yet be canonical (e.g. raw handler payload before AST
+     * normalisation); the result is always identical to calling entryHash()
+     * on the already-canonical form.
+     *
+     * @param string $client   client name from the request
+     * @param string $bodyJson raw or canonical request body
+     */
+    public static function entryHashFromBody(string $client, string $bodyJson): string
+    {
+        return self::entryHash($client, self::canonicalizePayloadString($bodyJson));
     }
 
     /**
@@ -846,16 +1089,12 @@ class PersistentOutputCacheService
 
     /**
      * Enqueue-dedupe sentinel resource shape for the per-canonical-request
-     * space, computed from raw inputs. Byte-equal to the listener's legacy
-     * `buildEnqueueDedupeKey` shape when meta+payload sidecar attributes are
-     * present — that is the contract.
+     * space, computed from raw inputs. Canonicalizes before hashing so both
+     * the invalidation-listener path (canonical body) and the terminate-path
+     * (raw body) resolve to the same key.
      */
     public static function computeEnqueueDedupeKey(string $client, string $bodyJson): string
     {
-        $canonical = self::canonicalizePayloadString($bodyJson);
-        $metaKey = self::keyMetaFor($client, $canonical);
-        $payloadKey = self::keyPayloadFor($client, $canonical);
-
-        return self::ENQUEUE_DEDUPE_PREFIX . md5($metaKey . '|' . $payloadKey);
+        return self::ENQUEUE_DEDUPE_PREFIX . self::entryHashFromBody($client, $bodyJson);
     }
 }

@@ -18,6 +18,10 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownInvalidationDecisionKind;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownRefreshPolicy;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
+use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Event\AssetEvents;
 use Pimcore\Event\DataObjectEvents;
@@ -44,11 +48,17 @@ use Symfony\Contracts\EventDispatcher\Event;
  */
 class PersistentCacheInvalidationListener implements EventSubscriberInterface
 {
+    private CooldownRefreshPolicy $policy;
+
     public function __construct(
         private PersistentOutputCacheService $persistentCache,
         private ContainerBagInterface $container,
-        private ?MessageBusInterface $bus = null
+        private ?MessageBusInterface $bus = null,
+        private ?OperationClassifier $classifier = null,
+        private ?CooldownWindowDispatcher $cooldownDispatcher = null,
+        ?CooldownRefreshPolicy $policy = null,
     ) {
+        $this->policy = $policy ?? new CooldownRefreshPolicy($persistentCache);
     }
 
     public static function getSubscribedEvents(): array
@@ -152,11 +162,15 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
             Logger::error('persistent_cache_invalidation: ' . $e->getMessage(), ['exception' => $e]);
 
             // Safety floor: bump the watermark so any exception in the queue-dispatch path
-            // does not silently drop the invalidation signal.
+            // does not silently drop the invalidation signal. If the bump itself fails,
+            // log it distinctly — that's the actual "we lost the invalidation" event.
             try {
                 $this->persistentCache->bumpFallbackWatermark();
-            } catch (\Throwable) {
-                // best effort
+            } catch (\Throwable $bumpErr) {
+                Logger::error(
+                    'persistent_cache_invalidation: watermark-bump fallback failed',
+                    ['exception' => $bumpErr]
+                );
             }
         }
     }
@@ -210,7 +224,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
      * Per-tag bus dispatch. The refresh-priority score on each dispatched
      * message is `time()` because no per-entry refreshedAt context is
      * available in the invalidation path — every entry is freshly stale, so
-     * the queue treats them as roughly equivalent and ZPOPMIN orders by
+     * the queue treats them as roughly equivalent and ZRANGEBYSCORE orders by
      * insertion time within the same-second bucket.
      *
      * The richer return shape lets the caller distinguish three
@@ -273,7 +287,89 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     continue;
                 }
 
-                $hash = hash('sha256', 'client:' . $client . "\n" . $canonical);
+                $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+                // Single `$now` per entry: stamp + dispatch score baseline share it
+                // so the refresh score never predates the invalidation it answers.
+                $now = time();
+
+                // Worker's freshness guard reads `invalidatedAt` regardless of
+                // dispatch arm; coalesced arms (no new dispatch) rely on the
+                // stamp to drive re-fire via meta re-read at pop time. Must
+                // precede the dispatch-arm fork.
+                $this->persistentCache->stampInvalidatedAt($metaKey, $meta, $now);
+
+                $cooldown = $operation !== '' && $this->classifier !== null
+                    ? $this->classifier->getInvalidationCooldown($operation)
+                    : null;
+                if ($cooldown !== null) {
+                    $priorityWeight = $this->classifier?->bandWeightFor($operation, false);
+
+                    $template = new PersistentRefreshMessage(
+                        client: $client,
+                        bodyJson: $canonical,
+                        operationName: $operation,
+                        scoreBaseline: $now,
+                        priorityWeight: $priorityWeight,
+                    );
+
+                    $decision = $this->policy->decideOnInvalidation($meta, $cooldown, $hash, $now);
+
+                    switch ($decision->kind) {
+                        case CooldownInvalidationDecisionKind::LEADING_EDGE:
+                            $this->bus->dispatch($template);
+                            $this->cooldownDispatcher?->open($hash, $cooldown, (int) $decision->deliverAt, $template);
+                            Logger::info(sprintf(
+                                'persistent_cache_invalidation: leading-edge refresh dispatched for op=%s',
+                                $operation
+                            ));
+                            $result['dispatched'][] = [
+                                'op' => $operation,
+                                'vars' => PersistentOutputCacheService::summariseVariables($canonical),
+                            ];
+
+                            break;
+
+                        case CooldownInvalidationDecisionKind::COALESCE_ARMED:
+                            $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
+                            $this->cacheSave(
+                                $pendingKey,
+                                1,
+                                [PersistentOutputCacheService::TAG_COMMON],
+                                max($enqueueTtl * 10, 600)
+                            );
+                            Logger::info(sprintf(
+                                'persistent_cache_invalidation: cooldown active for op=%s; trailing refresh already queued',
+                                $operation
+                            ));
+                            ++$result['coalesced'];
+
+                            break;
+
+                        case CooldownInvalidationDecisionKind::OPEN_TRAILING:
+                            $this->cooldownDispatcher?->open(
+                                $hash,
+                                $cooldown,
+                                (int) $decision->deliverAt,
+                                $template,
+                            );
+                            Logger::info(sprintf(
+                                'persistent_cache_invalidation: trailing refresh scheduled for op=%s at window end',
+                                $operation
+                            ));
+                            $result['dispatched'][] = [
+                                'op' => $operation,
+                                'vars' => PersistentOutputCacheService::summariseVariables($canonical),
+                            ];
+
+                            break;
+
+                        default:
+                            throw new \LogicException('unreachable: unhandled CooldownInvalidationDecisionKind ' . $decision->kind->value . ' for op=' . $operation);
+                    }
+
+                    continue;
+                }
+
                 $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash;
                 $existing = $this->cacheLoad($dedupeKey);
                 if ($existing !== false && $existing !== null) {
@@ -283,8 +379,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     // a late event isn't lost to the worker's pre-commit read.
                     $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
                     $this->cacheSave(
-                        1,
                         $pendingKey,
+                        1,
                         [PersistentOutputCacheService::TAG_COMMON],
                         max($enqueueTtl * 10, 600)
                     );
@@ -293,8 +389,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     continue;
                 }
                 $this->cacheSave(
-                    1,
                     $dedupeKey,
+                    1,
                     [PersistentOutputCacheService::TAG_COMMON],
                     $enqueueTtl
                 );
@@ -302,38 +398,16 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     $client,
                     $canonical,
                     $operation !== '' ? $operation : null,
-                    time()
+                    $now
                 ));
                 $result['dispatched'][] = [
                     'op' => $operation !== '' ? $operation : '?',
-                    'vars' => self::extractVariables($canonical),
+                    'vars' => PersistentOutputCacheService::summariseVariables($canonical),
                 ];
             }
         }
 
         return $result;
-    }
-
-    /**
-     * Mirrors the handler's variable summariser so a (op, vars) pair greps
-     * identically across listener and handler log lines.
-     */
-    private static function extractVariables(string $canonical): string
-    {
-        $decoded = json_decode($canonical, true);
-        if (!is_array($decoded)) {
-            return '?';
-        }
-        $vars = $decoded['variables'] ?? null;
-        if (!is_array($vars) || $vars === []) {
-            return '{}';
-        }
-        $json = json_encode($vars, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            return '?';
-        }
-
-        return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
     }
 
     /**
@@ -371,7 +445,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
     /**
      * @param mixed $value
      */
-    protected function cacheSave($value, string $key, array $tags, int $ttl): void
+    protected function cacheSave(string $key, $value, array $tags, int $ttl): void
     {
         \Pimcore\Cache::save($value, $key, $tags, $ttl, 1, true);
     }
