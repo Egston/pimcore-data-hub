@@ -873,6 +873,62 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         $handler($msg);
     }
 
+    public function testTrailingPopRearmDispatchesAtExactlyLastRefreshAtPlusCooldown(): void
+    {
+        $cooldownTtl = 21600;
+        $classifier = $this->makeCooldownClassifier('OpRearmPin', $cooldownTtl);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpRearmPin"}';
+        $lastRefreshAt = time() - 5000;
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn([
+            'refreshedAt' => 1,
+            'invalidatedAt' => 100,
+            'lastRefreshAt' => $lastRefreshAt,
+        ]);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
+        $persistentCache->method('isPastCooldown')->willReturn(false);
+        $persistentCache->method('windowEndsAt')
+            ->willReturnCallback(fn (array $meta, int $cooldown): int => (int)($meta['lastRefreshAt'] ?? 0) + $cooldown);
+
+        $dispatched = [];
+        $bus = $this->createMock(\Symfony\Component\Messenger\MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new \Symfony\Component\Messenger\Envelope($msg);
+        });
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache, $bus);
+
+        $before = time();
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpRearmPin', time(), null, time() + $cooldownTtl);
+        $handler($msg);
+
+        self::assertCount(1, $dispatched, 'rearm dispatches exactly one trailing refresh');
+        self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
+        self::assertSame(
+            $lastRefreshAt + $cooldownTtl,
+            $dispatched[0]->deliverAt,
+            'rearm deliverAt must be lastRefreshAt + cooldown, never now + cooldown',
+        );
+        self::assertNotSame(
+            $before + $cooldownTtl,
+            $dispatched[0]->deliverAt,
+            'rearm deliverAt is not now+cooldown (lastRefreshAt is 5000s in the past)',
+        );
+        self::assertLessThan(
+            $before + $cooldownTtl,
+            $dispatched[0]->deliverAt,
+            'lastRefreshAt+cooldown must precede now+cooldown given lastRefreshAt is in the past',
+        );
+    }
+
     private function makeCooldownClassifier(string $operationName, int $cooldownTtl): OperationClassifier
     {
         $container = $this->createMock(ContainerBagInterface::class);

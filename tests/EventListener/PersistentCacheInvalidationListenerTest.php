@@ -1249,4 +1249,85 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         self::assertGreaterThanOrEqual($before + 21600, $trailing->deliverAt, 'elapsed-window trailing must use now+cooldown, not the stale lastRefreshAt+cooldown');
         self::assertLessThanOrEqual($after + 21600, $trailing->deliverAt, 'trailing deliverAt must be within now+cooldown tolerance');
     }
+
+    public function testCooldownWithinWindowOpenTrailingDeliverAtIsExactlyLastRefreshAtPlusCooldown(): void
+    {
+        $object = $this->makeDataObject(81);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_81';
+
+        $client = 'c1';
+        $canonical = '{"q":"open_trailing_pin"}';
+        $lastRefreshAt = time() - 5000;
+        $cooldownTtl = 21600;
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_ot', 'persistent_output_meta_ot'],
+            ],
+            'persistent_output_meta_ot' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'CooldownOp',
+                'lastRefreshAt' => $lastRefreshAt,
+            ],
+        ];
+
+        $dispatched = [];
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(function (object $msg) use (&$dispatched) {
+            $dispatched[] = $msg;
+
+            return new Envelope($msg);
+        });
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->method('isPastCooldown')->willReturn(false);
+        $cache->method('hasOperationCooldown')->willReturn(false);
+        $cache->method('windowEndsAt')
+            ->willReturnCallback(fn (array $meta, int $cooldown): int => (int)($meta['lastRefreshAt'] ?? 0) + $cooldown);
+
+        $dispatcher = new CooldownWindowDispatcher($bus, $cache);
+
+        $classifier = $this->makeClassifier([
+            'CooldownOp' => [
+                'tier' => 'swr_only',
+                'granularity' => 'list',
+                'invalidation_cooldown_ttl' => $cooldownTtl,
+            ],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier,
+            $dispatcher
+        );
+
+        $before = time();
+        $listener->mark(new DataObjectEvent($object));
+
+        self::assertCount(1, $dispatched, 'open-trailing arm dispatches exactly one dated message');
+        self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
+        self::assertSame(
+            $lastRefreshAt + $cooldownTtl,
+            $dispatched[0]->deliverAt,
+            'open-trailing deliverAt must be lastRefreshAt + cooldown, never now + cooldown',
+        );
+        self::assertNotSame(
+            $before + $cooldownTtl,
+            $dispatched[0]->deliverAt,
+            'open-trailing deliverAt is not now+cooldown (lastRefreshAt is 5000s in the past)',
+        );
+        self::assertLessThan(
+            $before + $cooldownTtl,
+            $dispatched[0]->deliverAt,
+            'lastRefreshAt+cooldown must precede now+cooldown given lastRefreshAt is in the past',
+        );
+    }
 }

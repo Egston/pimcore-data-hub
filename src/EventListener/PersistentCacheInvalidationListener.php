@@ -18,6 +18,8 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownInvalidationDecisionKind;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownRefreshPolicy;
 use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
@@ -46,13 +48,17 @@ use Symfony\Contracts\EventDispatcher\Event;
  */
 class PersistentCacheInvalidationListener implements EventSubscriberInterface
 {
+    private CooldownRefreshPolicy $policy;
+
     public function __construct(
         private PersistentOutputCacheService $persistentCache,
         private ContainerBagInterface $container,
         private ?MessageBusInterface $bus = null,
         private ?OperationClassifier $classifier = null,
-        private ?CooldownWindowDispatcher $cooldownDispatcher = null
+        private ?CooldownWindowDispatcher $cooldownDispatcher = null,
+        ?CooldownRefreshPolicy $policy = null,
     ) {
+        $this->policy = $policy ?? new CooldownRefreshPolicy($persistentCache);
     }
 
     public static function getSubscribedEvents(): array
@@ -296,61 +302,60 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                         priorityWeight: $priorityWeight,
                     );
 
-                    // Leading edge: the cooldown window has fully elapsed (or the
-                    // entry was never refreshed). Warm immediately, then open a
-                    // fresh window: arm the sentinel + schedule the dated trailing
-                    // at now + cooldown.
-                    if ($this->persistentCache->isPastCooldown($meta, $cooldown, $now)) {
-                        $this->bus->dispatch($template);
-                        $this->cooldownDispatcher?->open($hash, $cooldown, $now + $cooldown, $template);
-                        Logger::info(sprintf(
-                            'persistent_cache_invalidation: leading-edge refresh dispatched for op=%s',
-                            $operation
-                        ));
-                        $result['dispatched'][] = [
-                            'op' => $operation,
-                            'vars' => PersistentOutputCacheService::summariseVariables($canonical),
-                        ];
+                    $decision = $this->policy->decideOnInvalidation($meta, $cooldown, $hash, $now);
 
-                        continue;
+                    switch ($decision->kind) {
+                        case CooldownInvalidationDecisionKind::LEADING_EDGE:
+                            $this->bus->dispatch($template);
+                            $this->cooldownDispatcher?->open($hash, $cooldown, (int) $decision->deliverAt, $template);
+                            Logger::info(sprintf(
+                                'persistent_cache_invalidation: leading-edge refresh dispatched for op=%s',
+                                $operation
+                            ));
+                            $result['dispatched'][] = [
+                                'op' => $operation,
+                                'vars' => PersistentOutputCacheService::summariseVariables($canonical),
+                            ];
+
+                            break;
+
+                        case CooldownInvalidationDecisionKind::COALESCE_ARMED:
+                            $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
+                            $this->cacheSave(
+                                $pendingKey,
+                                1,
+                                [PersistentOutputCacheService::TAG_COMMON],
+                                max($enqueueTtl * 10, 600)
+                            );
+                            Logger::info(sprintf(
+                                'persistent_cache_invalidation: cooldown active for op=%s; trailing refresh already queued',
+                                $operation
+                            ));
+                            ++$result['coalesced'];
+
+                            break;
+
+                        case CooldownInvalidationDecisionKind::OPEN_TRAILING:
+                            $this->cooldownDispatcher?->open(
+                                $hash,
+                                $cooldown,
+                                (int) $decision->deliverAt,
+                                $template,
+                            );
+                            Logger::info(sprintf(
+                                'persistent_cache_invalidation: trailing refresh scheduled for op=%s at window end',
+                                $operation
+                            ));
+                            $result['dispatched'][] = [
+                                'op' => $operation,
+                                'vars' => PersistentOutputCacheService::summariseVariables($canonical),
+                            ];
+
+                            break;
+
+                        default:
+                            throw new \LogicException('unreachable: unhandled CooldownInvalidationDecisionKind ' . $decision->kind->value . ' for op=' . $operation);
                     }
-
-                    // Within cooldown: a trailing refresh is already scheduled
-                    // for this window. Re-arm the pending flag so a late edit is
-                    // not lost, then coalesce.
-                    if ($this->persistentCache->hasOperationCooldown($hash)) {
-                        $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
-                        $this->cacheSave(
-                            $pendingKey,
-                            1,
-                            [PersistentOutputCacheService::TAG_COMMON],
-                            max($enqueueTtl * 10, 600)
-                        );
-                        Logger::info(sprintf(
-                            'persistent_cache_invalidation: cooldown active for op=%s; trailing refresh already queued',
-                            $operation
-                        ));
-                        ++$result['coalesced'];
-
-                        continue;
-                    }
-
-                    // Within cooldown, no trailing scheduled yet: coalesce to a
-                    // single window-end-dated trailing refresh.
-                    $this->cooldownDispatcher?->open(
-                        $hash,
-                        $cooldown,
-                        $this->persistentCache->windowEndsAt($meta, $cooldown),
-                        $template,
-                    );
-                    Logger::info(sprintf(
-                        'persistent_cache_invalidation: trailing refresh scheduled for op=%s at window end',
-                        $operation
-                    ));
-                    $result['dispatched'][] = [
-                        'op' => $operation,
-                        'vars' => PersistentOutputCacheService::summariseVariables($canonical),
-                    ];
 
                     continue;
                 }

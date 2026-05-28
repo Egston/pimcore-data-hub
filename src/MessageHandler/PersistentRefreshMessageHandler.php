@@ -22,6 +22,8 @@ use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownRefreshPolicy;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownTrailingDecisionKind;
 use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\DependencyCollector;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
@@ -62,6 +64,8 @@ use Symfony\Component\Messenger\MessageBusInterface;
 #[AsMessageHandler]
 final class PersistentRefreshMessageHandler
 {
+    private ?CooldownRefreshPolicy $policy;
+
     public function __construct(
         private OperationClassifier $classifier,
         private LockFactoryResolver $lockResolver,
@@ -75,8 +79,10 @@ final class PersistentRefreshMessageHandler
         private ?DependencyCollector $dependencyCollector = null,
         private ?MessageBusInterface $bus = null,
         private ?PersistentOutputCacheService $persistentCache = null,
-        private ?CooldownWindowDispatcher $cooldownDispatcher = null
+        private ?CooldownWindowDispatcher $cooldownDispatcher = null,
+        ?CooldownRefreshPolicy $policy = null,
     ) {
+        $this->policy = $policy ?? ($persistentCache !== null ? new CooldownRefreshPolicy($persistentCache) : null);
     }
 
     public function __invoke(PersistentRefreshMessage $message): void
@@ -360,7 +366,7 @@ final class PersistentRefreshMessageHandler
      */
     private function shouldFireTrailing(PersistentRefreshMessage $message, string $operationName, string $hash): bool
     {
-        if ($this->persistentCache === null) {
+        if ($this->persistentCache === null || $this->policy === null) {
             return true;
         }
 
@@ -370,23 +376,34 @@ final class PersistentRefreshMessageHandler
                 return true;
             }
 
-            $stale = $this->persistentCache->isEntryStaleWithWatermark($meta);
+            $cooldown = $this->classifier->getInvalidationCooldown($operationName) ?? 0;
+            // The decision policy assumes a positive cooldown for its REARM
+            // arm to be meaningful. A zero/unconfigured cooldown collapses to
+            // a binary stale/¬stale split, so route only `cooldown > 0` cases
+            // through the policy and keep the cooldown=0 path as a direct
+            // stale check identical to the legacy branch.
+            if ($cooldown <= 0) {
+                if (!$this->persistentCache->isEntryStaleWithWatermark($meta)) {
+                    return $this->cancelTrailingWithLog($hash, $operationName);
+                }
 
-            if (!$stale) {
-                $this->cancelTrailing($hash);
-                Logger::info(sprintf(
-                    'datahub.refresh_handler: trailing refresh cancelled for op=%s (entry no longer stale)',
-                    $operationName
-                ));
-
-                return false;
+                return true;
             }
 
-            $cooldown = $this->classifier->getInvalidationCooldown($operationName) ?? 0;
-            if ($cooldown > 0 && !$this->persistentCache->isPastCooldown($meta, $cooldown)) {
-                $this->rearmTrailing($message, $meta, $cooldown, $operationName, $hash);
+            $decision = $this->policy->decideOnTrailingPop($meta, $cooldown);
 
-                return false;
+            switch ($decision->kind) {
+                case CooldownTrailingDecisionKind::CANCEL:
+                    return $this->cancelTrailingWithLog($hash, $operationName);
+
+                case CooldownTrailingDecisionKind::REARM:
+                    return $this->rearmTrailing($message, (int) $decision->deliverAt, $cooldown, $operationName, $hash);
+
+                case CooldownTrailingDecisionKind::FIRE:
+                    return true;
+
+                default:
+                    throw new \LogicException('unreachable: unhandled CooldownTrailingDecisionKind ' . $decision->kind->value . ' for op=' . $operationName);
             }
         } catch (\Throwable $e) {
             $this->logWarning(sprintf(
@@ -397,8 +414,6 @@ final class PersistentRefreshMessageHandler
 
             return true;
         }
-
-        return true;
     }
 
     /**
@@ -417,23 +432,29 @@ final class PersistentRefreshMessageHandler
         $this->persistentCache?->clearOperationCooldown($hash);
     }
 
-    /**
-     * Re-arm: schedule the next trailing refresh at the current
-     * `lastRefreshAt + cooldown` and leave the pending flag set.
-     *
-     * @param array<string, mixed> $meta
-     */
-    private function rearmTrailing(PersistentRefreshMessage $message, array $meta, int $cooldown, string $operationName, string $hash): void
+    private function cancelTrailingWithLog(string $hash, string $operationName): false
     {
-        if ($this->cooldownDispatcher === null || $this->persistentCache === null) {
-            return;
-        }
-
-        $this->cooldownDispatcher->open($hash, $cooldown, $this->persistentCache->windowEndsAt($meta, $cooldown), $message);
+        $this->cancelTrailing($hash);
         Logger::info(sprintf(
-            'datahub.refresh_handler: trailing refresh re-armed for op=%s at window end',
+            'datahub.refresh_handler: trailing refresh cancelled for op=%s (entry no longer stale)',
             $operationName
         ));
+
+        return false;
+    }
+
+    // Leaves the pending flag set so the re-arm loop converges.
+    private function rearmTrailing(PersistentRefreshMessage $message, int $deliverAt, int $cooldown, string $operationName, string $hash): false
+    {
+        if ($this->cooldownDispatcher !== null) {
+            $this->cooldownDispatcher->open($hash, $cooldown, $deliverAt, $message);
+            Logger::info(sprintf(
+                'datahub.refresh_handler: trailing refresh re-armed for op=%s at window end',
+                $operationName
+            ));
+        }
+
+        return false;
     }
 
     /**
