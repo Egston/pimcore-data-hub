@@ -680,6 +680,29 @@ class PersistentOutputCacheService
     }
 
     /**
+     * Compact representation of the request `variables` for log lines. Returns
+     * a short JSON blob trimmed to 200 chars so verbose filter payloads don't
+     * blow the line length. Falls back to `?` when the body is unparseable.
+     */
+    public static function summariseVariables(string $bodyJson): string
+    {
+        $decoded = json_decode($bodyJson, true);
+        if (!is_array($decoded)) {
+            return '?';
+        }
+        $vars = $decoded['variables'] ?? null;
+        if (!is_array($vars) || $vars === []) {
+            return '{}';
+        }
+        $json = json_encode($vars, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            return '?';
+        }
+
+        return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
+    }
+
+    /**
      * Strips tag prefixes for readability and folds per-object tags into
      * `Class×N` counts so listing-shaped queries don't dwarf the log line.
      *

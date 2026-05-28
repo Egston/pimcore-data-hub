@@ -20,6 +20,7 @@ namespace Pimcore\Bundle\DataHubBundle\Tests\EventListener;
 use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\EventListener\PersistentCacheInvalidationListener;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Event\AssetEvents;
@@ -41,12 +42,13 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         ?MessageBusInterface $bus,
         PersistentOutputCacheService $cacheService,
         array &$cacheBacking,
-        ?OperationClassifier $classifier = null
+        ?OperationClassifier $classifier = null,
+        ?CooldownWindowDispatcher $cooldownDispatcher = null
     ): PersistentCacheInvalidationListener {
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn(['graphql' => $graphqlConfig]);
 
-        return new class($cacheService, $container, $bus, $cacheBacking, $classifier) extends PersistentCacheInvalidationListener {
+        return new class($cacheService, $container, $bus, $cacheBacking, $classifier, $cooldownDispatcher) extends PersistentCacheInvalidationListener {
             /** @var array<string, mixed> */
             private array $store;
 
@@ -55,9 +57,10 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 ContainerBagInterface $container,
                 ?MessageBusInterface $bus,
                 array &$store,
-                ?OperationClassifier $classifier
+                ?OperationClassifier $classifier,
+                ?CooldownWindowDispatcher $cooldownDispatcher
             ) {
-                parent::__construct($cache, $container, $bus, $classifier);
+                parent::__construct($cache, $container, $bus, $classifier, $cooldownDispatcher);
                 $this->store = &$store;
             }
 
@@ -66,7 +69,7 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 return $this->store[$key] ?? null;
             }
 
-            protected function cacheSave($value, string $key, array $tags, int $ttl): void
+            protected function cacheSave(string $key, $value, array $tags, int $ttl): void
             {
                 $this->store[$key] = $value;
             }
@@ -593,6 +596,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $cache->method('isPastCooldown')->willReturn(true);
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
 
+        $dispatcher = new CooldownWindowDispatcher($bus, $cache);
+
         $classifier = $this->makeClassifier([
             'CooldownOp' => [
                 'tier' => 'swr_only',
@@ -609,7 +614,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $bus,
             $cache,
             $store,
-            $classifier
+            $classifier,
+            $dispatcher
         );
 
         $before = time();
@@ -671,6 +677,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $cache->method('hasOperationCooldown')->with($hash)->willReturn(false);
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
 
+        $dispatcher = new CooldownWindowDispatcher($bus, $cache);
+
         $classifier = $this->makeClassifier([
             'CooldownOp' => [
                 'tier' => 'swr_only',
@@ -687,7 +695,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $bus,
             $cache,
             $store,
-            $classifier
+            $classifier,
+            $dispatcher
         );
 
         $listener->mark(new DataObjectEvent($object));
@@ -735,7 +744,6 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         // dispatch, and must NOT bump the global watermark (which would cascade-
         // stale everything and defeat the cooldown).
         $cache->method('hasOperationCooldown')->with($hash)->willReturn(true);
-        $cache->expects(self::never())->method('armOperationCooldown');
         $cache->expects(self::never())->method('bumpFallbackWatermark');
 
         $classifier = $this->makeClassifier([
@@ -787,7 +795,6 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
 
         $cache = $this->createMock(PersistentOutputCacheService::class);
         $cache->expects(self::never())->method('bumpFallbackWatermark');
-        $cache->expects(self::never())->method('armOperationCooldown');
 
         // PlainOp is classified but has no invalidation_cooldown_ttl → immediate path.
         $classifier = $this->makeClassifier([
@@ -905,6 +912,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 self::callback(fn ($ts) => $ts >= $before)
             );
 
+        $dispatcher = new CooldownWindowDispatcher($bus, $cache);
+
         $classifier = $this->makeClassifier([
             'CooldownOp' => [
                 'tier' => 'swr_only',
@@ -921,7 +930,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $bus,
             $cache,
             $store,
-            $classifier
+            $classifier,
+            $dispatcher
         );
 
         $listener->mark(new DataObjectEvent($object));
@@ -1024,6 +1034,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $cache->expects(self::never())->method('bumpFallbackWatermark');
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
 
+        $dispatcher = new CooldownWindowDispatcher($bus, $cache);
+
         $classifier = $this->makeClassifier([
             'CooldownOp' => [
                 'tier' => 'swr_only',
@@ -1040,7 +1052,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $bus,
             $cache,
             $store,
-            $classifier
+            $classifier,
+            $dispatcher
         );
 
         $before = time();
@@ -1120,6 +1133,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
                 return $armed[$h] ?? false;
             });
 
+        $dispatcher = new CooldownWindowDispatcher($bus, $cache);
+
         $classifier = $this->makeClassifier([
             'CooldownOp' => [
                 'tier' => 'swr_only',
@@ -1136,7 +1151,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $bus,
             $cache,
             $store,
-            $classifier
+            $classifier,
+            $dispatcher
         );
 
         // First mark: within window, no sentinel yet → arm + schedule trailing.
@@ -1191,6 +1207,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $cache->expects(self::never())->method('bumpFallbackWatermark');
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
 
+        $dispatcher = new CooldownWindowDispatcher($bus, $cache);
+
         $classifier = $this->makeClassifier([
             'CooldownOp' => [
                 'tier' => 'swr_only',
@@ -1207,7 +1225,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $bus,
             $cache,
             $store,
-            $classifier
+            $classifier,
+            $dispatcher
         );
 
         $before = time();

@@ -148,35 +148,13 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
                 'datahub.refresh_dispatch: enqueued op=%s client=%s vars=%s request_uri=%s ua=%s',
                 $op ?? '?',
                 $client,
-                self::summariseVariables($payload),
+                PersistentOutputCacheService::summariseVariables($payload),
                 (string)$request->getRequestUri(),
                 substr((string)$request->headers->get('User-Agent', ''), 0, 80)
             ));
         } catch (\Throwable $e) {
             Logger::error('datahub.refresh_dispatch: queue dispatch failed: ' . $e->getMessage());
         }
-    }
-
-    /**
-     * Mirror of the handler's helper so (op, vars) greps identically
-     * across dispatch and worker log lines.
-     */
-    private static function summariseVariables(string $bodyJson): string
-    {
-        $decoded = json_decode($bodyJson, true);
-        if (!is_array($decoded)) {
-            return '?';
-        }
-        $vars = $decoded['variables'] ?? null;
-        if (!is_array($vars) || $vars === []) {
-            return '{}';
-        }
-        $json = json_encode($vars, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            return '?';
-        }
-
-        return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
     }
 
     /**

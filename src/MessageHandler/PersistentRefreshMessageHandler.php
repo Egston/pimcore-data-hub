@@ -22,6 +22,7 @@ use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\DependencyCollector;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
@@ -73,7 +74,8 @@ final class PersistentRefreshMessageHandler
         private ContainerBagInterface $container,
         private ?DependencyCollector $dependencyCollector = null,
         private ?MessageBusInterface $bus = null,
-        private ?PersistentOutputCacheService $persistentCache = null
+        private ?PersistentOutputCacheService $persistentCache = null,
+        private ?CooldownWindowDispatcher $cooldownDispatcher = null
     ) {
     }
 
@@ -100,7 +102,9 @@ final class PersistentRefreshMessageHandler
             return;
         }
 
-        if (!$this->shouldRunRefresh($message, $operationName)) {
+        $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
+
+        if (!$this->shouldRunRefresh($message, $operationName, $hash)) {
             return;
         }
 
@@ -137,7 +141,7 @@ final class PersistentRefreshMessageHandler
         // one PHP process) so without this the peak would be cumulative.
         memory_reset_peak_usage();
         $memBefore = memory_get_usage(true);
-        $varsSummary = self::summariseVariables($message->bodyJson);
+        $varsSummary = PersistentOutputCacheService::summariseVariables($message->bodyJson);
         Logger::info(sprintf(
             'datahub.refresh_handler: started op=%s client=%s tier=%s vars=%s mem_before_mb=%.1f',
             $operationName,
@@ -203,8 +207,8 @@ final class PersistentRefreshMessageHandler
             // was set during processing — dispatch a trailing refresh.
             // Skipped on failure so the retry path doesn't pile dispatches.
             if ($controllerSucceeded) {
-                $this->reconcileCoalesceFlags($message, $operationName);
-                $this->closeCooldownWindow($message, $operationName);
+                $this->reconcileCoalesceFlags($message, $operationName, $hash);
+                $this->closeCooldownWindow($message, $operationName, $hash);
             }
 
             Logger::info(sprintf(
@@ -223,10 +227,9 @@ final class PersistentRefreshMessageHandler
      * Wrapped in try/catch: a cache failure here is non-fatal — the dedupe
      * sentinel expires on its own TTL, costing a brief coalesce window.
      */
-    private function reconcileCoalesceFlags(PersistentRefreshMessage $message, string $operationName): void
+    private function reconcileCoalesceFlags(PersistentRefreshMessage $message, string $operationName, string $hash): void
     {
         try {
-            $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
             $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash;
             $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
 
@@ -267,14 +270,13 @@ final class PersistentRefreshMessageHandler
      * dated refresh. Fail-soft: a clear failure is non-fatal — the sentinel
      * TTL-expires near deliverAt anyway.
      */
-    private function closeCooldownWindow(PersistentRefreshMessage $message, string $operationName): void
+    private function closeCooldownWindow(PersistentRefreshMessage $message, string $operationName, string $hash): void
     {
         if ($message->deliverAt === null || $this->persistentCache === null) {
             return;
         }
 
         try {
-            $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
             $this->persistentCache->clearOperationCooldown($hash);
         } catch (\Throwable $e) {
             $this->logWarning(sprintf(
@@ -301,10 +303,10 @@ final class PersistentRefreshMessageHandler
      * the guard falls through to refresh so a needed refresh is never skipped
      * on uncertainty.
      */
-    private function shouldRunRefresh(PersistentRefreshMessage $message, string $operationName): bool
+    private function shouldRunRefresh(PersistentRefreshMessage $message, string $operationName, string $hash): bool
     {
         if ($message->deliverAt !== null) {
-            return $this->shouldFireTrailing($message, $operationName);
+            return $this->shouldFireTrailing($message, $operationName, $hash);
         }
 
         if ($this->persistentCache === null) {
@@ -356,7 +358,7 @@ final class PersistentRefreshMessageHandler
      * Returns true only on the fire path. Fail-soft: if the service is absent or
      * meta can't be loaded, fall through to fire so a refresh is never lost.
      */
-    private function shouldFireTrailing(PersistentRefreshMessage $message, string $operationName): bool
+    private function shouldFireTrailing(PersistentRefreshMessage $message, string $operationName, string $hash): bool
     {
         if ($this->persistentCache === null) {
             return true;
@@ -369,7 +371,6 @@ final class PersistentRefreshMessageHandler
             }
 
             $stale = $this->persistentCache->isEntryStaleWithWatermark($meta);
-            $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
 
             if (!$stale) {
                 $this->cancelTrailing($hash);
@@ -383,7 +384,7 @@ final class PersistentRefreshMessageHandler
 
             $cooldown = $this->classifier->getInvalidationCooldown($operationName) ?? 0;
             if ($cooldown > 0 && !$this->persistentCache->isPastCooldown($meta, $cooldown)) {
-                $this->rearmTrailing($message, $meta, $cooldown, $operationName);
+                $this->rearmTrailing($message, $meta, $cooldown, $operationName, $hash);
 
                 return false;
             }
@@ -422,40 +423,17 @@ final class PersistentRefreshMessageHandler
      *
      * @param array<string, mixed> $meta
      */
-    private function rearmTrailing(PersistentRefreshMessage $message, array $meta, int $cooldown, string $operationName): void
+    private function rearmTrailing(PersistentRefreshMessage $message, array $meta, int $cooldown, string $operationName, string $hash): void
     {
-        if ($this->bus === null) {
+        if ($this->cooldownDispatcher === null) {
             return;
         }
 
         $lastRefreshAt = (int)($meta['lastRefreshAt'] ?? 0);
-        $hash = PersistentOutputCacheService::entryHashFromBody($message->client, $message->bodyJson);
-        $this->openCooldownWindow($hash, $cooldown, $lastRefreshAt + $cooldown, $message);
+        $this->cooldownDispatcher->open($hash, $cooldown, $lastRefreshAt + $cooldown, $message);
         Logger::info(sprintf(
             'datahub.refresh_handler: trailing refresh re-armed for op=%s at window end',
             $operationName
-        ));
-    }
-
-    /**
-     * Open (or re-arm) a cooldown window: arm the per-entry sentinel and enqueue
-     * the dated trailing refresh in one structural step.
-     *
-     * `$deliverAt` is an explicit parameter, never computed here — the re-arm site
-     * passes `lastRefreshAt + cooldown`, deliberately distinct from the listener's
-     * leading-edge `now + cooldown`. The trailing carries `readTriggered: false`
-     * (a worker re-dispatch is a warm, never a read).
-     */
-    private function openCooldownWindow(string $hash, int $cooldownTtl, int $deliverAt, PersistentRefreshMessage $template): void
-    {
-        $this->persistentCache?->armOperationCooldown($hash, $cooldownTtl);
-        $this->bus?->dispatch(new PersistentRefreshMessage(
-            client: $template->client,
-            bodyJson: $template->bodyJson,
-            operationName: $template->operationName,
-            refreshedAt: time(),
-            priorityWeight: $template->priorityWeight,
-            deliverAt: $deliverAt,
         ));
     }
 
@@ -471,29 +449,6 @@ final class PersistentRefreshMessageHandler
         $graphql = $cfg['graphql'] ?? [];
 
         return is_array($graphql) ? $graphql : [];
-    }
-
-    /**
-     * Compact representation of the request `variables` for log lines. Returns
-     * a short JSON blob trimmed to 200 chars so verbose filter payloads don't
-     * blow the line length. Falls back to `?` when the body is unparseable.
-     */
-    private static function summariseVariables(string $bodyJson): string
-    {
-        $decoded = json_decode($bodyJson, true);
-        if (!is_array($decoded)) {
-            return '?';
-        }
-        $vars = $decoded['variables'] ?? null;
-        if (!is_array($vars) || $vars === []) {
-            return '{}';
-        }
-        $json = json_encode($vars, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            return '?';
-        }
-
-        return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
     }
 
     protected function logWarning(string $message): void

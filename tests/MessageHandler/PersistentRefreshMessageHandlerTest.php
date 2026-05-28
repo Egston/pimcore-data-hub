@@ -23,6 +23,7 @@ use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\MessageHandler\PersistentRefreshMessageHandler;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\DependencyCollector;
 use Pimcore\Bundle\DataHubBundle\Service\Granularity;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
@@ -504,6 +505,8 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         $container = $this->createMock(ContainerBagInterface::class);
         $container->method('get')->willReturn(['graphql' => ['persistent_refresh_lock_ttl' => 60]]);
 
+        $cooldownDispatcher = $bus !== null ? new CooldownWindowDispatcher($bus, $persistentCache) : null;
+
         return new PersistentRefreshMessageHandler(
             $classifier,
             $resolver,
@@ -516,7 +519,8 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
             $container,
             null,
             $bus,
-            $persistentCache
+            $persistentCache,
+            $cooldownDispatcher
         );
     }
 

@@ -18,6 +18,7 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\DataHubBundle\EventListener;
 
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Event\AssetEvents;
@@ -49,7 +50,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
         private PersistentOutputCacheService $persistentCache,
         private ContainerBagInterface $container,
         private ?MessageBusInterface $bus = null,
-        private ?OperationClassifier $classifier = null
+        private ?OperationClassifier $classifier = null,
+        private ?CooldownWindowDispatcher $cooldownDispatcher = null
     ) {
     }
 
@@ -287,26 +289,28 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     $lastRefreshAt = (int)($meta['lastRefreshAt'] ?? 0);
                     $priorityWeight = $this->classifier?->getPriorityWeight($operation);
 
+                    $template = new PersistentRefreshMessage(
+                        client: $client,
+                        bodyJson: $canonical,
+                        operationName: $operation,
+                        refreshedAt: $now,
+                        priorityWeight: $priorityWeight,
+                    );
+
                     // Leading edge: the cooldown window has fully elapsed (or the
                     // entry was never refreshed). Warm immediately, then open a
                     // fresh window: arm the sentinel + schedule the dated trailing
                     // at now + cooldown.
                     if ($this->persistentCache->isPastCooldown($meta, $cooldown, $now)) {
-                        $this->bus->dispatch(new PersistentRefreshMessage(
-                            client: $client,
-                            bodyJson: $canonical,
-                            operationName: $operation,
-                            refreshedAt: $now,
-                            priorityWeight: $priorityWeight,
-                        ));
-                        $this->openCooldownWindow($hash, $cooldown, $now + $cooldown, $client, $canonical, $operation, $now, $priorityWeight);
+                        $this->bus->dispatch($template);
+                        $this->cooldownDispatcher?->open($hash, $cooldown, $now + $cooldown, $template);
                         Logger::info(sprintf(
                             'persistent_cache_invalidation: leading-edge refresh dispatched for op=%s',
                             $operation
                         ));
                         $result['dispatched'][] = [
                             'op' => $operation,
-                            'vars' => self::extractVariables($canonical),
+                            'vars' => PersistentOutputCacheService::summariseVariables($canonical),
                         ];
 
                         continue;
@@ -318,8 +322,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     if ($this->persistentCache->hasOperationCooldown($hash)) {
                         $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
                         $this->cacheSave(
-                            1,
                             $pendingKey,
+                            1,
                             [PersistentOutputCacheService::TAG_COMMON],
                             max($enqueueTtl * 10, 600)
                         );
@@ -334,14 +338,14 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
 
                     // Within cooldown, no trailing scheduled yet: coalesce to a
                     // single window-end-dated trailing refresh.
-                    $this->openCooldownWindow($hash, $cooldown, $lastRefreshAt + $cooldown, $client, $canonical, $operation, $now, $priorityWeight);
+                    $this->cooldownDispatcher?->open($hash, $cooldown, $lastRefreshAt + $cooldown, $template);
                     Logger::info(sprintf(
                         'persistent_cache_invalidation: trailing refresh scheduled for op=%s at window end',
                         $operation
                     ));
                     $result['dispatched'][] = [
                         'op' => $operation,
-                        'vars' => self::extractVariables($canonical),
+                        'vars' => PersistentOutputCacheService::summariseVariables($canonical),
                     ];
 
                     continue;
@@ -356,8 +360,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     // a late event isn't lost to the worker's pre-commit read.
                     $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
                     $this->cacheSave(
-                        1,
                         $pendingKey,
+                        1,
                         [PersistentOutputCacheService::TAG_COMMON],
                         max($enqueueTtl * 10, 600)
                     );
@@ -366,8 +370,8 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     continue;
                 }
                 $this->cacheSave(
-                    1,
                     $dedupeKey,
+                    1,
                     [PersistentOutputCacheService::TAG_COMMON],
                     $enqueueTtl
                 );
@@ -379,64 +383,12 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                 ));
                 $result['dispatched'][] = [
                     'op' => $operation !== '' ? $operation : '?',
-                    'vars' => self::extractVariables($canonical),
+                    'vars' => PersistentOutputCacheService::summariseVariables($canonical),
                 ];
             }
         }
 
         return $result;
-    }
-
-    /**
-     * Open a cooldown window: arm the per-entry sentinel and enqueue the dated
-     * trailing refresh in one structural step.
-     *
-     * `$deliverAt` is an explicit parameter, never computed here: the call sites
-     * are deliberately asymmetric (leading-edge passes `now + cooldown`;
-     * within-window passes `lastRefreshAt + cooldown`). Computing it internally
-     * would re-introduce the leading-edge-pops-immediately defect.
-     */
-    private function openCooldownWindow(
-        string $hash,
-        int $cooldownTtl,
-        int $deliverAt,
-        string $client,
-        string $canonical,
-        string $operation,
-        int $refreshedAt,
-        ?int $priorityWeight
-    ): void {
-        $this->persistentCache->armOperationCooldown($hash, $cooldownTtl);
-        $this->bus->dispatch(new PersistentRefreshMessage(
-            client: $client,
-            bodyJson: $canonical,
-            operationName: $operation,
-            refreshedAt: $refreshedAt,
-            priorityWeight: $priorityWeight,
-            deliverAt: $deliverAt,
-        ));
-    }
-
-    /**
-     * Mirrors the handler's variable summariser so a (op, vars) pair greps
-     * identically across listener and handler log lines.
-     */
-    private static function extractVariables(string $canonical): string
-    {
-        $decoded = json_decode($canonical, true);
-        if (!is_array($decoded)) {
-            return '?';
-        }
-        $vars = $decoded['variables'] ?? null;
-        if (!is_array($vars) || $vars === []) {
-            return '{}';
-        }
-        $json = json_encode($vars, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            return '?';
-        }
-
-        return strlen($json) > 200 ? substr($json, 0, 197) . '...' : $json;
     }
 
     /**
@@ -474,7 +426,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
     /**
      * @param mixed $value
      */
-    protected function cacheSave($value, string $key, array $tags, int $ttl): void
+    protected function cacheSave(string $key, $value, array $tags, int $ttl): void
     {
         \Pimcore\Cache::save($value, $key, $tags, $ttl, 1, true);
     }
