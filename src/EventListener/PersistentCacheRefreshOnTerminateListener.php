@@ -140,7 +140,7 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
                 client: $client,
                 bodyJson: $payload,
                 operationName: $op,
-                refreshedAt: $refreshedAt,
+                scoreBaseline: $refreshedAt,
                 priorityWeight: $priorityWeight,
                 readTriggered: true,
             ));

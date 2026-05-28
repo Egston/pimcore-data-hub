@@ -120,7 +120,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
 
         self::assertCount(1, $dispatched);
         self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
-        self::assertSame(1700001234, $dispatched[0]->refreshedAt);
+        self::assertSame(1700001234, $dispatched[0]->scoreBaseline);
     }
 
     public function testDispatchFallsBackToTimeWhenAttributeAbsent(): void
@@ -153,9 +153,9 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
         $listener->onKernelTerminate($this->makeTerminateEvent($req));
 
         self::assertCount(1, $dispatched);
-        self::assertNotNull($dispatched[0]->refreshedAt);
-        self::assertGreaterThanOrEqual($before, $dispatched[0]->refreshedAt);
-        self::assertLessThanOrEqual($before + 5, $dispatched[0]->refreshedAt);
+        self::assertNotNull($dispatched[0]->scoreBaseline);
+        self::assertGreaterThanOrEqual($before, $dispatched[0]->scoreBaseline);
+        self::assertLessThanOrEqual($before + 5, $dispatched[0]->scoreBaseline);
         self::assertNull($dispatched[0]->priorityWeight);
     }
 
@@ -198,7 +198,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
 
         self::assertCount(1, $dispatched);
         self::assertSame(7, $dispatched[0]->priorityWeight);
-        self::assertSame(1700001234, $dispatched[0]->refreshedAt);
+        self::assertSame(1700001234, $dispatched[0]->scoreBaseline);
     }
 
     public function testDisabledStrategyDispatchesUnclassifiedOpWithNullScoreFields(): void
@@ -231,7 +231,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
         $listener->onKernelTerminate($this->makeTerminateEvent($req));
 
         self::assertCount(1, $dispatched);
-        self::assertNull($dispatched[0]->refreshedAt);
+        self::assertNull($dispatched[0]->scoreBaseline);
         self::assertNull($dispatched[0]->priorityWeight);
     }
 
@@ -274,7 +274,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
 
         self::assertCount(1, $dispatched);
         self::assertSame(7, $dispatched[0]->priorityWeight);
-        self::assertNull($dispatched[0]->refreshedAt);
+        self::assertNull($dispatched[0]->scoreBaseline);
     }
 
     public function testDispatchUnderBandStrategyThreadsClassifiedWeight(): void
@@ -316,7 +316,7 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
 
         self::assertCount(1, $dispatched);
         self::assertSame(7, $dispatched[0]->priorityWeight);
-        self::assertSame(1700001234, $dispatched[0]->refreshedAt);
+        self::assertSame(1700001234, $dispatched[0]->scoreBaseline);
     }
 
     public function testReadDispatchCarriesReadWeightNotWarmWeightWhenTheyDiffer(): void
@@ -392,6 +392,6 @@ final class PersistentCacheRefreshOnTerminateListenerPriorityTest extends TestCa
 
         self::assertCount(1, $dispatched);
         self::assertNull($dispatched[0]->priorityWeight);
-        self::assertSame(1700001234, $dispatched[0]->refreshedAt);
+        self::assertSame(1700001234, $dispatched[0]->scoreBaseline);
     }
 }

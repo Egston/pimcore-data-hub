@@ -241,7 +241,7 @@ abstract class KernelTestCase extends PimcoreSupportTestCase
     }
 
     /**
-     * Returns id→(score, refreshedAt, message) for every envelope currently
+     * Returns id→(score, scoreBaseline, message) for every envelope currently
      * held in the priority transport's messages HASH, indexed by the ZSET id.
      *
      * Scans every `datahub_refresh_priority_*` ZSET, maps each ZSET key to its
@@ -258,9 +258,9 @@ abstract class KernelTestCase extends PimcoreSupportTestCase
      * that scrambled id→envelope pairings while preserving the sorted score
      * set is observable.
      *
-     * @return array<string, array{score: float, refreshedAt: ?int, message: PersistentRefreshMessage}>
+     * @return array<string, array{score: float, scoreBaseline: ?int, message: PersistentRefreshMessage}>
      */
-    final protected function envelopeRefreshedAtById(): array
+    final protected function envelopeScoreBaselineById(): array
     {
         $redis = $this->redis();
         $keys = $redis->keys('datahub_refresh_priority_*');
@@ -304,7 +304,7 @@ abstract class KernelTestCase extends PimcoreSupportTestCase
 
                 $rows[$id] = [
                     'score' => (float)$score,
-                    'refreshedAt' => $message->refreshedAt,
+                    'scoreBaseline' => $message->scoreBaseline,
                     'message' => $message,
                 ];
             }

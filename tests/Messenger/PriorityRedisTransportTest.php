@@ -327,7 +327,7 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertInstanceOf(PersistentRefreshMessage::class, $decoded);
         self::assertSame('client-x', $decoded->client);
         self::assertSame('OpRoundTrip', $decoded->operationName);
-        self::assertSame(1700000000, $decoded->refreshedAt);
+        self::assertSame(1700000000, $decoded->scoreBaseline);
         self::assertSame(3, $decoded->priorityWeight);
     }
 
@@ -359,7 +359,7 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertSame('stuck-id', (string)$stamp->getId());
         $decoded = $envelopes[0]->getMessage();
         self::assertInstanceOf(PersistentRefreshMessage::class, $decoded);
-        self::assertSame(500, $decoded->refreshedAt);
+        self::assertSame(500, $decoded->scoreBaseline);
         self::assertNotEmpty($transport->warnings);
     }
 

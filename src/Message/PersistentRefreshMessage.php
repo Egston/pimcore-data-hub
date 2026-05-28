@@ -23,7 +23,7 @@ final class PersistentRefreshMessage
         public readonly string $client,
         public readonly string $bodyJson,
         public readonly ?string $operationName = null,
-        public readonly ?int $refreshedAt = null,
+        public readonly ?int $scoreBaseline = null,
         /**
          * Per-operation priority weight consumed by {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
          * under the `oldest_refreshed_at_first_with_weight_bands` strategy to offset the score
@@ -46,7 +46,7 @@ final class PersistentRefreshMessage
          * dispatched from the invalidation listener or re-dispatched by the worker.
          * {@see \Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport::scoreFor()}
          * subtracts a constant read-trigger offset from a read's score so demand-driven
-         * reads sort strictly below every warm of the same refreshedAt. Reads must not
+         * reads sort strictly below every warm of the same scoreBaseline. Reads must not
          * carry a deliverAt; the constructor enforces this as an invariant.
          */
         public readonly bool $readTriggered = false

@@ -36,7 +36,7 @@ final class CooldownWindowDispatcherTest extends TestCase
             client: 'c1',
             bodyJson: '{"operationName":"OpTest"}',
             operationName: 'OpTest',
-            refreshedAt: time(),
+            scoreBaseline: time(),
             priorityWeight: 5,
         );
 

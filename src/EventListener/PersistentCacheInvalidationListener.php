@@ -293,7 +293,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                         client: $client,
                         bodyJson: $canonical,
                         operationName: $operation,
-                        refreshedAt: $now,
+                        scoreBaseline: $now,
                         priorityWeight: $priorityWeight,
                     );
 

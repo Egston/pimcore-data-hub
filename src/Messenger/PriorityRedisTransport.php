@@ -34,8 +34,9 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  * set alongside `datahub_persistent_*` cache markers and the Symfony Lock
  * resource space). Member ids are opaque UUID-v4.
  *
- * - ZSET `<zset_key>` — score: refreshedAt unix-seconds (or an absolute
- *   `deliverAt` due-time for scheduled refreshes), member: message id.
+ * - ZSET `<zset_key>` — score: a unix-seconds baseline sourced from
+ *   `PersistentRefreshMessage::$scoreBaseline` (or `time()` when unset), or an
+ *   absolute `deliverAt` due-time for scheduled refreshes; member: message id.
  *   `get()` reads the lowest-scored member whose score is `<= now` via
  *   ZRANGEBYSCORE, so future-dated (scheduled) members stay invisible until
  *   due while past-dated members drain longest-stale-first.
@@ -54,9 +55,9 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  * - `ack()`/`reject()`: HDEL on both messages and inflight in MULTI/EXEC.
  *
  * Score source rule: under the default `oldest_refreshed_at_first` strategy,
- * `scoreFor()` reads `PersistentRefreshMessage::$refreshedAt` when non-null,
+ * `scoreFor()` reads `PersistentRefreshMessage::$scoreBaseline` when non-null,
  * else `time()`. Under `oldest_refreshed_at_first_with_weight_bands`, the
- * score is `refreshedAt - (priorityWeight * weightBandSeconds)` so higher-weight
+ * score is `scoreBaseline - (priorityWeight * weightBandSeconds)` so higher-weight
  * messages drop into an earlier band and ZRANGEBYSCORE pops them first among
  * same-aged peers; `priorityWeight = null` falls back to the classifier's
  * neutral default of `1`. No other message types are special-cased;
@@ -268,7 +269,7 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
      * Score-extraction hook for the priority queue.
      *
      * Under `oldest_refreshed_at_first` (the default), the canonical source of
-     * truth is `PersistentRefreshMessage::$refreshedAt`; otherwise falls back
+     * truth is `PersistentRefreshMessage::$scoreBaseline`; otherwise falls back
      * to `time()` so non-Persistent messages and Persistent messages with no
      * per-entry context are still ordered against now.
      *
@@ -289,7 +290,7 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
      * no deliverAt) has a read-trigger offset (`$readTriggerOffsetSeconds`)
      * subtracted from its score under both banded/timestamp strategies, so every
      * demand-driven read sorts strictly below every speculative warm of the same
-     * refreshedAt. The hard-guarantee constraint `offset > priority_weight ×
+     * scoreBaseline. The hard-guarantee constraint `offset > priority_weight ×
      * $weightBandSeconds` (enforced by the config default) keeps a read below
      * even the highest-weight warm; the offset is sourced from config so it stays
      * coupled to the weight-band tuning rather than hardcoded.
@@ -319,8 +320,8 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
 
     private function baseScore(object $message): int
     {
-        if ($message instanceof PersistentRefreshMessage && $message->refreshedAt !== null) {
-            return $message->refreshedAt;
+        if ($message instanceof PersistentRefreshMessage && $message->scoreBaseline !== null) {
+            return $message->scoreBaseline;
         }
 
         return time();

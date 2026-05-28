@@ -57,7 +57,7 @@ final class CooldownWindowDispatcher
             client: $template->client,
             bodyJson: $template->bodyJson,
             operationName: $template->operationName,
-            refreshedAt: time(),
+            scoreBaseline: time(),
             priorityWeight: $template->priorityWeight,
             deliverAt: $deliverAt,
         ));
