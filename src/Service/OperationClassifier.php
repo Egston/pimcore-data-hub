@@ -158,6 +158,13 @@ class OperationClassifier
         return $this->readPriorityWeights[$operationName] ?? 1;
     }
 
+    public function bandWeightFor(string $operationName, bool $readTriggered): ?int
+    {
+        return $readTriggered
+            ? $this->getReadPriorityWeight($operationName)
+            : $this->getPriorityWeight($operationName);
+    }
+
     /**
      * Returns the per-operation invalidation-cooldown window in seconds, or
      * null when the operation has no cooldown configured (or is unclassified).

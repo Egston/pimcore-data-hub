@@ -221,6 +221,52 @@ final class OperationClassifierTest extends TestCase
         self::assertNull($classifier->getReadPriorityWeight('testOpUnknown'));
     }
 
+    public function testBandWeightForWithReadTriggeredFalseReturnsWarmWeight(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpBandWeight' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'priority_weight' => 7,
+                    'read_priority_weight' => 9,
+                ],
+            ],
+        ]);
+        self::assertSame(7, $classifier->bandWeightFor('testOpBandWeight', false));
+    }
+
+    public function testBandWeightForWithReadTriggeredTrueReturnsReadWeight(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpBandWeight' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'priority_weight' => 7,
+                    'read_priority_weight' => 9,
+                ],
+            ],
+        ]);
+        self::assertSame(9, $classifier->bandWeightFor('testOpBandWeight', true));
+    }
+
+    public function testBandWeightForUnclassifiedReturnsNull(): void
+    {
+        $classifier = $this->makeClassifier([
+            'operations' => [
+                'testOpBandWeight' => [
+                    'tier' => 'swr_only',
+                    'granularity' => 'list',
+                    'priority_weight' => 7,
+                    'read_priority_weight' => 9,
+                ],
+            ],
+        ]);
+        self::assertNull($classifier->bandWeightFor('testOpUnknown', true));
+        self::assertNull($classifier->bandWeightFor('testOpUnknown', false));
+    }
+
     public function testGetInvalidationCooldownReturnsValueWhenSet(): void
     {
         $classifier = $this->makeClassifier([

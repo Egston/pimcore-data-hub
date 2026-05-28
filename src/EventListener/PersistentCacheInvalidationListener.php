@@ -292,7 +292,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     : null;
                 if ($cooldown !== null) {
                     $now = time();
-                    $priorityWeight = $this->classifier?->getPriorityWeight($operation);
+                    $priorityWeight = $this->classifier?->bandWeightFor($operation, false);
 
                     $template = new PersistentRefreshMessage(
                         client: $client,
