@@ -676,6 +676,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         $cache->expects(self::never())->method('bumpFallbackWatermark');
         $cache->method('hasOperationCooldown')->with($hash)->willReturn(false);
         $cache->expects(self::once())->method('armOperationCooldown')->with($hash, 21600);
+        $cache->method('windowEndsAt')
+            ->willReturnCallback(fn (array $meta, int $cooldown): int => (int)($meta['lastRefreshAt'] ?? 0) + $cooldown);
 
         $dispatcher = new CooldownWindowDispatcher($bus, $cache);
 
@@ -1132,6 +1134,8 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             ->willReturnCallback(function (string $h) use (&$armed): bool {
                 return $armed[$h] ?? false;
             });
+        $cache->method('windowEndsAt')
+            ->willReturnCallback(fn (array $meta, int $cooldown): int => (int)($meta['lastRefreshAt'] ?? 0) + $cooldown);
 
         $dispatcher = new CooldownWindowDispatcher($bus, $cache);
 

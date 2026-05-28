@@ -286,7 +286,6 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     : null;
                 if ($cooldown !== null) {
                     $now = time();
-                    $lastRefreshAt = (int)($meta['lastRefreshAt'] ?? 0);
                     $priorityWeight = $this->classifier?->getPriorityWeight($operation);
 
                     $template = new PersistentRefreshMessage(
@@ -338,7 +337,12 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
 
                     // Within cooldown, no trailing scheduled yet: coalesce to a
                     // single window-end-dated trailing refresh.
-                    $this->cooldownDispatcher?->open($hash, $cooldown, $lastRefreshAt + $cooldown, $template);
+                    $this->cooldownDispatcher?->open(
+                        $hash,
+                        $cooldown,
+                        $this->persistentCache->windowEndsAt($meta, $cooldown),
+                        $template,
+                    );
                     Logger::info(sprintf(
                         'persistent_cache_invalidation: trailing refresh scheduled for op=%s at window end',
                         $operation

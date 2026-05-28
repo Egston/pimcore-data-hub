@@ -335,19 +335,6 @@ class PersistentOutputCacheService
     }
 
     /**
-     * Writes `lastRefreshAt` into the meta blob via the same fail-soft pattern as
-     * {@see stampInvalidatedAt}. Not currently on any production path — `lastRefreshAt`
-     * is written inline in {@see savePersistent}; this helper is available for future
-     * callers that need to advance the completion clock independently.
-     *
-     * @param array<string, mixed> $meta
-     */
-    public function stampLastRefreshAt(string $metaKey, array $meta, int $ts): void
-    {
-        $this->stampMetaField($metaKey, $meta, 'lastRefreshAt', $ts, 'datahub.swr.stamp_last_refresh_at_failed');
-    }
-
-    /**
      * @param array<string, mixed> $meta
      */
     private function stampMetaField(string $metaKey, array $meta, string $field, int $ts, string $errSlug): void
@@ -383,6 +370,19 @@ class PersistentOutputCacheService
     }
 
     /**
+     * Returns the window-end timestamp derived from `lastRefreshAt + $cooldown`.
+     * The leading-edge dispatch arm in {@see PersistentCacheInvalidationListener}
+     * intentionally uses `now + $cooldown` instead — do NOT route that site
+     * through this helper.
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function windowEndsAt(array $meta, int $cooldown): int
+    {
+        return (int)($meta['lastRefreshAt'] ?? 0) + $cooldown;
+    }
+
+    /**
      * Re-load the entry meta blob for a (client, body) pair at the point of use.
      * The worker reads `lastRefreshAt` / `invalidatedAt` from here at pop time so
      * the self-cancel / re-arm decision converges against current state rather
@@ -415,12 +415,11 @@ class PersistentOutputCacheService
 
     /**
      * Per-entry staleness predicate: an invalidation recorded after the last
-     * refresh-start means the cached payload predates the edit. Public so the
-     * worker can evaluate the trailing-pop self-cancel decision.
+     * refresh-start means the cached payload predates the edit.
      *
      * @param array<string, mixed> $meta
      */
-    public function isEntryStaleByTimestamps(array $meta): bool
+    private function isEntryStaleByTimestamps(array $meta): bool
     {
         $refreshedAt = (int)($meta['refreshedAt'] ?? 0);
         $invalidatedAt = (int)($meta['invalidatedAt'] ?? 0);
@@ -482,6 +481,36 @@ class PersistentOutputCacheService
     public function clearOperationCooldown(string $hash): void
     {
         $this->cacheRemove(self::KEY_OP_COOLDOWN_PREFIX . $hash);
+    }
+
+    public function loadPendingFlag(string $hash): bool
+    {
+        $value = $this->cacheLoad(self::PENDING_REFRESH_PREFIX . $hash);
+
+        return $value !== false && $value !== null;
+    }
+
+    /**
+     * Re-throws any exception propagated by the underlying cache layer (e.g. key
+     * validation, write-lock acquisition, PHP errors). Callers with a narrow
+     * decision-affecting catch — currently {@see PersistentRefreshMessageHandler::cancelTrailing()}
+     * — must NOT swallow internally; the fault must reach the caller's catch so
+     * the cancel decision stays consistent with whatever side-effect did or did
+     * not happen.
+     */
+    public function clearPendingFlag(string $hash): void
+    {
+        $this->cacheRemove(self::PENDING_REFRESH_PREFIX . $hash);
+    }
+
+    /**
+     * Re-throw shape is symmetric with {@see clearPendingFlag}: any exception from
+     * the cache layer propagates to the caller. Callers in decision-affecting
+     * catches must not swallow internally.
+     */
+    public function clearEnqueueDedupe(string $hash): void
+    {
+        $this->cacheRemove(self::ENQUEUE_DEDUPE_PREFIX . $hash);
     }
 
     /**

@@ -230,16 +230,16 @@ final class PersistentRefreshMessageHandler
     private function reconcileCoalesceFlags(PersistentRefreshMessage $message, string $operationName, string $hash): void
     {
         try {
-            $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX . $hash;
-            $pendingKey = PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash;
+            if ($this->persistentCache === null) {
+                return;
+            }
 
-            $pending = \Pimcore\Cache::load($pendingKey);
-            $hasPending = $pending !== false && $pending !== null;
+            $hasPending = $this->persistentCache->loadPendingFlag($hash);
 
             if ($hasPending) {
-                \Pimcore\Cache::remove($pendingKey);
+                $this->persistentCache->clearPendingFlag($hash);
             }
-            \Pimcore\Cache::remove($dedupeKey);
+            $this->persistentCache->clearEnqueueDedupe($hash);
 
             if ($hasPending && $this->bus !== null) {
                 $this->bus->dispatch(new PersistentRefreshMessage(
@@ -256,7 +256,7 @@ final class PersistentRefreshMessageHandler
             }
         } catch (\Throwable $e) {
             $this->logWarning(sprintf(
-                'datahub.refresh_handler: coalesce-flag reconcile failed for %s: %s',
+                'datahub.refresh_handler: coalesce-flag reconcile or trailing-dispatch failed for %s: %s',
                 $operationName,
                 $e->getMessage()
             ));
@@ -410,7 +410,7 @@ final class PersistentRefreshMessageHandler
     private function cancelTrailing(string $hash): void
     {
         try {
-            \Pimcore\Cache::remove(PersistentOutputCacheService::PENDING_REFRESH_PREFIX . $hash);
+            $this->persistentCache?->clearPendingFlag($hash);
         } catch (\Throwable $e) {
             $this->logWarning('datahub.refresh_handler: pending-flag clear failed on cancel: ' . $e->getMessage());
         }
@@ -425,12 +425,11 @@ final class PersistentRefreshMessageHandler
      */
     private function rearmTrailing(PersistentRefreshMessage $message, array $meta, int $cooldown, string $operationName, string $hash): void
     {
-        if ($this->cooldownDispatcher === null) {
+        if ($this->cooldownDispatcher === null || $this->persistentCache === null) {
             return;
         }
 
-        $lastRefreshAt = (int)($meta['lastRefreshAt'] ?? 0);
-        $this->cooldownDispatcher->open($hash, $cooldown, $lastRefreshAt + $cooldown, $message);
+        $this->cooldownDispatcher->open($hash, $cooldown, $this->persistentCache->windowEndsAt($meta, $cooldown), $message);
         Logger::info(sprintf(
             'datahub.refresh_handler: trailing refresh re-armed for op=%s at window end',
             $operationName

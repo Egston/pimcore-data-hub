@@ -1323,73 +1323,76 @@ final class PersistentOutputCacheServiceTest extends TestCase
         $service->stampInvalidatedAt('some_meta_key', $meta, time());
     }
 
-    public function testStampLastRefreshAtWritesIntoMetaBlobPreservingExistingKeys(): void
+    public function testWindowEndsAtReturnsLastRefreshAtPlusCooldown(): void
     {
-        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
-            ->setConstructorArgs([$this->makeContainer([
-                'persistent_output_cache_enabled' => true,
-                'persistent_output_cache_lifetime' => 60,
-            ])])
-            ->onlyMethods(['cacheSave'])
-            ->getMock();
+        $service = new PersistentOutputCacheService($this->makeContainer([
+            'persistent_output_cache_enabled' => true,
+        ]));
 
-        $now = time();
-        $meta = [
-            'refreshedAt' => $now - 100,
-            'client'      => 'c1',
-            'operation'   => 'SomeOp',
-            'tags'        => ['datahub_graphql_persistent', 'datahub_graphql_op_SomeOp'],
-        ];
+        $lastRefreshAt = 1_000_000;
+        $cooldown = 3600;
+        $meta = ['lastRefreshAt' => $lastRefreshAt];
 
-        $saved = [];
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
-            $saved[] = compact('key', 'value', 'tags', 'ttl');
-        });
-
-        $service->stampLastRefreshAt('persistent_output_meta_abc', $meta, $now);
-
-        $this->assertCount(1, $saved);
-        $this->assertSame('persistent_output_meta_abc', $saved[0]['key']);
-        $this->assertSame($now, $saved[0]['value']['lastRefreshAt']);
-        $this->assertSame($now - 100, $saved[0]['value']['refreshedAt'], 'existing meta keys must be preserved');
-        $this->assertSame(['datahub_graphql_persistent', 'datahub_graphql_op_SomeOp'], $saved[0]['tags']);
+        $this->assertSame($lastRefreshAt + $cooldown, $service->windowEndsAt($meta, $cooldown));
+        $this->assertSame($cooldown, $service->windowEndsAt([], $cooldown), 'absent lastRefreshAt treated as 0');
     }
 
-    public function testStampLastRefreshAtFallsBackToTagCommonWhenMetaHasNoTags(): void
+    public function testClearPendingFlagRaisesOnCacheFault(): void
     {
         $service = $this->getMockBuilder(PersistentOutputCacheService::class)
             ->setConstructorArgs([$this->makeContainer([
                 'persistent_output_cache_enabled' => true,
-                'persistent_output_cache_lifetime' => 60,
             ])])
-            ->onlyMethods(['cacheSave'])
+            ->onlyMethods(['cacheRemove'])
             ->getMock();
 
-        $saved = [];
-        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
-            $saved[] = compact('key', 'value', 'tags', 'ttl');
-        });
+        $service->method('cacheRemove')->willThrowException(new \RuntimeException('cache down'));
 
-        $service->stampLastRefreshAt('persistent_output_meta_abc', ['operation' => 'Op'], time());
-
-        $this->assertCount(1, $saved);
-        $this->assertSame([PersistentOutputCacheService::TAG_COMMON], $saved[0]['tags']);
+        $this->expectException(\RuntimeException::class);
+        $service->clearPendingFlag('somehash');
     }
 
-    public function testStampLastRefreshAtSwallowsCacheSaveFailure(): void
+    public function testLoadPendingFlagReturnsTrueWhenCacheHit(): void
     {
         $service = $this->getMockBuilder(PersistentOutputCacheService::class)
             ->setConstructorArgs([$this->makeContainer([
                 'persistent_output_cache_enabled' => true,
-                'persistent_output_cache_lifetime' => 60,
             ])])
-            ->onlyMethods(['cacheSave'])
+            ->onlyMethods(['cacheLoad'])
             ->getMock();
 
-        $service->method('cacheSave')->willThrowException(new \RuntimeException('cache down'));
+        $service->method('cacheLoad')->willReturn('1');
 
-        $this->expectNotToPerformAssertions();
-        $service->stampLastRefreshAt('some_meta_key', ['operation' => 'Op'], time());
+        $this->assertTrue($service->loadPendingFlag('somehash'));
+    }
+
+    public function testLoadPendingFlagReturnsFalseWhenCacheMiss(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheLoad'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturn(false);
+
+        $this->assertFalse($service->loadPendingFlag('somehash'));
+    }
+
+    public function testClearEnqueueDedupeRaisesOnCacheFault(): void
+    {
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer([
+                'persistent_output_cache_enabled' => true,
+            ])])
+            ->onlyMethods(['cacheRemove'])
+            ->getMock();
+
+        $service->method('cacheRemove')->willThrowException(new \RuntimeException('cache down'));
+
+        $this->expectException(\RuntimeException::class);
+        $service->clearEnqueueDedupe('somehash');
     }
 
     /**

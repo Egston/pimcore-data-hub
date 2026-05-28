@@ -629,6 +629,8 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         ]);
         $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
         $persistentCache->method('isPastCooldown')->willReturn(false);
+        $persistentCache->method('windowEndsAt')
+            ->willReturnCallback(fn (array $meta, int $cooldown): int => (int)($meta['lastRefreshAt'] ?? 0) + $cooldown);
         $persistentCache->expects(self::never())->method('clearOperationCooldown');
 
         $dispatched = [];
@@ -822,6 +824,8 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         ]);
         $persistentCache->method('isEntryStaleWithWatermark')->willReturn(true);
         $persistentCache->method('isPastCooldown')->willReturn(false);
+        $persistentCache->method('windowEndsAt')
+            ->willReturnCallback(fn (array $meta, int $cooldown): int => (int)($meta['lastRefreshAt'] ?? 0) + $cooldown);
 
         $dispatched = [];
         $bus = $this->createMock(\Symfony\Component\Messenger\MessageBusInterface::class);
@@ -840,6 +844,33 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         self::assertInstanceOf(PersistentRefreshMessage::class, $dispatched[0]);
         self::assertFalse($dispatched[0]->readTriggered, 'a worker-re-dispatched trailing must be a warm, never a read');
         self::assertSame($lastRefreshAt + 21600, $dispatched[0]->deliverAt, 're-arm must date at current lastRefreshAt + cooldown');
+    }
+
+    public function testCancelTrailingCompletesWhenPendingClearFails(): void
+    {
+        $classifier = $this->makeCooldownClassifier('OpCancel2', 21600);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpCancel2"}';
+        $hash = PersistentOutputCacheService::entryHashFromBody('c1', $body);
+
+        $persistentCache = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCache->method('loadEntryMeta')->willReturn(['refreshedAt' => 200, 'invalidatedAt' => 100]);
+        $persistentCache->method('isEntryStaleWithWatermark')->willReturn(false);
+        $persistentCache->method('clearPendingFlag')
+            ->willThrowException(new \RuntimeException('cache down'));
+        $persistentCache->expects(self::once())->method('clearOperationCooldown')->with($hash);
+
+        $bus = $this->createMock(\Symfony\Component\Messenger\MessageBusInterface::class);
+        $bus->expects(self::never())->method('dispatch');
+
+        $handler = $this->makeCooldownHandler($classifier, $lockFactory, $controller, $persistentCache, $bus);
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpCancel2', time(), null, time() + 21600);
+        $handler($msg);
     }
 
     private function makeCooldownClassifier(string $operationName, int $cooldownTtl): OperationClassifier
