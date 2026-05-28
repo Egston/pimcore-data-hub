@@ -785,10 +785,12 @@ class PersistentOutputCacheService
 
     /**
      * Resolve the per-object / per-class tag set for the current request from
-     * the DependencyCollector, gated on the operation's granularity. SINGLE
-     * with an empty collector raises an in-flight warning — the canonical
-     * detector for missing POST_LOAD coverage (raw-SQL hydrators bypass the
-     * subscriber and the collector stays empty).
+     * the DependencyCollector, gated on the operation's granularity. Any
+     * granularity with an empty collector raises an in-flight warning — the
+     * canonical detector for missing POST_LOAD coverage (raw-SQL hydrators
+     * bypass the subscriber and the collector stays empty). A LIST op with an
+     * empty collector is just as broken as a SINGLE one: its reverse-index
+     * entry is never written and invalidation can never find it.
      *
      * @return list<string>
      */
@@ -801,7 +803,7 @@ class PersistentOutputCacheService
         if ($granularity === null) {
             return [];
         }
-        if ($granularity === Granularity::SINGLE && !$this->dependencyCollector->hasRecordedAny()) {
+        if (!$this->dependencyCollector->hasRecordedAny()) {
             $this->logCollectorEmptyOnSave($operationName, $client);
         }
 
@@ -810,11 +812,11 @@ class PersistentOutputCacheService
 
     /**
      * Loud in-flight detector for the missing-POST_LOAD-coverage failure
-     * mode: SINGLE-granularity operations should always record at least one
-     * element before writing to the persistent cache. Raw-SQL hydrators
-     * bypass the POST_LOAD subscriber and the collector stays empty,
-     * producing a write with no per-object tags — invalidation would then
-     * miss it entirely.
+     * mode: every classified op should record at least one element before
+     * writing to the persistent cache. Raw-SQL hydrators bypass the
+     * POST_LOAD subscriber and the collector stays empty, producing a write
+     * with no per-object or per-class tags — the reverse-index entry is
+     * never created and invalidation can never find this query later.
      *
      * Separated from the call site so tests can observe the trigger
      * condition without booting the Pimcore kernel (the Logger facade
