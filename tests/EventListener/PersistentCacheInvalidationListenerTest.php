@@ -821,6 +821,119 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
         self::assertNull($dispatched[0]->deliverAt, 'non-cooldown op must dispatch an immediate (null deliverAt) refresh');
     }
 
+    public function testNonCooldownDispatchStampsInvalidatedAt(): void
+    {
+        // Regression: the worker's freshness guard reads `invalidatedAt` on the
+        // meta as the per-entry staleness signal. Stamping was originally scoped
+        // to the cooldown-aware branch, so every refresh dispatched for an op
+        // without invalidation_cooldown_ttl was rejected as "already fresh" and
+        // silently dropped. Stamp must happen on the immediate-dispatch path too.
+        $object = $this->makeDataObject(123);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_123';
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_nc2', 'persistent_output_meta_nc2'],
+            ],
+            'persistent_output_meta_nc2' => [
+                'client' => 'c1',
+                'canonical' => '{"q":"nocooldown-stamp"}',
+                'operation' => 'PlainOp',
+            ],
+        ];
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->method('dispatch')->willReturnCallback(fn (object $msg) => new Envelope($msg));
+
+        $before = time();
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::once())->method('stampInvalidatedAt')
+            ->with(
+                'persistent_output_meta_nc2',
+                self::callback(fn ($m) => is_array($m) && ($m['operation'] ?? null) === 'PlainOp'),
+                self::callback(fn ($ts) => $ts >= $before)
+            );
+
+        $classifier = $this->makeClassifier([
+            'PlainOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $listener->mark(new DataObjectEvent($object));
+    }
+
+    public function testNonCooldownCoalescedDispatchStampsInvalidatedAt(): void
+    {
+        // Same regression on the coalesce arm: when the dedupe sentinel is alive
+        // from a prior dispatch, the in-flight refresh that the worker is about
+        // to execute must still see this entry as stale. Without the stamp it
+        // self-cancels and the second invalidation is lost.
+        $object = $this->makeDataObject(124);
+        $sanitizedClass = str_replace('\\', '_', ltrim(get_class($object), '\\'));
+        $objectTag = PersistentOutputCacheService::TAG_OBJECT_PREFIX . $sanitizedClass . '_124';
+
+        $client = 'c1';
+        $canonical = '{"q":"nocooldown-coalesce"}';
+        $dedupeKey = PersistentOutputCacheService::ENQUEUE_DEDUPE_PREFIX
+            . PersistentOutputCacheService::entryHash($client, $canonical);
+
+        $store = [
+            PersistentOutputCacheService::REVERSE_INDEX_PREFIX . $objectTag => [
+                ['persistent_output_payload_nc3', 'persistent_output_meta_nc3'],
+            ],
+            'persistent_output_meta_nc3' => [
+                'client' => $client,
+                'canonical' => $canonical,
+                'operation' => 'PlainOp',
+            ],
+            $dedupeKey => 1,
+        ];
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects(self::never())->method('dispatch');
+
+        $before = time();
+
+        $cache = $this->createMock(PersistentOutputCacheService::class);
+        $cache->expects(self::never())->method('bumpFallbackWatermark');
+        $cache->expects(self::once())->method('stampInvalidatedAt')
+            ->with(
+                'persistent_output_meta_nc3',
+                self::callback(fn ($m) => is_array($m) && ($m['operation'] ?? null) === 'PlainOp'),
+                self::callback(fn ($ts) => $ts >= $before)
+            );
+
+        $classifier = $this->makeClassifier([
+            'PlainOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+        ]);
+
+        $listener = $this->makeListener(
+            [
+                'persistent_refresh_queue_enabled' => true,
+                'persistent_enqueue_dedupe_ttl' => 60,
+            ],
+            $bus,
+            $cache,
+            $store,
+            $classifier
+        );
+
+        $listener->mark(new DataObjectEvent($object));
+    }
+
     public function testAllEntriesCooldownHandledDoesNotBumpWatermark(): void
     {
         // When every surviving reverse-index entry is a cooldown op that is
@@ -1281,11 +1394,19 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             return new Envelope($msg);
         });
 
+        $before = time();
+
         $cache = $this->createMock(PersistentOutputCacheService::class);
         $cache->method('isPastCooldown')->willReturn(false);
         $cache->method('hasOperationCooldown')->willReturn(false);
         $cache->method('windowEndsAt')
             ->willReturnCallback(fn (array $meta, int $cooldown): int => (int)($meta['lastRefreshAt'] ?? 0) + $cooldown);
+        $cache->expects(self::once())->method('stampInvalidatedAt')
+            ->with(
+                'persistent_output_meta_ot',
+                self::callback(fn ($m) => is_array($m) && ($m['operation'] ?? null) === 'CooldownOp'),
+                self::callback(fn ($ts) => $ts >= $before)
+            );
 
         $dispatcher = new CooldownWindowDispatcher($bus, $cache);
 
@@ -1309,7 +1430,6 @@ final class PersistentCacheInvalidationListenerTest extends TestCase
             $dispatcher
         );
 
-        $before = time();
         $listener->mark(new DataObjectEvent($object));
 
         self::assertCount(1, $dispatched, 'open-trailing arm dispatches exactly one dated message');

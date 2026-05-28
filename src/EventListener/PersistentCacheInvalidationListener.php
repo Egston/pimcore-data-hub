@@ -162,11 +162,15 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
             Logger::error('persistent_cache_invalidation: ' . $e->getMessage(), ['exception' => $e]);
 
             // Safety floor: bump the watermark so any exception in the queue-dispatch path
-            // does not silently drop the invalidation signal.
+            // does not silently drop the invalidation signal. If the bump itself fails,
+            // log it distinctly — that's the actual "we lost the invalidation" event.
             try {
                 $this->persistentCache->bumpFallbackWatermark();
-            } catch (\Throwable) {
-                // best effort
+            } catch (\Throwable $bumpErr) {
+                Logger::error(
+                    'persistent_cache_invalidation: watermark-bump fallback failed',
+                    ['exception' => $bumpErr]
+                );
             }
         }
     }
@@ -284,14 +288,20 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                 }
 
                 $hash = PersistentOutputCacheService::entryHash($client, $canonical);
+                // Single `$now` per entry: stamp + dispatch score baseline share it
+                // so the refresh score never predates the invalidation it answers.
+                $now = time();
 
-                $this->persistentCache->stampInvalidatedAt($metaKey, $meta, time());
+                // Worker's freshness guard reads `invalidatedAt` regardless of
+                // dispatch arm; coalesced arms (no new dispatch) rely on the
+                // stamp to drive re-fire via meta re-read at pop time. Must
+                // precede the dispatch-arm fork.
+                $this->persistentCache->stampInvalidatedAt($metaKey, $meta, $now);
 
                 $cooldown = $operation !== '' && $this->classifier !== null
                     ? $this->classifier->getInvalidationCooldown($operation)
                     : null;
                 if ($cooldown !== null) {
-                    $now = time();
                     $priorityWeight = $this->classifier?->bandWeightFor($operation, false);
 
                     $template = new PersistentRefreshMessage(
@@ -388,7 +398,7 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                     $client,
                     $canonical,
                     $operation !== '' ? $operation : null,
-                    time()
+                    $now
                 ));
                 $result['dispatched'][] = [
                     'op' => $operation !== '' ? $operation : '?',
