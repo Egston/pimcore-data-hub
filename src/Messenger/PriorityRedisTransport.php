@@ -49,10 +49,24 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  * Atomic invariants:
  * - `send()`: ZADD + HSET in MULTI/EXEC. On retry (id already in inflight)
  *   the ZSET score is bumped by the requeue-score knob so contended messages
- *   sink behind fresher arrivals.
- * - `get()`: ZRANGEBYSCORE (read due member) then ZREM + HGET messages +
- *   HSET inflight in MULTI/EXEC.
+ *   sink behind fresher arrivals. MULTI/EXEC is N-consumer-safe here: send
+ *   only ever adds, so concurrent senders cannot lose a write to a racing pop.
+ * - `get()`: a single Lua script does ZRANGEBYSCORE (lowest due member),
+ *   ZREM, HGET messages, HSET inflight in one uninterruptible step. Folding
+ *   the read and the claim into one EVAL is what makes exactly-one-consumer
+ *   wins each message hold at N≥2 — a non-atomic ZRANGEBYSCORE+ZREM could
+ *   hand the same id to two consumers between the read and the remove.
+ * - `reapStuckInflight()`: candidate selection (HGETALL snapshot, score
+ *   re-derivation) is PHP-side, but each reclaim runs a Lua script that
+ *   re-asserts the id is still inflight and still stale before ZADD + HDEL,
+ *   so two reapers cannot resurrect the same id twice.
  * - `ack()`/`reject()`: HDEL on both messages and inflight in MULTI/EXEC.
+ *   Deletes are idempotent, so concurrent acks of distinct ids are safe.
+ *
+ * The watermark, dedupe/cooldown sentinels, and herd-guard/cold-miss locks
+ * that the persistent-cache layer relies on do not live in this transport:
+ * they use SET NX PX (Symfony Lock) and single-key SET/GETSET (sentinels),
+ * which are individually atomic Redis commands and need no Lua wrapping here.
  *
  * Score source rule: under the default `oldest_refreshed_at_first` strategy,
  * `scoreFor()` reads `PersistentRefreshMessage::$scoreBaseline` when non-null,
@@ -65,8 +79,54 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  */
 class PriorityRedisTransport implements TransportInterface, MessageCountAwareInterface
 {
-    // hGet is queued second in the get() pipeline (after zRem) → body at this index.
-    private const BODY_RESULT_INDEX = 1;
+    // Script-identity token (first ARGV element / Lua `ARGV[1]`): the FakeRedis
+    // double dispatches on it; inert against a real Redis (the Lua body ignores it).
+    private const POP_SCRIPT_TAG = 'pop';
+
+    private const RECLAIM_SCRIPT_TAG = 'reclaim';
+
+    // Marker strings returned by POP_SCRIPT — keep in sync with self::POP_SCRIPT.
+    private const POP_EMPTY    = 'empty';
+
+    private const POP_ZREM_MISS = 'zrem_miss';
+
+    private const POP_TORN     = 'torn';
+
+    private const POP_OK       = 'ok';
+
+    private const POP_SCRIPT = <<<'LUA'
+        local id = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[2], 'LIMIT', 0, 1)[1]
+        if id == nil then
+            return {'empty'}
+        end
+        if redis.call('ZREM', KEYS[1], id) == 0 then
+            return {'zrem_miss'}
+        end
+        local body = redis.call('HGET', KEYS[2], id)
+        redis.call('HSET', KEYS[3], id, ARGV[3])
+        if body == false then
+            return {'torn', id}
+        end
+        return {'ok', id, body}
+        LUA;
+
+    private const RECLAIM_SCRIPT = <<<'LUA'
+        local meta = redis.call('HGET', KEYS[2], ARGV[2])
+        if meta == false then
+            return 0
+        end
+        local ok, decoded = pcall(cjson.decode, meta)
+        if not ok or type(decoded) ~= 'table' then
+            return 0
+        end
+        local poppedAt = tonumber(decoded.poppedAt)
+        if poppedAt == nil or poppedAt >= tonumber(ARGV[4]) then
+            return 0
+        end
+        redis.call('ZADD', KEYS[1], ARGV[3], ARGV[2])
+        redis.call('HDEL', KEYS[2], ARGV[2])
+        return 1
+        LUA;
 
     public function __construct(
         private \Redis $redis,
@@ -86,49 +146,59 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
     {
         $this->reapStuckInflight();
 
-        // ZRANGEBYSCORE with an upper bound of `now` is the scheduled-delivery
-        // gate: a future-scored member (a cooldown-throttled refresh dated via
-        // PersistentRefreshMessage::$deliverAt) is invisible until due, while
-        // every normal refresh (score <= now) is returned immediately. The
-        // explicit ZREM that follows replaces the atomicity ZPOPMIN gave us.
-        // The race window is between this pre-MULTI read and the ZREM inside
-        // the MULTI/EXEC below; non-atomic ZRANGEBYSCORE+ZREM is safe only at
-        // replicas: 1, so a Lua wrap is required to scale past one consumer.
-        try {
-            $candidates = $this->redis->zRangeByScore(
-                $this->zsetKey,
-                '-inf',
-                (string)time(),
-                ['limit' => [0, 1]]
-            );
-        } catch (\Throwable $e) {
-            throw new TransportException('datahub.priority_transport: zRangeByScore failed: ' . $e->getMessage(), 0, $e);
-        }
-
-        if (!is_array($candidates) || $candidates === []) {
-            return [];
-        }
-
-        $id = (string)($candidates[0] ?? '');
-        if ($id === '') {
-            return [];
-        }
+        // The Lua pop reads the lowest due member (ZRANGEBYSCORE upper-bounded
+        // at `now` — the scheduled-delivery gate: a future-scored member dated
+        // via PersistentRefreshMessage::$deliverAt stays invisible until due),
+        // then ZREM + HGET + HSET-inflight in one uninterruptible step so no
+        // second consumer can claim the same id between read and remove.
+        $now = time();
 
         try {
-            $this->redis->multi();
-            $this->redis->zRem($this->zsetKey, $id);
-            $this->redis->hGet($this->messagesKey, $id);
-            $this->redis->hSet(
-                $this->inflightKey,
-                $id,
-                (string)json_encode(['poppedAt' => time()], JSON_UNESCAPED_SLASHES)
+            $result = $this->redis->eval(
+                self::POP_SCRIPT,
+                [
+                    $this->zsetKey,
+                    $this->messagesKey,
+                    $this->inflightKey,
+                    self::POP_SCRIPT_TAG,
+                    (string)$now,
+                    (string)json_encode(['poppedAt' => $now], JSON_UNESCAPED_SLASHES),
+                ],
+                3
             );
-            $pipelineResult = $this->redis->exec();
         } catch (\Throwable $e) {
             throw new TransportException('datahub.priority_transport: get pipeline failed: ' . $e->getMessage(), 0, $e);
         }
 
-        if (!is_array($pipelineResult) || count($pipelineResult) < 2 || $pipelineResult[self::BODY_RESULT_INDEX] === false || !is_string($pipelineResult[self::BODY_RESULT_INDEX])) {
+        if (!is_array($result) || $result === []) {
+            return [];
+        }
+
+        $marker = (string)($result[0] ?? '');
+
+        if ($marker === self::POP_EMPTY) {
+            return [];
+        }
+
+        // ZREM removing nothing inside an atomic EVAL means external interference
+        // (manual ZREM, a buggy non-transport client, or a flush) removed the
+        // member after ZRANGEBYSCORE but before ZREM in the same script. Surface it
+        // loudly rather than silently returning [].
+        if ($marker === self::POP_ZREM_MISS) {
+            $this->logWarning('datahub.priority_transport: zRem == 0 — id already claimed by a concurrent consumer');
+
+            return [];
+        }
+
+        if ($marker !== self::POP_TORN && $marker !== self::POP_OK) {
+            $this->logError('datahub.priority_transport: unknown pop marker \'' . $marker . '\'');
+
+            return [];
+        }
+
+        $id = (string)($result[1] ?? '');
+
+        if ($marker === self::POP_TORN || !is_string($result[2] ?? null)) {
             $this->logWarning('datahub.priority_transport: torn write — id ' . $id . ' in ZSET but absent from messages HASH; discarding');
 
             try {
@@ -140,7 +210,7 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
             return [];
         }
 
-        $body = $pipelineResult[self::BODY_RESULT_INDEX];
+        $body = (string)$result[2];
 
         try {
             $envelope = $this->serializer->decode(['body' => $body]);
@@ -162,6 +232,12 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
         return [$envelope->with(new TransportMessageIdStamp($id))];
     }
 
+    /**
+     * MULTI-atomic and N-consumer-safe: each consumer acks only the exclusive
+     * id it won via the atomic ZREM in get(), so two acks always operate on
+     * distinct ids. HDEL is idempotent, so a duplicate ack of the same id is
+     * also safe.
+     */
     public function ack(Envelope $envelope): void
     {
         $id = $this->extractId($envelope);
@@ -183,6 +259,10 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
         }
     }
 
+    /**
+     * MULTI-atomic and N-consumer-safe as-is, same idempotent-HDEL reasoning
+     * as ack().
+     */
     public function reject(Envelope $envelope): void
     {
         $id = $this->extractId($envelope);
@@ -206,6 +286,11 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
         $this->logError('datahub.priority_transport: message rejected (id ' . $id . ')');
     }
 
+    /**
+     * MULTI-atomic and N-consumer-safe as-is: send only adds (ZADD + HSET), so
+     * a concurrent pop cannot tear an in-progress send — at worst the pop runs
+     * just before the ZADD and the message waits for the next get().
+     */
     public function send(Envelope $envelope): Envelope
     {
         $message = $envelope->getMessage();
@@ -396,14 +481,28 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
                 }
             }
 
+            // Re-assert under the script that the id is still inflight and
+            // still older than threshold before reclaiming: two reapers racing
+            // the same snapshot must not both ZADD it. The script fails closed
+            // (returns 0, no ZADD) when the entry is gone or already fresh.
             try {
-                $this->redis->multi();
-                $this->redis->zAdd($this->zsetKey, $score, $id);
-                $this->redis->hDel($this->inflightKey, $id);
-                $this->redis->exec();
-                ++$reaped;
-            } catch (\Throwable) {
-                // best effort — next reaper pass will retry
+                $reclaimed = $this->redis->eval(
+                    self::RECLAIM_SCRIPT,
+                    [
+                        $this->zsetKey,
+                        $this->inflightKey,
+                        self::RECLAIM_SCRIPT_TAG,
+                        $id,
+                        (string)$score,
+                        (string)$threshold,
+                    ],
+                    2
+                );
+                if ($reclaimed === 1) {
+                    ++$reaped;
+                }
+            } catch (\Throwable $e) {
+                $this->logError('datahub.priority_transport: reclaim script failed for id ' . $id . ': ' . $e->getMessage());
             }
         }
 
