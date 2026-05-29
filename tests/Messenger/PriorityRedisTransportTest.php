@@ -22,6 +22,7 @@ use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\TransportException;
+use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
@@ -388,19 +389,34 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertLessThanOrEqual($now + 5, (int)$scores[0]);
     }
 
-    public function testRetryBumpsScoreWhenIdAlreadyInflight(): void
+    public function testRetryBumpsScoreWhenRedeliveryStampPresent(): void
     {
         $redis = new FakeRedis();
         $transport = $this->makeTransport($redis, null, 600, 7);
 
-        $idStamp = new TransportMessageIdStamp('reused-id');
         $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1000, null);
 
-        $redis->hashes[self::INFLIGHT] = ['reused-id' => '{"poppedAt":' . time() . '}'];
+        // A retry re-send carries a RedeliveryStamp; the score is bumped so the
+        // contended message sinks behind fresher arrivals.
+        $transport->send(new Envelope($message, [new RedeliveryStamp(1)]));
 
-        $transport->send(new Envelope($message, [$idStamp]));
+        $scores = $redis->zsets[self::ZSET];
+        self::assertCount(1, $scores);
+        self::assertSame(1007, (int)reset($scores));
+    }
 
-        self::assertSame(1007, (int)$redis->zsets[self::ZSET]['reused-id']);
+    public function testSendMintsFreshIdIgnoringInboundTransportIdStamp(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1000, null);
+        $transport->send(new Envelope($message, [new TransportMessageIdStamp('inbound-id')]));
+
+        // The inbound id must not become the queue id — reusing it is what let a
+        // later reject() of the original tear the re-queued retry copy.
+        self::assertArrayNotHasKey('inbound-id', $redis->zsets[self::ZSET]);
+        self::assertCount(1, $redis->zsets[self::ZSET]);
     }
 
     public function testEnvelopeRoundTripsViaSerializer(): void
@@ -510,6 +526,29 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertArrayNotHasKey($id, $redis->hashes[self::MESSAGES]);
         self::assertArrayNotHasKey($id, $redis->hashes[self::INFLIGHT]);
         self::assertNotEmpty($transport->errors);
+    }
+
+    public function testRecoverableRetryReSendSurvivesRejectOfOriginal(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        $message = new PersistentRefreshMessage('c1', '{"query":"x"}', 'OpRetry', 1700000000, null);
+        $transport->send(new Envelope($message));
+
+        $received = iterator_to_array($transport->get())[0];
+
+        // Symfony's retry flow re-sends the received envelope (still carrying
+        // its TransportMessageIdStamp) and then rejects the original. The retry
+        // copy must not collide on the original's queue id, or reject()'s body
+        // HDEL discards it as a torn write and the refresh is silently dropped.
+        $transport->send($received->with(new RedeliveryStamp(1)));
+        $transport->reject($received);
+
+        $redelivered = iterator_to_array($transport->get());
+        self::assertCount(1, $redelivered, 'retried message was lost as a torn-write discard');
+        self::assertSame('OpRetry', $redelivered[0]->getMessage()->operationName);
+        self::assertSame([], $transport->warnings, 'no torn-write warning should fire for a clean retry');
     }
 
     public function testScoreForUnderDefaultStrategyIgnoresPriorityWeight(): void

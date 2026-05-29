@@ -21,6 +21,7 @@ use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Logger;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\TransportException;
+use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
@@ -295,20 +296,22 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
     {
         $message = $envelope->getMessage();
 
-        $existingIdStamp = $envelope->last(TransportMessageIdStamp::class);
-        $id = $existingIdStamp instanceof TransportMessageIdStamp
-            ? (string)$existingIdStamp->getId()
-            : $this->newMessageId();
+        // Always mint a fresh queue id, even when the envelope arrives with a
+        // TransportMessageIdStamp. Messenger's retry flow re-sends the received
+        // envelope (carrying that stamp) and *then* reject()s the original by
+        // the same id; reusing the inbound id would let that reject() HDEL the
+        // body of the just-re-queued retry copy, discarding it as a torn write
+        // — the retry would be silently dropped instead of redelivered. A fresh
+        // id keeps the retry copy distinct from the original the worker rejects.
+        $id = $this->newMessageId();
 
         $score = $this->scoreFor($message);
 
-        try {
-            $isRetry = $this->redis->hExists($this->inflightKey, $id) === true;
-        } catch (\Throwable $e) {
-            throw new TransportException('datahub.priority_transport: hExists failed: ' . $e->getMessage(), 0, $e);
-        }
-
-        if ($isRetry) {
+        // A RedeliveryStamp marks a retry re-send; bump its score so a contended
+        // message sinks behind fresher arrivals instead of busy-looping ahead of
+        // them. (Replaces the former inflight-membership probe, which only worked
+        // because retries reused the inbound id.)
+        if ($envelope->last(RedeliveryStamp::class) !== null) {
             $score += $this->requeueScoreBump;
         }
 
