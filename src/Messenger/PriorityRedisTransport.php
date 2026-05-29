@@ -21,6 +21,7 @@ use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Logger;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\TransportException;
+use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
@@ -313,6 +314,18 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
         // because retries reused the inbound id.)
         if ($envelope->last(RedeliveryStamp::class) !== null) {
             $score += $this->requeueScoreBump;
+        }
+
+        // Honor Messenger's DelayStamp as a ZSET visibility floor: a re-queued
+        // message (e.g. a retry after herd-lock contention) stays invisible
+        // until now + delay instead of re-popping immediately and tight-spinning
+        // the worker. Applied as a score floor — never via PersistentRefreshMessage
+        // deliverAt — so once due it still sorts by intrinsic staleness and is not
+        // misread as a scheduled cooldown pop. A genuinely-scheduled message owns
+        // its deliverAt score verbatim and is exempt.
+        $delayStamp = $envelope->last(DelayStamp::class);
+        if ($delayStamp !== null && !($message instanceof PersistentRefreshMessage && $message->deliverAt !== null)) {
+            $score = max($score, time() + (int)ceil($delayStamp->getDelay() / 1000));
         }
 
         try {

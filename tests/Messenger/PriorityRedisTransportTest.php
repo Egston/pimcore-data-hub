@@ -22,6 +22,7 @@ use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\TransportException;
+use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
@@ -403,6 +404,44 @@ final class PriorityRedisTransportTest extends TestCase
         $scores = $redis->zsets[self::ZSET];
         self::assertCount(1, $scores);
         self::assertSame(1007, (int)reset($scores));
+    }
+
+    public function testDelayStampFloorsVisibilityScore(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        // Past baseline: without the DelayStamp floor the score would be 1000
+        // (immediately due), so a contended retry would re-pop at once instead
+        // of waiting out the backoff window.
+        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1000, null);
+
+        $before = time();
+        $transport->send(new Envelope($message, [new DelayStamp(5000)]));
+        $after = time();
+
+        $scores = $redis->zsets[self::ZSET];
+        self::assertCount(1, $scores);
+        $score = (int) reset($scores);
+        self::assertGreaterThanOrEqual($before + 5, $score, 'DelayStamp must floor visibility to now + delay');
+        self::assertLessThanOrEqual($after + 5, $score);
+    }
+
+    public function testDeliverAtTakesPrecedenceOverDelayStamp(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        $deliverAt = time() + 3600;
+        $message = new PersistentRefreshMessage('c1', '{}', 'OpSched', time(), null, $deliverAt);
+
+        // A genuinely-scheduled message owns its score verbatim; a transient
+        // retry DelayStamp must not pull it earlier or it would be misread as
+        // due before its scheduled time.
+        $transport->send(new Envelope($message, [new DelayStamp(5000)]));
+
+        $scores = $redis->zsets[self::ZSET];
+        self::assertSame($deliverAt, (int) reset($scores), 'scheduled deliverAt must win over a retry DelayStamp');
     }
 
     public function testSendMintsFreshIdIgnoringInboundTransportIdStamp(): void
