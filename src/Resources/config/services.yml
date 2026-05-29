@@ -39,6 +39,15 @@ services:
         tags:
             - { name: messenger.transport_factory }
 
+    # Demote expected recoverable retry warnings (per-op-name lock contention on
+    # the refresh worker at replicas > 1) from WARNING+trace to DEBUG. Decorates
+    # the messenger channel logger the retry listener uses; genuine handler
+    # failures stay loud. See RecoverableRetryLogger.
+    Pimcore\Bundle\DataHubBundle\Messenger\RecoverableRetryLogger:
+        decorates: monolog.logger.messenger
+        arguments:
+            $inner: '@.inner'
+
     Pimcore\Bundle\DataHubBundle\Installer:
         public: true
         arguments:
