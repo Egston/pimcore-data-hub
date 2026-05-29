@@ -21,6 +21,7 @@ use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
@@ -420,6 +421,27 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertSame('OpRoundTrip', $decoded->operationName);
         self::assertSame(1700000000, $decoded->scoreBaseline);
         self::assertSame(3, $decoded->priorityWeight);
+    }
+
+    public function testSendRejectsSerializerThatEmitsHeaders(): void
+    {
+        $redis = new FakeRedis();
+        $headerSerializer = new class() implements SerializerInterface {
+            public function decode(array $encodedEnvelope): Envelope
+            {
+                return new Envelope(new \stdClass());
+            }
+
+            public function encode(Envelope $envelope): array
+            {
+                return ['body' => 'irrelevant', 'headers' => ['X-Message-Stamp-Foo' => '[]']];
+            }
+        };
+        $transport = $this->makeTransport($redis, $headerSerializer);
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('persists only the body');
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'Op1', 1700000000)));
     }
 
     public function testEmptyZsetReturnsEmptyIterable(): void

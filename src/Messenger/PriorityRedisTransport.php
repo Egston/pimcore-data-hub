@@ -318,6 +318,20 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
             throw new TransportException('datahub.priority_transport: encode failed: ' . $e->getMessage(), 0, $e);
         }
 
+        // This transport persists only the body — correct solely for the
+        // header-less PhpSerializer (the framework default), which packs every
+        // stamp into the body. A header-carrying serializer (e.g. the Symfony
+        // serializer) puts stamps in headers; dropping them would silently lose
+        // RedeliveryStamp (retry counting → no dead-lettering) and any custom
+        // stamp. Fail loud rather than ship that silently.
+        if (!empty($encoded['headers'])) {
+            throw new TransportException(
+                'datahub.priority_transport: serializer emitted transport headers, but this transport persists only the '
+                . 'body and is coupled to the header-less PhpSerializer. Keep the default PhpSerializer for this transport, '
+                . 'or extend send()/get() to persist headers — otherwise message stamps would be silently dropped.'
+            );
+        }
+
         $body = (string)($encoded['body'] ?? '');
         if ($body === '') {
             throw new TransportException('datahub.priority_transport: encoded envelope has empty body');
