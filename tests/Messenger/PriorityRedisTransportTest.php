@@ -364,32 +364,6 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertSame(1700000000, (int)$redis->zsets[self::ZSET][(string)$stamp->getId()]);
     }
 
-    public function testScoreSelectionUsesRefreshedAtWhenSet(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis);
-
-        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, null);
-        $transport->send(new Envelope($message));
-
-        $scores = array_values($redis->zsets[self::ZSET]);
-        self::assertSame(1234567890, (int)$scores[0]);
-    }
-
-    public function testScoreSelectionFallsBackToTimeWhenRefreshedAtNull(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis);
-
-        $now = time();
-        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', null, null);
-        $transport->send(new Envelope($message));
-
-        $scores = array_values($redis->zsets[self::ZSET]);
-        self::assertGreaterThanOrEqual($now, (int)$scores[0]);
-        self::assertLessThanOrEqual($now + 5, (int)$scores[0]);
-    }
-
     public function testRetryBumpsScoreWhenRedeliveryStampPresent(): void
     {
         $redis = new FakeRedis();
@@ -590,38 +564,6 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertSame([], $transport->warnings, 'no torn-write warning should fire for a clean retry');
     }
 
-    public function testScoreForUnderDefaultStrategyIgnoresPriorityWeight(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis);
-
-        $weighted = new PersistentRefreshMessage('c1', '{}', 'Op1', 1700000000, 7);
-        $unweighted = new PersistentRefreshMessage('c1', '{}', 'Op2', 1700000000, null);
-
-        self::assertSame(1700000000, $transport->scoreFor($weighted));
-        self::assertSame(1700000000, $transport->scoreFor($unweighted));
-    }
-
-    public function testScoreForUnderBandStrategyOffsetsByPriorityWeight(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis, null, 600, 5, 'oldest_refreshed_at_first_with_weight_bands', 60);
-
-        $message = new PersistentRefreshMessage('c1', '{}', 'OpHigh', 1700000000, 7);
-
-        self::assertSame(1700000000 - 420, $transport->scoreFor($message));
-    }
-
-    public function testScoreForUnderBandStrategyFallsBackToNeutralWeightWhenNull(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis, null, 600, 5, 'oldest_refreshed_at_first_with_weight_bands', 60);
-
-        $message = new PersistentRefreshMessage('c1', '{}', 'OpUnclassified', 1700000000, null);
-
-        self::assertSame(1700000000 - 60, $transport->scoreFor($message));
-    }
-
     public function testLongestStaleFirstDrainsLowestScoreFirst(): void
     {
         $redis = new FakeRedis();
@@ -638,18 +580,6 @@ final class PriorityRedisTransportTest extends TestCase
 
         $second = iterator_to_array($transport->get());
         self::assertSame('OpMid', $second[0]->getMessage()->operationName);
-    }
-
-    public function testScoreForUsesDeliverAtVerbatimWhenSet(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis, null, 600, 5, 'oldest_refreshed_at_first_with_weight_bands', 60);
-
-        $future = time() + 21600;
-        $scheduled = new PersistentRefreshMessage('c1', '{}', 'OpCooldown', time(), 7, $future);
-
-        // deliverAt wins over both the refreshedAt baseline and weight banding.
-        self::assertSame($future, $transport->scoreFor($scheduled));
     }
 
     public function testNullDeliverAtMessagePopsImmediately(): void
@@ -762,15 +692,15 @@ final class PriorityRedisTransportTest extends TestCase
     {
         // Requeue-stays-in-class: the reaper re-derives the score through
         // scoreFor(deserialized message), so a reaped read keeps its offset. A
-        // future-dated refreshedAt keeps the re-queued read above `now`, so it
+        // future-dated scoreBaseline keeps the re-queued read above `now`, so it
         // stays in the ZSET (not immediately re-popped) and the score is
         // observable directly.
         $redis = new FakeRedis();
         $serializer = new PhpSerializer();
         $transport = $this->makeTransport($redis, $serializer, 60, 5, 'oldest_refreshed_at_first', 60, 86400);
 
-        $refreshedAt = time() + 200000;
-        $read = new PersistentRefreshMessage('c1', '{}', 'OpRead', $refreshedAt, null, null, true);
+        $scoreBaseline = time() + 200000;
+        $read = new PersistentRefreshMessage('c1', '{}', 'OpRead', $scoreBaseline, null, null, true);
         $encoded = $serializer->encode(new Envelope($read));
         $redis->hashes[self::MESSAGES] = ['stuck-read' => $encoded['body']];
         $redis->hashes[self::INFLIGHT] = ['stuck-read' => json_encode(['poppedAt' => time() - 600])];
@@ -778,7 +708,7 @@ final class PriorityRedisTransportTest extends TestCase
         iterator_to_array($transport->get());
 
         self::assertArrayHasKey('stuck-read', $redis->zsets[self::ZSET]);
-        self::assertSame($refreshedAt - 86400, (int)$redis->zsets[self::ZSET]['stuck-read'], 'reaped read must re-derive a score that still carries the offset');
+        self::assertSame($scoreBaseline - 86400, (int)$redis->zsets[self::ZSET]['stuck-read'], 'reaped read must re-derive a score that still carries the offset');
     }
 
     public function testMessageScoredAtExactlyNowPopsImmediately(): void

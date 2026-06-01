@@ -70,14 +70,7 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  * they use SET NX PX (Symfony Lock) and single-key SET/GETSET (sentinels),
  * which are individually atomic Redis commands and need no Lua wrapping here.
  *
- * Score source rule: under the default `oldest_refreshed_at_first` strategy,
- * `scoreFor()` reads `PersistentRefreshMessage::$scoreBaseline` when non-null,
- * else `time()`. Under `oldest_refreshed_at_first_with_weight_bands`, the
- * score is `scoreBaseline - (priorityWeight * weightBandSeconds)` so higher-weight
- * messages drop into an earlier band and ZRANGEBYSCORE pops them first among
- * same-aged peers; `priorityWeight = null` falls back to the classifier's
- * neutral default of `1`. No other message types are special-cased;
- * non-Persistent messages get `time()` and behave FIFO-equivalent.
+ * Queue-score derivation lives in {@see scoreFor()}.
  */
 class PriorityRedisTransport implements TransportInterface, MessageCountAwareInterface
 {
@@ -408,6 +401,8 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
      * $weightBandSeconds` (enforced by the config default) keeps a read below
      * even the highest-weight warm; the offset is sourced from config so it stays
      * coupled to the weight-band tuning rather than hardcoded.
+     *
+     * @internal test seam — called directly by PriorityRedisTransportScoreTest
      */
     public function scoreFor(object $message): int
     {
@@ -486,6 +481,8 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
                     $poppedAt = $decoded['poppedAt'];
                 }
             }
+            // Pre-EVAL candidate skip only — RECLAIM_SCRIPT re-asserts staleness
+            // atomically and is the authoritative TOCTOU-closing check.
             if ($poppedAt === 0 || $poppedAt >= $threshold) {
                 continue;
             }

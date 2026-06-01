@@ -45,14 +45,14 @@ final class PriorityRedisTransportScoreTest extends TestCase
         );
     }
 
-    public function testScoreForReturnsRefreshedAtWhenPersistentMessageHasIt(): void
+    public function testScoreForReturnsScoreBaselineWhenPersistentMessageHasIt(): void
     {
         $transport = $this->makeTransport();
         $msg = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, null);
         self::assertSame(1234567890, $transport->scoreFor($msg));
     }
 
-    public function testScoreForFallsBackToTimeWhenRefreshedAtNull(): void
+    public function testScoreForFallsBackToTimeWhenScoreBaselineNull(): void
     {
         $transport = $this->makeTransport();
         $msg = new PersistentRefreshMessage('c1', '{}', 'Op1', null, null);
@@ -72,7 +72,7 @@ final class PriorityRedisTransportScoreTest extends TestCase
         self::assertLessThanOrEqual($now + 5, $score);
     }
 
-    public function testScoreForUnderBandStrategyOffsetsRefreshedAtByWeightedBand(): void
+    public function testScoreForUnderBandStrategyOffsetsScoreBaselineByWeightedBand(): void
     {
         $transport = $this->makeTransport('oldest_refreshed_at_first_with_weight_bands', 60);
         $msg = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, 7);
@@ -139,15 +139,34 @@ final class PriorityRedisTransportScoreTest extends TestCase
         self::assertSame($deliverAt, $transport->scoreFor($dated));
     }
 
+    public function testDatedMessageScoreIsDeliverAtVerbatimUnderBandStrategy(): void
+    {
+        $deliverAt = time() + 21600;
+        $transport = $this->makeTransport('oldest_refreshed_at_first_with_weight_bands', 60, 86400);
+        // Non-null priorityWeight=7 with weightBandSeconds=60 would yield a -420
+        // band offset absent the deliverAt guard; assert deliverAt wins anyway.
+        $dated = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, 7, $deliverAt);
+        self::assertSame($deliverAt, $transport->scoreFor($dated));
+    }
+
     public function testReadWithLowestWeightStillScoresBelowHighestWeightWarm(): void
     {
         // Hard-guarantee proof at the default offset: a read carrying the
         // lowest plausible warm-weight (1) sorts strictly below a warm carrying
-        // a high weight (10), at the same refreshedAt, under weight bands.
+        // a high weight (10), at the same scoreBaseline, under weight bands.
         $transport = $this->makeTransport('oldest_refreshed_at_first_with_weight_bands', 60, 86400);
         $read = new PersistentRefreshMessage('c1', '{}', 'OpRead', 1234567890, 1, null, true);
         $warm = new PersistentRefreshMessage('c1', '{}', 'OpWarm', 1234567890, 10, null, false);
         self::assertLessThan($transport->scoreFor($warm), $transport->scoreFor($read));
+    }
+
+    public function testDefaultStrategyIgnoresPriorityWeight(): void
+    {
+        $transport = $this->makeTransport('oldest_refreshed_at_first');
+        $weighted = new PersistentRefreshMessage('c1', '{}', 'Op1', 1700000000, 7);
+        $unweighted = new PersistentRefreshMessage('c1', '{}', 'Op2', 1700000000, null);
+        self::assertSame(1700000000, $transport->scoreFor($weighted));
+        self::assertSame(1700000000, $transport->scoreFor($unweighted));
     }
 
     public function testReadTriggeredWithDeliverAtThrows(): void
