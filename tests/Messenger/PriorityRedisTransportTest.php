@@ -21,6 +21,9 @@ use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
 use Pimcore\Bundle\DataHubBundle\Messenger\PriorityRedisTransport;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\TransportException;
+use Symfony\Component\Messenger\Stamp\DelayStamp;
+use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
@@ -39,6 +42,7 @@ if (!class_exists('Redis')) {
         public function hDel($key, ...$fields) {}
         public function hExists($key, $field) {}
         public function hGetAll($key) {}
+        public function eval($script, $args = [], $num_keys = 0) {}
         public function connect($host, $port = 6379) {}
         public function auth($auth) {}
         public function select($db) {}
@@ -66,6 +70,9 @@ final class FakeRedis extends \Redis
     private bool $inMulti = false;
 
     public bool $simulateExecFailure = false;
+
+    /** Forces the pop script's ZREM to report 0 removed, modelling a lost race. */
+    public bool $simulateZremMiss = false;
 
     public function multi(): bool|self
     {
@@ -206,6 +213,93 @@ final class FakeRedis extends \Redis
         return $this->hashes[$key] ?? [];
     }
 
+    /**
+     * Models the two transport Lua scripts as single uninterruptible in-memory
+     * operations. A real Redis runs Lua server-side atomically; the double
+     * dispatches on the script-identity token the production code passes as the
+     * first ARGV element (never parsing the Lua source). Interleaving in the
+     * harness happens *between* whole eval() calls, never inside one.
+     *
+     * @param list<string> $args
+     */
+    public function eval($script, $args = [], $num_keys = 0): mixed
+    {
+        $keys = array_slice($args, 0, (int)$num_keys);
+        $argv = array_values(array_slice($args, (int)$num_keys));
+        $tag = (string)($argv[0] ?? '');
+
+        return match ($tag) {
+            'pop' => $this->evalPop($keys, $argv),
+            'reclaim' => $this->evalReclaim($keys, $argv),
+            default => throw new \LogicException('FakeRedis::eval — unknown script tag "' . $tag . '"'),
+        };
+    }
+
+    /**
+     * @param list<string> $keys
+     * @param list<string> $argv
+     *
+     * @return list<string>
+     */
+    private function evalPop(array $keys, array $argv): array
+    {
+        [$zsetKey, $messagesKey, $inflightKey] = $keys;
+        $now = $argv[1];
+        $poppedAtJson = $argv[2];
+
+        $candidates = $this->zRangeByScore($zsetKey, '-inf', $now, ['limit' => [0, 1]]);
+        $id = (string)($candidates[0] ?? '');
+        if ($id === '') {
+            return ['empty'];
+        }
+
+        if ($this->simulateZremMiss || (int)$this->zRem($zsetKey, $id) === 0) {
+            return ['zrem_miss'];
+        }
+
+        $body = $this->hashes[$messagesKey][$id] ?? false;
+
+        if (!isset($this->hashes[$inflightKey])) {
+            $this->hashes[$inflightKey] = [];
+        }
+        $this->hashes[$inflightKey][$id] = (string)$poppedAtJson;
+
+        if ($body === false) {
+            return ['torn', $id];
+        }
+
+        return ['ok', $id, $body];
+    }
+
+    /**
+     * @param list<string> $keys
+     * @param list<string> $argv
+     */
+    private function evalReclaim(array $keys, array $argv): int
+    {
+        [$zsetKey, $inflightKey] = $keys;
+        $id = (string)$argv[1];
+        $score = $argv[2];
+        $threshold = (int)$argv[3];
+
+        $meta = $this->hashes[$inflightKey][$id] ?? false;
+        if ($meta === false) {
+            return 0;
+        }
+        $decoded = json_decode((string)$meta, true);
+        $poppedAt = is_array($decoded) && isset($decoded['poppedAt']) && is_int($decoded['poppedAt'])
+            ? $decoded['poppedAt']
+            : null;
+        if ($poppedAt === null || $poppedAt >= $threshold) {
+            return 0;
+        }
+
+        $this->zAdd($zsetKey, $score, $id);
+        unset($this->hashes[$inflightKey][$id]);
+
+        return 1;
+    }
+
     private function recordOrReturn(mixed $value): mixed
     {
         if ($this->inMulti) {
@@ -270,45 +364,72 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertSame(1700000000, (int)$redis->zsets[self::ZSET][(string)$stamp->getId()]);
     }
 
-    public function testScoreSelectionUsesRefreshedAtWhenSet(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis);
-
-        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1234567890, null);
-        $transport->send(new Envelope($message));
-
-        $scores = array_values($redis->zsets[self::ZSET]);
-        self::assertSame(1234567890, (int)$scores[0]);
-    }
-
-    public function testScoreSelectionFallsBackToTimeWhenRefreshedAtNull(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis);
-
-        $now = time();
-        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', null, null);
-        $transport->send(new Envelope($message));
-
-        $scores = array_values($redis->zsets[self::ZSET]);
-        self::assertGreaterThanOrEqual($now, (int)$scores[0]);
-        self::assertLessThanOrEqual($now + 5, (int)$scores[0]);
-    }
-
-    public function testRetryBumpsScoreWhenIdAlreadyInflight(): void
+    public function testRetryBumpsScoreWhenRedeliveryStampPresent(): void
     {
         $redis = new FakeRedis();
         $transport = $this->makeTransport($redis, null, 600, 7);
 
-        $idStamp = new TransportMessageIdStamp('reused-id');
         $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1000, null);
 
-        $redis->hashes[self::INFLIGHT] = ['reused-id' => '{"poppedAt":' . time() . '}'];
+        // A retry re-send carries a RedeliveryStamp; the score is bumped so the
+        // contended message sinks behind fresher arrivals.
+        $transport->send(new Envelope($message, [new RedeliveryStamp(1)]));
 
-        $transport->send(new Envelope($message, [$idStamp]));
+        $scores = $redis->zsets[self::ZSET];
+        self::assertCount(1, $scores);
+        self::assertSame(1007, (int)reset($scores));
+    }
 
-        self::assertSame(1007, (int)$redis->zsets[self::ZSET]['reused-id']);
+    public function testDelayStampFloorsVisibilityScore(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        // Past baseline: without the DelayStamp floor the score would be 1000
+        // (immediately due), so a contended retry would re-pop at once instead
+        // of waiting out the backoff window.
+        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1000, null);
+
+        $before = time();
+        $transport->send(new Envelope($message, [new DelayStamp(5000)]));
+        $after = time();
+
+        $scores = $redis->zsets[self::ZSET];
+        self::assertCount(1, $scores);
+        $score = (int) reset($scores);
+        self::assertGreaterThanOrEqual($before + 5, $score, 'DelayStamp must floor visibility to now + delay');
+        self::assertLessThanOrEqual($after + 5, $score);
+    }
+
+    public function testDeliverAtTakesPrecedenceOverDelayStamp(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        $deliverAt = time() + 3600;
+        $message = new PersistentRefreshMessage('c1', '{}', 'OpSched', time(), null, $deliverAt);
+
+        // A genuinely-scheduled message owns its score verbatim; a transient
+        // retry DelayStamp must not pull it earlier or it would be misread as
+        // due before its scheduled time.
+        $transport->send(new Envelope($message, [new DelayStamp(5000)]));
+
+        $scores = $redis->zsets[self::ZSET];
+        self::assertSame($deliverAt, (int) reset($scores), 'scheduled deliverAt must win over a retry DelayStamp');
+    }
+
+    public function testSendMintsFreshIdIgnoringInboundTransportIdStamp(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        $message = new PersistentRefreshMessage('c1', '{}', 'Op1', 1000, null);
+        $transport->send(new Envelope($message, [new TransportMessageIdStamp('inbound-id')]));
+
+        // The inbound id must not become the queue id — reusing it is what let a
+        // later reject() of the original tear the re-queued retry copy.
+        self::assertArrayNotHasKey('inbound-id', $redis->zsets[self::ZSET]);
+        self::assertCount(1, $redis->zsets[self::ZSET]);
     }
 
     public function testEnvelopeRoundTripsViaSerializer(): void
@@ -329,6 +450,27 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertSame('OpRoundTrip', $decoded->operationName);
         self::assertSame(1700000000, $decoded->scoreBaseline);
         self::assertSame(3, $decoded->priorityWeight);
+    }
+
+    public function testSendRejectsSerializerThatEmitsHeaders(): void
+    {
+        $redis = new FakeRedis();
+        $headerSerializer = new class() implements SerializerInterface {
+            public function decode(array $encodedEnvelope): Envelope
+            {
+                return new Envelope(new \stdClass());
+            }
+
+            public function encode(Envelope $envelope): array
+            {
+                return ['body' => 'irrelevant', 'headers' => ['X-Message-Stamp-Foo' => '[]']];
+            }
+        };
+        $transport = $this->makeTransport($redis, $headerSerializer);
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('persists only the body');
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'Op1', 1700000000)));
     }
 
     public function testEmptyZsetReturnsEmptyIterable(): void
@@ -399,36 +541,27 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertNotEmpty($transport->errors);
     }
 
-    public function testScoreForUnderDefaultStrategyIgnoresPriorityWeight(): void
+    public function testRecoverableRetryReSendSurvivesRejectOfOriginal(): void
     {
         $redis = new FakeRedis();
         $transport = $this->makeTransport($redis);
 
-        $weighted = new PersistentRefreshMessage('c1', '{}', 'Op1', 1700000000, 7);
-        $unweighted = new PersistentRefreshMessage('c1', '{}', 'Op2', 1700000000, null);
+        $message = new PersistentRefreshMessage('c1', '{"query":"x"}', 'OpRetry', 1700000000, null);
+        $transport->send(new Envelope($message));
 
-        self::assertSame(1700000000, $transport->scoreFor($weighted));
-        self::assertSame(1700000000, $transport->scoreFor($unweighted));
-    }
+        $received = iterator_to_array($transport->get())[0];
 
-    public function testScoreForUnderBandStrategyOffsetsByPriorityWeight(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis, null, 600, 5, 'oldest_refreshed_at_first_with_weight_bands', 60);
+        // Symfony's retry flow re-sends the received envelope (still carrying
+        // its TransportMessageIdStamp) and then rejects the original. The retry
+        // copy must not collide on the original's queue id, or reject()'s body
+        // HDEL discards it as a torn write and the refresh is silently dropped.
+        $transport->send($received->with(new RedeliveryStamp(1)));
+        $transport->reject($received);
 
-        $message = new PersistentRefreshMessage('c1', '{}', 'OpHigh', 1700000000, 7);
-
-        self::assertSame(1700000000 - 420, $transport->scoreFor($message));
-    }
-
-    public function testScoreForUnderBandStrategyFallsBackToNeutralWeightWhenNull(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis, null, 600, 5, 'oldest_refreshed_at_first_with_weight_bands', 60);
-
-        $message = new PersistentRefreshMessage('c1', '{}', 'OpUnclassified', 1700000000, null);
-
-        self::assertSame(1700000000 - 60, $transport->scoreFor($message));
+        $redelivered = iterator_to_array($transport->get());
+        self::assertCount(1, $redelivered, 'retried message was lost as a torn-write discard');
+        self::assertSame('OpRetry', $redelivered[0]->getMessage()->operationName);
+        self::assertSame([], $transport->warnings, 'no torn-write warning should fire for a clean retry');
     }
 
     public function testLongestStaleFirstDrainsLowestScoreFirst(): void
@@ -447,18 +580,6 @@ final class PriorityRedisTransportTest extends TestCase
 
         $second = iterator_to_array($transport->get());
         self::assertSame('OpMid', $second[0]->getMessage()->operationName);
-    }
-
-    public function testScoreForUsesDeliverAtVerbatimWhenSet(): void
-    {
-        $redis = new FakeRedis();
-        $transport = $this->makeTransport($redis, null, 600, 5, 'oldest_refreshed_at_first_with_weight_bands', 60);
-
-        $future = time() + 21600;
-        $scheduled = new PersistentRefreshMessage('c1', '{}', 'OpCooldown', time(), 7, $future);
-
-        // deliverAt wins over both the refreshedAt baseline and weight banding.
-        self::assertSame($future, $transport->scoreFor($scheduled));
     }
 
     public function testNullDeliverAtMessagePopsImmediately(): void
@@ -571,15 +692,15 @@ final class PriorityRedisTransportTest extends TestCase
     {
         // Requeue-stays-in-class: the reaper re-derives the score through
         // scoreFor(deserialized message), so a reaped read keeps its offset. A
-        // future-dated refreshedAt keeps the re-queued read above `now`, so it
+        // future-dated scoreBaseline keeps the re-queued read above `now`, so it
         // stays in the ZSET (not immediately re-popped) and the score is
         // observable directly.
         $redis = new FakeRedis();
         $serializer = new PhpSerializer();
         $transport = $this->makeTransport($redis, $serializer, 60, 5, 'oldest_refreshed_at_first', 60, 86400);
 
-        $refreshedAt = time() + 200000;
-        $read = new PersistentRefreshMessage('c1', '{}', 'OpRead', $refreshedAt, null, null, true);
+        $scoreBaseline = time() + 200000;
+        $read = new PersistentRefreshMessage('c1', '{}', 'OpRead', $scoreBaseline, null, null, true);
         $encoded = $serializer->encode(new Envelope($read));
         $redis->hashes[self::MESSAGES] = ['stuck-read' => $encoded['body']];
         $redis->hashes[self::INFLIGHT] = ['stuck-read' => json_encode(['poppedAt' => time() - 600])];
@@ -587,7 +708,7 @@ final class PriorityRedisTransportTest extends TestCase
         iterator_to_array($transport->get());
 
         self::assertArrayHasKey('stuck-read', $redis->zsets[self::ZSET]);
-        self::assertSame($refreshedAt - 86400, (int)$redis->zsets[self::ZSET]['stuck-read'], 'reaped read must re-derive a score that still carries the offset');
+        self::assertSame($scoreBaseline - 86400, (int)$redis->zsets[self::ZSET]['stuck-read'], 'reaped read must re-derive a score that still carries the offset');
     }
 
     public function testMessageScoredAtExactlyNowPopsImmediately(): void
@@ -602,5 +723,281 @@ final class PriorityRedisTransportTest extends TestCase
         $envelopes = iterator_to_array($transport->get());
         self::assertCount(1, $envelopes);
         self::assertSame('OpExactNow', $envelopes[0]->getMessage()->operationName);
+    }
+
+    public function testGetDiscardsTornWriteAndRemovesInflight(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        $id = 'torn-id';
+        $redis->zsets[self::ZSET][$id] = time() - 5;
+        // id present in ZSET but absent from messages HASH — torn write
+        $redis->hashes[self::INFLIGHT][$id] = json_encode(['poppedAt' => time()]);
+
+        $envelopes = iterator_to_array($transport->get());
+
+        self::assertSame([], $envelopes);
+        self::assertArrayNotHasKey($id, $redis->hashes[self::INFLIGHT] ?? [], 'torn id must be removed from inflight');
+        self::assertNotEmpty($transport->warnings);
+        self::assertStringContainsString('torn write', $transport->warnings[0]);
+    }
+
+    public function testGetLoudBailsWhenZremRemovesNothing(): void
+    {
+        // A real Redis returns the zrem_miss marker when the script's ZREM removes
+        // nothing — the member was removed externally before the EVAL ran (manual
+        // ZREM, FLUSHDB, or a non-transport client). The single-threaded fake can't
+        // produce external removal inside one eval(), so simulateZremMiss forces the
+        // marker to exercise the production loud-bail branch.
+        $redis = new FakeRedis();
+        $redis->simulateZremMiss = true;
+        $transport = $this->makeTransport($redis);
+
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpContended', time() - 5, null)));
+
+        $envelopes = iterator_to_array($transport->get());
+
+        self::assertSame([], $envelopes);
+        self::assertNotEmpty($transport->warnings);
+        self::assertStringContainsString('zRem == 0', $transport->warnings[0]);
+    }
+
+    public function testThreeConsumersNeverDoublePopUnderInterleavedGet(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+
+        $consumerA = $this->makeTransport($redis, $serializer);
+        $consumerB = $this->makeTransport($redis, $serializer);
+        $consumerC = $this->makeTransport($redis, $serializer);
+
+        $seeded = [];
+        for ($i = 0; $i < 9; ++$i) {
+            $envelope = $consumerA->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'Op' . $i, time() - (100 - $i), null)));
+            $seeded[] = (string)$envelope->last(TransportMessageIdStamp::class)->getId();
+        }
+
+        $consumers = [$consumerA, $consumerB, $consumerC];
+        $popped = [];
+        $rounds = 0;
+
+        // Interleaved round-robin draining: pins PHP fan-out and marker-parsing
+        // correctness. Redis-level atomicity (no double-pop inside one EVAL) is
+        // only verifiable against real Redis in the Functional suite.
+        do {
+            $progress = false;
+            foreach ($consumers as $consumer) {
+                $envelopes = iterator_to_array($consumer->get());
+                if ($envelopes === []) {
+                    continue;
+                }
+                $progress = true;
+                foreach ($envelopes as $envelope) {
+                    $id = (string)$envelope->last(TransportMessageIdStamp::class)->getId();
+                    self::assertArrayNotHasKey($id, $popped, 'id ' . $id . ' popped by more than one consumer');
+                    $popped[$id] = true;
+                    $consumer->ack($envelope);
+                }
+            }
+            ++$rounds;
+        } while ($progress && $rounds < 100);
+
+        self::assertCount(9, $popped, 'every seeded message popped exactly once');
+        foreach ($seeded as $id) {
+            self::assertArrayHasKey($id, $popped);
+        }
+        self::assertSame([], $redis->hashes[self::INFLIGHT] ?? [], 'inflight HASH fully drained after acks');
+    }
+
+    public function testThreeReapersNeverResurrectAStuckMessage(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+
+        $reaperA = $this->makeTransport($redis, $serializer, 60, 5);
+        $reaperB = $this->makeTransport($redis, $serializer, 60, 5);
+        $reaperC = $this->makeTransport($redis, $serializer, 60, 5);
+
+        $stuckIds = [];
+        for ($i = 0; $i < 5; ++$i) {
+            $id = 'stuck-' . $i;
+            $stuckIds[] = $id;
+            $encoded = $serializer->encode(new Envelope(new PersistentRefreshMessage('c1', '{}', 'Op' . $i, 500 + $i, null)));
+            $redis->hashes[self::MESSAGES][$id] = $encoded['body'];
+            $redis->hashes[self::INFLIGHT][$id] = (string)json_encode(['poppedAt' => time() - 600]);
+        }
+
+        // Three reapers share state sequentially. get() runs the reaper first;
+        // each stuck id, once reclaimed by one reaper, is re-popped by whichever
+        // consumer's get() next sees it as due. Pins PHP orchestration correctness
+        // and the missing-entry idempotency guard; Redis-level atomicity belongs
+        // to the Functional suite.
+        $reapers = [$reaperA, $reaperB, $reaperC];
+        $surfaced = [];
+        $rounds = 0;
+
+        do {
+            $progress = false;
+            foreach ($reapers as $reaper) {
+                $envelopes = iterator_to_array($reaper->get());
+                if ($envelopes === []) {
+                    continue;
+                }
+                $progress = true;
+                foreach ($envelopes as $envelope) {
+                    $id = (string)$envelope->last(TransportMessageIdStamp::class)->getId();
+                    self::assertArrayNotHasKey($id, $surfaced, 'stuck id ' . $id . ' resurrected more than once');
+                    $surfaced[$id] = true;
+                    $reaper->ack($envelope);
+                }
+            }
+            ++$rounds;
+        } while ($progress && $rounds < 100);
+
+        self::assertCount(5, $surfaced, 'each stuck id reclaimed and popped exactly once');
+        foreach ($stuckIds as $id) {
+            self::assertArrayHasKey($id, $surfaced);
+        }
+        self::assertSame([], $redis->hashes[self::INFLIGHT] ?? [], 'inflight HASH fully drained');
+        self::assertSame([], $redis->zsets[self::ZSET] ?? [], 'no stuck id left behind in the ZSET');
+    }
+
+    public function testFakeRedisEvalModelsAtomicReclaim(): void
+    {
+        $redis = new FakeRedis();
+        $threshold = time() - 60;
+        $score = 500;
+        $id = 'reclaim-test-id';
+
+        // Stale entry: poppedAt older than threshold — should reclaim (return 1).
+        $redis->hashes[self::INFLIGHT][$id] = json_encode(['poppedAt' => $threshold - 1]);
+        $result = $redis->eval(
+            '',
+            [self::ZSET, self::INFLIGHT, 'reclaim', $id, (string)$score, (string)$threshold],
+            2
+        );
+        self::assertSame(1, $result, 'stale entry must be reclaimed');
+        self::assertArrayHasKey($id, $redis->zsets[self::ZSET], 'reclaimed id must be re-added to ZSET');
+        self::assertSame($score, (int)$redis->zsets[self::ZSET][$id]);
+        self::assertArrayNotHasKey($id, $redis->hashes[self::INFLIGHT] ?? [], 'reclaimed id must be removed from inflight');
+
+        // Fresh entry: poppedAt at or after threshold — must not reclaim (return 0).
+        $redis->hashes[self::INFLIGHT][$id] = json_encode(['poppedAt' => $threshold]);
+        $result = $redis->eval(
+            '',
+            [self::ZSET, self::INFLIGHT, 'reclaim', $id, (string)$score, (string)$threshold],
+            2
+        );
+        self::assertSame(0, $result, 'fresh entry must not be reclaimed');
+
+        // Absent entry: id not in inflight — must return 0.
+        $result = $redis->eval(
+            '',
+            [self::ZSET, self::INFLIGHT, 'reclaim', 'no-such-id', (string)$score, (string)$threshold],
+            2
+        );
+        self::assertSame(0, $result, 'absent entry must return 0');
+    }
+
+    public function testSendThrowsTransportExceptionWhenExecReturnsFalse(): void
+    {
+        $redis = new FakeRedis();
+        $redis->simulateExecFailure = true;
+        $transport = $this->makeTransport($redis);
+
+        $message = new PersistentRefreshMessage('c1', '{}', 'OpExecFail', time(), null);
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('send MULTI/EXEC returned false');
+        $transport->send(new Envelope($message));
+    }
+
+    public function testAckThrowsTransportExceptionWhenExecReturnsFalse(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis, new PhpSerializer());
+
+        $envelope = $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpAckFail', time() - 5, null)));
+        $received = iterator_to_array($transport->get());
+        self::assertCount(1, $received);
+
+        $redis->simulateExecFailure = true;
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('ack MULTI/EXEC returned false');
+        $transport->ack($received[0]);
+    }
+
+    public function testRejectThrowsTransportExceptionWhenExecReturnsFalse(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis, new PhpSerializer());
+
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpRejectFail', time() - 5, null)));
+        $received = iterator_to_array($transport->get());
+        self::assertCount(1, $received);
+
+        $redis->simulateExecFailure = true;
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('reject MULTI/EXEC returned false');
+        $transport->reject($received[0]);
+    }
+
+    public function testDelayStampDoesNotPullDownFutureIntrinsicScore(): void
+    {
+        $redis = new FakeRedis();
+        $transport = $this->makeTransport($redis);
+
+        $futureBaseline = time() + 10000;
+        $message = new PersistentRefreshMessage('c1', '{}', 'OpFuture', $futureBaseline, null);
+        $transport->send(new Envelope($message, [new DelayStamp(1000)]));
+
+        $scores = $redis->zsets[self::ZSET];
+        self::assertCount(1, $scores);
+        $score = (int) reset($scores);
+        self::assertGreaterThanOrEqual($futureBaseline, $score, 'DelayStamp must not pull score below intrinsic future baseline');
+    }
+
+    public function testReaperSkipsInflightEntryWithinVisibilityTimeout(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer, 600);
+
+        $id = 'fresh-inflight-id';
+        $encoded = $serializer->encode(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpFresh', 500, null)));
+        $redis->hashes[self::MESSAGES][$id] = $encoded['body'];
+        $redis->hashes[self::INFLIGHT][$id] = (string)json_encode(['poppedAt' => time() - 10]);
+
+        iterator_to_array($transport->get());
+
+        self::assertArrayHasKey($id, $redis->hashes[self::INFLIGHT], 'entry within timeout must stay inflight');
+        self::assertArrayNotHasKey($id, $redis->zsets[self::ZSET] ?? [], 'entry within timeout must not be re-queued');
+    }
+
+    public function testFakeRedisEvalModelsAtomicPop(): void
+    {
+        $redis = new FakeRedis();
+        $serializer = new PhpSerializer();
+        $transport = $this->makeTransport($redis, $serializer);
+
+        $transport->send(new Envelope(new PersistentRefreshMessage('c1', '{}', 'OpAtomic', time() - 5, null)));
+        $id = array_key_first($redis->zsets[self::ZSET]);
+
+        // The fake dispatches on the ARGV identity token, not the Lua source,
+        // so the $script argument is inert here.
+        $result = $redis->eval(
+            '',
+            [self::ZSET, self::MESSAGES, self::INFLIGHT, 'pop', (string)time(), '{"poppedAt":' . time() . '}'],
+            3
+        );
+
+        self::assertIsArray($result);
+        self::assertSame('ok', $result[0]);
+        self::assertSame($id, $result[1]);
+        self::assertArrayNotHasKey($id, $redis->zsets[self::ZSET], 'pop ZREMs the member');
+        self::assertArrayHasKey($id, $redis->hashes[self::INFLIGHT], 'pop records the id inflight');
     }
 }
