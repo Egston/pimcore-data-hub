@@ -49,7 +49,7 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  *   the visibility timeout.
  *
  * Atomic invariants:
- * - `send()`: ZADD + HSET in MULTI/EXEC. On retry (id already in inflight)
+ * - `send()`: ZADD + HSET in MULTI/EXEC. On retry (RedeliveryStamp present)
  *   the ZSET score is bumped by the requeue-score knob so contended messages
  *   sink behind fresher arrivals. MULTI/EXEC is N-consumer-safe here: send
  *   only ever adds, so concurrent senders cannot lose a write to a racing pop.
@@ -182,12 +182,12 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
             return [];
         }
 
-        // ZREM removing nothing inside an atomic EVAL means external interference
-        // (manual ZREM, a buggy non-transport client, or a flush) removed the
-        // member after ZRANGEBYSCORE but before ZREM in the same script. Surface it
-        // loudly rather than silently returning [].
+        // ZREM removing nothing inside an atomic EVAL means the member was removed
+        // externally before the EVAL ran — manual ZREM, FLUSHDB, or a non-transport
+        // client bypassing the Lua path. Surface it loudly rather than silently
+        // returning [].
         if ($marker === self::POP_ZREM_MISS) {
-            $this->logWarning('datahub.priority_transport: zRem == 0 — id already claimed by a concurrent consumer');
+            $this->logWarning('datahub.priority_transport: zRem == 0 — member removed externally before the pop EVAL ran');
 
             return [];
         }
@@ -310,8 +310,7 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
 
         // A RedeliveryStamp marks a retry re-send; bump its score so a contended
         // message sinks behind fresher arrivals instead of busy-looping ahead of
-        // them. (Replaces the former inflight-membership probe, which only worked
-        // because retries reused the inbound id.)
+        // them.
         if ($envelope->last(RedeliveryStamp::class) !== null) {
             $score += $this->requeueScoreBump;
         }
