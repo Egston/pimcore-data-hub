@@ -85,6 +85,13 @@ class AssetFieldHelper extends AbstractFieldHelper
         }
     }
 
+    private function thumbnailDeferredDefault(): bool
+    {
+        $cfg = \Pimcore::getContainer()?->getParameter('pimcore_data_hub');
+
+        return (bool)(\is_array($cfg) ? ($cfg['graphql']['thumbnail_deferred_default'] ?? false) : false);
+    }
+
     /**
      * @param array $data
      * @param Asset $container
@@ -110,11 +117,12 @@ class AssetFieldHelper extends AbstractFieldHelper
         $realName = $astName;
 
         if (($astName == 'fullpath' || $astName == 'data') && $thumbnailArgument && ($container instanceof Image || $container instanceof Video)) {
+            $deferredDefault = $this->thumbnailDeferredDefault();
             if ($ast->alias) {
                 // defer it
-                $data[$realName] = function ($source, $args, $context, ResolveInfo $info) use ($container, $realName) {
+                $data[$realName] = function ($source, $args, $context, ResolveInfo $info) use ($container, $realName, $deferredDefault) {
                     if ($realName === 'fullpath') {
-                        return $container->getThumbnail($args['thumbnail'], false);
+                        return $container->getThumbnail($args['thumbnail'], $deferredDefault);
                     }
                     if ($realName === 'data') {
                         $thumb = $container->getThumbnail($args['thumbnail'], false);
@@ -127,7 +135,7 @@ class AssetFieldHelper extends AbstractFieldHelper
             } else {
                 //TODO extract duplicate code
                 if ($realName == 'fullpath') {
-                    $data[$realName] = $container->getThumbnail($thumbnailArgument);
+                    $data[$realName] = $container->getThumbnail($thumbnailArgument, $deferredDefault);
                 } elseif ($realName == 'data') {
                     $thumb = $this->getAssetThumbnail($container, $thumbnailArgument, $thumbnailFormat);
                     if ($thumb) {

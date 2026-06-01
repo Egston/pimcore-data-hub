@@ -133,6 +133,13 @@ class AssetType
         return $result;
     }
 
+    private function thumbnailDeferredDefault(): bool
+    {
+        $cfg = \Pimcore::getContainer()?->getParameter('pimcore_data_hub');
+
+        return (bool)(\is_array($cfg) ? ($cfg['graphql']['thumbnail_deferred_default'] ?? false) : false);
+    }
+
     /**
      * @param ElementDescriptor|null $value
      * @param array $args
@@ -147,7 +154,7 @@ class AssetType
         $asset = $this->getAssetFromValue($value, $context);
         $thumbNailConfig = $args['thumbnail'] ?? null;
         $thumbNailFormat = $args['format'] ?? null;
-        $deferred = $args['deferred'] ?? false;
+        $deferred = $args['deferred'] ?? $this->thumbnailDeferredDefault();
         $assetFieldHelper = $this->getGraphQLService()->getAssetFieldHelper();
 
         if (!isset($thumbNailConfig)) {
@@ -196,7 +203,7 @@ class AssetType
         $asset = $this->getAssetFromValue($value, $context);
         $thumbNailConfig = $args['thumbnail'] ?? null;
         $thumbNailFormat = $args['format'] ?? null;
-        $deferred = $args['deferred'] ?? null;
+        $deferred = $args['deferred'] ?? $this->thumbnailDeferredDefault();
         $assetFieldHelper = $this->getGraphQLService()->getAssetFieldHelper();
 
         if ($asset instanceof Asset\Image) {
