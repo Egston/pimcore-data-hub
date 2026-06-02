@@ -38,6 +38,7 @@
             <file>tests/Messenger/PriorityRedisTransportTest.php</file>
             <file>tests/Messenger/PriorityRedisTransportScoreTest.php</file>
             <file>tests/Messenger/RecoverableRetryLoggerTest.php</file>
+            <file>tests/GraphQL/Resolver/ListingSortValidatorTest.php</file>
             <file>tests/Service/PersistentOutputCacheServicePriorityTest.php</file>
             <file>tests/DependencyInjection/ConfigurationTest.php</file>
             <file>tests/Service/TierTest.php</file>
