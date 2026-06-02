@@ -336,6 +336,9 @@ final class PriorityRedisTransportTest extends TestCase
             /** @var list<string> */
             public array $errors = [];
 
+            /** @var list<string> */
+            public array $debugs = [];
+
             protected function logWarning(string $message): void
             {
                 $this->warnings[] = $message;
@@ -344,6 +347,11 @@ final class PriorityRedisTransportTest extends TestCase
             protected function logError(string $message): void
             {
                 $this->errors[] = $message;
+            }
+
+            protected function logDebug(string $message): void
+            {
+                $this->debugs[] = $message;
             }
         };
     }
@@ -523,7 +531,7 @@ final class PriorityRedisTransportTest extends TestCase
         self::assertArrayNotHasKey($id, $redis->hashes[self::INFLIGHT]);
     }
 
-    public function testRejectRemovesFromBothHashesAndLogsError(): void
+    public function testRejectRemovesFromBothHashesAndLogsDebugOnly(): void
     {
         $redis = new FakeRedis();
         $transport = $this->makeTransport($redis);
@@ -538,7 +546,12 @@ final class PriorityRedisTransportTest extends TestCase
         $id = (string)$envelopes[0]->last(TransportMessageIdStamp::class)->getId();
         self::assertArrayNotHasKey($id, $redis->hashes[self::MESSAGES]);
         self::assertArrayNotHasKey($id, $redis->hashes[self::INFLIGHT]);
-        self::assertNotEmpty($transport->errors);
+        // Rejects are dominated by Messenger's retry flow (re-send copy, then
+        // reject original) — normal control flow at N>=2, so no error/warning.
+        self::assertSame([], $transport->errors);
+        self::assertSame([], $transport->warnings);
+        self::assertNotEmpty($transport->debugs);
+        self::assertStringContainsString($id, $transport->debugs[0]);
     }
 
     public function testRecoverableRetryReSendSurvivesRejectOfOriginal(): void

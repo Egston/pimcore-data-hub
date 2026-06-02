@@ -278,7 +278,12 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
             throw new TransportException('datahub.priority_transport: reject MULTI/EXEC returned false for id ' . $id);
         }
 
-        $this->logError('datahub.priority_transport: message rejected (id ' . $id . ')');
+        // Rejects are dominated by Messenger's retry flow (re-send a fresh
+        // copy, then reject the superseded original — see send()): normal
+        // control flow under lock contention at replicas > 1. A terminal drop
+        // after exhausted retries is logged by the messenger channel's retry
+        // listener, which — unlike this transport — knows the reason.
+        $this->logDebug('datahub.priority_transport: removed rejected message from queue (id ' . $id . ')');
     }
 
     /**
@@ -560,6 +565,11 @@ class PriorityRedisTransport implements TransportInterface, MessageCountAwareInt
     protected function logError(string $message): void
     {
         Logger::error($message);
+    }
+
+    protected function logDebug(string $message): void
+    {
+        Logger::debug($message);
     }
 
     /**
