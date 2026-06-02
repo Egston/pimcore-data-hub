@@ -585,13 +585,16 @@ class PersistentOutputCacheService
         // Refuse to persist transient infrastructure failures (non-2xx, empty
         // body) — caching those for payloadTtl seconds turns a momentary DB or
         // herd-guard hiccup into a persistent outage. GraphQL-level errors
-        // co-existing with non-empty `data` (partial success) are still cached:
+        // co-existing with useful `data` (partial success) are still cached:
         // the data is useful and the errors are deterministic against the
-        // input. Errors-only responses (no `data`, null `data`, or empty `data`)
-        // are NOT cached — they typically come from a transient broken-schema
-        // state (orphan class references during deploy, a misconfigured
-        // workspace, etc.) and persisting them outlasts the broken window so
-        // clients see stale errors even after the upstream is fixed.
+        // input. Errors-only responses (no `data`, null `data`, empty `data`,
+        // or `data` whose members are all strictly null — the shape a
+        // resolver-thrown error produces) are NOT cached — they typically come
+        // from a transient broken-schema state or invalid client input, and
+        // persisting them mints junk cache entries that outlast the trigger.
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = (string)($input['operationName'] ?? '');
+
         $status = $response->getStatusCode();
         if ($status < 200 || $status >= 300) {
             Logger::warning(sprintf(
@@ -610,11 +613,13 @@ class PersistentOutputCacheService
         }
         $hasErrors = !empty($payload['errors']);
         $data = $payload['data'] ?? null;
-        $hasNonEmptyDataArray = \is_array($data) && $data !== [];
-        if ($hasErrors && !$hasNonEmptyDataArray) {
+        $hasUsefulData = \is_array($data)
+            && array_filter($data, static fn ($value) => $value !== null) !== [];
+        if ($hasErrors && !$hasUsefulData) {
             $messages = array_column((array)$payload['errors'], 'message');
-            Logger::warning(sprintf(
-                'DataHub persistent cache: refusing to save errors-only response (client=%s, errors=%s)',
+            Logger::info(sprintf(
+                'DataHub persistent cache: refusing to save errors-only response (op=%s, client=%s, errors=%s)',
+                $operationName,
                 (string)$request->attributes->get('clientname'),
                 json_encode($messages)
             ));
@@ -624,7 +629,8 @@ class PersistentOutputCacheService
         if ($hasErrors) {
             $messages = array_column((array)$payload['errors'], 'message');
             Logger::warning(sprintf(
-                'DataHub persistent cache: caching response with non-empty data array and errors (client=%s, errors=%s)',
+                'DataHub persistent cache: caching partial-success response with errors (op=%s, client=%s, errors=%s)',
+                $operationName,
                 (string)$request->attributes->get('clientname'),
                 json_encode($messages)
             ));
@@ -633,9 +639,6 @@ class PersistentOutputCacheService
         [$client, $canonical] = $this->clientAndCanonical($request);
         $metaKey = $this->keyMeta($client, $canonical);
         $payloadKey = $this->keyPayload($client, $canonical);
-
-        $input = json_decode($request->getContent(), true) ?: [];
-        $operationName = (string)($input['operationName'] ?? '');
 
         $baseTags = $this->buildTags($request, $operationName);
         $collectorTags = $this->collectorTagsForOperation($operationName, $client);

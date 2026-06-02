@@ -626,8 +626,8 @@ final class PersistentOutputCacheServiceTest extends TestCase
     }
 
     /**
-     * Anchors the three errors-only shapes (no `data`, null `data`, empty `data`)
-     * that must not enter the persistent cache.
+     * Anchors the errors-only shapes (no `data`, null `data`, empty `data`,
+     * all-null `data` members) that must not enter the persistent cache.
      *
      * @dataProvider provideErrorsOnlyPayloads
      */
@@ -665,6 +665,9 @@ final class PersistentOutputCacheServiceTest extends TestCase
             'errors-only, no data key' => [['errors' => [['message' => 'type definition X not found']]]],
             'errors with null data' => [['data' => null, 'errors' => [['message' => 'boom']]]],
             'errors with empty-array data' => [['data' => [], 'errors' => [['message' => 'boom']]]],
+            // A resolver-thrown error nulls its field but keeps the data key,
+            // so `data` is a non-empty array carrying nothing useful.
+            'errors with all-null data members' => [['data' => ['getListing' => null], 'errors' => [['message' => 'invalid sortOrder']]]],
         ];
     }
 
@@ -704,6 +707,37 @@ final class PersistentOutputCacheServiceTest extends TestCase
 
         $payloadEntries = array_values(array_filter($saved, fn ($c) => str_starts_with($c['key'], 'persistent_output_payload_')));
         $this->assertNotEmpty($payloadEntries, 'partial-success payload should be cached');
+    }
+
+    public function testSavePersistentCachesAllNullDataWithoutErrors(): void
+    {
+        $graphqlCfg = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 12,
+            'persistent_output_cache_payload_ttl' => 3456,
+        ];
+        $classifier = $this->makeClassifier([
+            'Op' => ['tier' => 'swr_only', 'granularity' => 'single'],
+        ]);
+
+        $saved = [];
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphqlCfg), $classifier])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+
+        $service->method('cacheLoad')->willReturn(null);
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$saved) {
+            $saved[] = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'Op']);
+        // All-null data but no errors key — a legitimate empty result, not a resolver failure.
+        // The $hasErrors && !$hasUsefulData gate must not fire; the payload must be cached.
+        $service->savePersistent($request, new JsonResponse(['data' => ['getListing' => null]]));
+
+        $payloadEntries = array_values(array_filter($saved, fn ($c) => str_starts_with($c['key'], 'persistent_output_payload_')));
+        $this->assertNotEmpty($payloadEntries, 'all-null data without errors must be cached');
     }
 
     public function testAppliesFlagSetOnMiss(): void
