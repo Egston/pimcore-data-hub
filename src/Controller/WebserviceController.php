@@ -87,6 +87,8 @@ class WebserviceController extends FrontendController
 
     private readonly RequestVariableValidator $requestVariableValidator;
 
+    private readonly string $bypassApikey;
+
     private readonly ?LoggerInterface $psrLogger;
 
     public function __construct(
@@ -97,6 +99,8 @@ class WebserviceController extends FrontendController
         FileUploadService $uploadService,
         OperationClassifier $operationClassifier,
         RequestVariableValidator $requestVariableValidator,
+        #[Autowire('%pimcore_data_hub.request_validation.bypass_apikey%')]
+        string $bypassApikey = '',
         #[Autowire(service: 'monolog.logger.pimcore')]
         ?LoggerInterface $psrLogger = null,
     ) {
@@ -107,6 +111,7 @@ class WebserviceController extends FrontendController
         $this->uploadService = $uploadService;
         $this->operationClassifier = $operationClassifier;
         $this->requestVariableValidator = $requestVariableValidator;
+        $this->bypassApikey = $bypassApikey;
         $this->psrLogger = $psrLogger;
     }
 
@@ -160,18 +165,37 @@ class WebserviceController extends FrontendController
             }
         }
 
-        try {
-            $this->requestVariableValidator->assertRequest(
-                $clientname,
-                $version,
-                $operationName,
-                is_array($input['variables'] ?? null) ? $input['variables'] : []
-            );
-        } catch (ClientSafeException $e) {
-            return new JsonResponse(
-                ['errors' => [['message' => $e->getMessage(), 'extensions' => ['category' => $e->getCategory()]]]],
-                400
-            );
+        // Development/explorer bypass. Only honoured when the bypass key is
+        // configured AND matches AND the client is NOT rules-enforced: pasting
+        // the key on an enforced client (e.g. public-content) must leave the
+        // endpoint fully validated and cached. The enforced-client guard makes
+        // this a dev convenience, never an authentication escape hatch.
+        $isBypass = false;
+        if ($this->bypassApikey !== '' && !$this->requestVariableValidator->isEnforced($clientname)) {
+            $resolvedApiKey = $this->permissionsService->resolveApiKey($request) ?? '';
+            $isBypass = hash_equals($this->bypassApikey, $resolvedApiKey);
+        }
+
+        if ($isBypass) {
+            $request->attributes->set(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE, true);
+            $this->psrLogger?->info('datahub.request_validation.bypass', [
+                'operation' => $operationName,
+                'client' => $clientname,
+            ]);
+        } else {
+            try {
+                $this->requestVariableValidator->assertRequest(
+                    $clientname,
+                    $version,
+                    $operationName,
+                    is_array($input['variables'] ?? null) ? $input['variables'] : []
+                );
+            } catch (ClientSafeException $e) {
+                return new JsonResponse(
+                    ['errors' => [['message' => $e->getMessage(), 'extensions' => ['category' => $e->getCategory()]]]],
+                    400
+                );
+            }
         }
 
         $tier = $operationName !== null
@@ -205,7 +229,9 @@ class WebserviceController extends FrontendController
         // no compute protection. STALE-HIT's refresh dispatch is deduplicated downstream
         // by PersistentCacheRefreshOnTerminateListener (per-body lock) and by
         // PersistentRefreshMessageHandler (per-op lock at the queue worker).
-        if ($pResponse = $this->persistentCacheService->preHandle($request, $responseService)) {
+        $isBypassCache = (bool)$request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE);
+
+        if (!$isBypassCache && ($pResponse = $this->persistentCacheService->preHandle($request, $responseService))) {
             $responseService->addHitMissHeaders($pResponse, true);
 
             return $pResponse;
@@ -227,6 +253,7 @@ class WebserviceController extends FrontendController
         // never overlaps with the herd-guard atomic lock above.
         $lock = null;
         if ($tier === Tier::SWR_ONLY
+            && !$isBypassCache
             && !$request->attributes->get('_datahub_persistent_refresh')
         ) {
             $waitMs = max(0, (int)($graphqlCfg['swr_cold_miss_lock_wait_ms'] ?? 5000));
@@ -268,7 +295,7 @@ class WebserviceController extends FrontendController
             // When running a background refresh, bypass the standard output cache layer
             $isPersistentRefresh = (bool)$request->attributes->get('_datahub_persistent_refresh');
             $isPersistentApplies = (bool)$request->attributes->get('_datahub_persistent_applies');
-            $skipOutputCache = $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
+            $skipOutputCache = $isBypassCache || $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
 
             if (!$skipOutputCache && ($response = $this->cacheService->load($request))) {
                 Logger::debug('Output cache HIT');
@@ -422,7 +449,12 @@ class WebserviceController extends FrontendController
                 $this->cacheService->save($request, $response);
             }
 
-            $this->persistentCacheService->postHandle($request, $response);
+            // A bypass request must never mint a persistent entry — postHandle has
+            // no bypass-awareness internally; without this guard a bypass request
+            // would mint a persistent entry if the operation is classified.
+            if (!$isBypassCache) {
+                $this->persistentCacheService->postHandle($request, $response);
+            }
         } finally {
             $this->persistentCacheService->releaseColdMissLock(
                 $request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_COLD_MISS_LOCK)

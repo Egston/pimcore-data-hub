@@ -22,6 +22,12 @@ services:
     
     Pimcore\Bundle\DataHubBundle\Service\:
         resource: '../../Service'
+        # Kernel-free value objects constructed by RulesLoader, not the container.
+        exclude:
+            - '../../Service/RequestValidation/OperationRule.php'
+            - '../../Service/RequestValidation/RulesSet.php'
+            - '../../Service/RequestValidation/RulesVersion.php'
+            - '../../Service/RequestValidation/VariableConstraint.php'
         public: true
         autowire: true
         autoconfigure: true

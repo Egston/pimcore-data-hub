@@ -33,13 +33,7 @@ class CheckConsumerPermissionsService
         }
         $securityConfig = $configuration->getSecurityConfig();
         if ($securityConfig['method'] === Configuration::SECURITYCONFIG_AUTH_APIKEY) {
-            $apiKey = $request->headers->get('apikey');
-            if (empty($apiKey)) {
-                $apiKey = $request->headers->get(static::TOKEN_HEADER);
-            }
-            if (empty($apiKey)) {
-                $apiKey = $request->query->getString('apikey');
-            }
+            $apiKey = $this->resolveApiKey($request) ?? '';
             if (is_array($securityConfig['apikey'])) {
                 return in_array($apiKey, $securityConfig['apikey']);
             } else {
@@ -48,5 +42,26 @@ class CheckConsumerPermissionsService
         }
 
         return false;
+    }
+
+    /**
+     * Single source of truth for the request's apikey read order:
+     * `apikey` header → `X-API-Key` header → `apikey` query param.
+     * Shared by the security check and the development bypass gate so a future
+     * read-order change can never drift between the two.
+     *
+     * Returns null only when none of the three sources carry a non-empty value.
+     */
+    public function resolveApiKey(Request $request): ?string
+    {
+        $apiKey = $request->headers->get('apikey');
+        if (empty($apiKey)) {
+            $apiKey = $request->headers->get(static::TOKEN_HEADER);
+        }
+        if (empty($apiKey)) {
+            $apiKey = $request->query->getString('apikey');
+        }
+
+        return $apiKey === '' ? null : $apiKey;
     }
 }

@@ -22,6 +22,9 @@ class PersistentOutputCacheService
     /** Request attribute carrying the acquired cold-miss lock (or absent when no lock held). */
     public const REQUEST_ATTR_COLD_MISS_LOCK = '_datahub_swr_cold_miss_lock';
 
+    /** Request attribute set by the bypass gate; suppresses both cache read and write for the request. */
+    public const REQUEST_ATTR_BYPASS_CACHE = '_datahub_bypass_cache';
+
     /**
      * Dedicated tag for the singleton invalidation watermark; kept separate from
      * TAG_COMMON so a blanket clear of cached entries by TAG_COMMON does not

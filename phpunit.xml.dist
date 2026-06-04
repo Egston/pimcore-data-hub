@@ -16,6 +16,7 @@
             <file>tests/Command/PersistentCacheClearCommandTest.php</file>
             <file>tests/Controller/WebserviceControllerTierGateTest.php</file>
             <file>tests/Controller/WebserviceControllerSwrColdMissTest.php</file>
+            <file>tests/Controller/WebserviceControllerBypassTest.php</file>
             <file>tests/Service/GraphQLRequestCanonicalizerTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceCanonicalizationParityTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceTest.php</file>

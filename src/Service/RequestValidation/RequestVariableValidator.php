@@ -53,6 +53,12 @@ class RequestVariableValidator
     ) {
     }
 
+    /** Whether request-validation rules are enforced for the given client. */
+    public function isEnforced(string $clientName): bool
+    {
+        return in_array($clientName, $this->enforcedClients, true);
+    }
+
     /**
      * @param array<string, mixed> $variables
      *

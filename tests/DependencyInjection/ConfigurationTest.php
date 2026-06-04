@@ -478,6 +478,17 @@ final class ConfigurationTest extends TestCase
         $config = $this->processRoot([]);
         self::assertSame('', $config['request_validation']['rules_file']);
         self::assertSame([], $config['request_validation']['enforced_clients']);
+        self::assertSame('', $config['request_validation']['bypass_apikey']);
+    }
+
+    public function testRequestValidationAcceptsBypassApikey(): void
+    {
+        $config = $this->processRoot([
+            'request_validation' => [
+                'bypass_apikey' => 'dev-secret',
+            ],
+        ]);
+        self::assertSame('dev-secret', $config['request_validation']['bypass_apikey']);
     }
 
     public function testRequestValidationAcceptsRulesFileAndClients(): void
