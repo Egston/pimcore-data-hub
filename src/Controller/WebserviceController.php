@@ -26,6 +26,7 @@ use Pimcore\Bundle\DataHubBundle\Event\GraphQL\ExecutorEvents;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\ExecutorEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\ExecutorResultEvent;
 use Pimcore\Bundle\DataHubBundle\GraphQL\ClassTypeDefinitions;
+use Pimcore\Bundle\DataHubBundle\GraphQL\Exception\ClientSafeException;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Mutation\MutationType;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Query\QueryType;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service;
@@ -35,6 +36,7 @@ use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Pimcore\Cache\RuntimeCache;
@@ -83,6 +85,8 @@ class WebserviceController extends FrontendController
      */
     private $operationClassifier;
 
+    private readonly RequestVariableValidator $requestVariableValidator;
+
     private readonly ?LoggerInterface $psrLogger;
 
     public function __construct(
@@ -92,6 +96,7 @@ class WebserviceController extends FrontendController
         PersistentOutputCacheService $persistentCacheService,
         FileUploadService $uploadService,
         OperationClassifier $operationClassifier,
+        RequestVariableValidator $requestVariableValidator,
         #[Autowire(service: 'monolog.logger.pimcore')]
         ?LoggerInterface $psrLogger = null,
     ) {
@@ -101,6 +106,7 @@ class WebserviceController extends FrontendController
         $this->persistentCacheService = $persistentCacheService;
         $this->uploadService = $uploadService;
         $this->operationClassifier = $operationClassifier;
+        $this->requestVariableValidator = $requestVariableValidator;
         $this->psrLogger = $psrLogger;
     }
 
@@ -132,6 +138,41 @@ class WebserviceController extends FrontendController
 
         $input = json_decode($request->getContent(), true) ?: [];
         $operationName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+
+        $versionParam = $request->query->all()['version'] ?? null;
+        $version = null;
+        if ($versionParam !== null) {
+            if (!is_scalar($versionParam)) {
+                Logger::warning('datahub.request_validation.invalid_version', [
+                    'client' => $clientname,
+                    'version_raw' => '[non-scalar]',
+                ]);
+            } else {
+                $versionInt = (int)$versionParam;
+                if ($versionInt > 0 && (string)$versionInt === (string)$versionParam) {
+                    $version = $versionInt;
+                } else {
+                    Logger::warning('datahub.request_validation.invalid_version', [
+                        'client' => $clientname,
+                        'version_raw' => mb_substr((string)$versionParam, 0, 64),
+                    ]);
+                }
+            }
+        }
+
+        try {
+            $this->requestVariableValidator->assertRequest(
+                $clientname,
+                $version,
+                $operationName,
+                is_array($input['variables'] ?? null) ? $input['variables'] : []
+            );
+        } catch (ClientSafeException $e) {
+            return new JsonResponse(
+                ['errors' => [['message' => $e->getMessage(), 'extensions' => ['category' => $e->getCategory()]]]],
+                400
+            );
+        }
 
         $tier = $operationName !== null
             ? $this->operationClassifier->getTier($operationName)

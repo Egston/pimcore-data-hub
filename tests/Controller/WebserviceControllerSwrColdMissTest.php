@@ -6,13 +6,17 @@ namespace Pimcore\Bundle\DataHubBundle\Tests\Controller;
 
 use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
+use Pimcore\Bundle\DataHubBundle\GraphQL\Exception\ClientSafeException;
 use Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService;
 use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
+use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
@@ -71,7 +75,8 @@ final class WebserviceControllerSwrColdMissTest extends TestCase
             $cacheService,
             $persistentCacheService,
             $uploadService,
-            $classifier
+            $classifier,
+            new RequestVariableValidator(new RulesLoader(''), [])
         );
         $controller->graphqlCfg = $deps['graphqlCfg'] ?? [
             'swr_cold_miss_lock_wait_ms' => 5000,
@@ -358,8 +363,48 @@ final class TestableSwrColdMissController extends WebserviceController
         /** @var OperationClassifier $classifier */
         $classifier = $classifierProp->getValue($this);
 
+        $validatorProp = $reflection->getProperty('requestVariableValidator');
+        $validatorProp->setAccessible(true);
+        /** @var RequestVariableValidator $validator */
+        $validator = $validatorProp->getValue($this);
+
         $input = json_decode($request->getContent(), true) ?: [];
         $operationName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+
+        $versionParam = $request->query->all()['version'] ?? null;
+        $version = null;
+        if ($versionParam !== null) {
+            if (!is_scalar($versionParam)) {
+                Logger::warning('datahub.request_validation.invalid_version', [
+                    'client' => $request->attributes->getString('clientname'),
+                    'version_raw' => '[non-scalar]',
+                ]);
+            } else {
+                $versionInt = (int)$versionParam;
+                if ($versionInt > 0 && (string)$versionInt === (string)$versionParam) {
+                    $version = $versionInt;
+                } else {
+                    Logger::warning('datahub.request_validation.invalid_version', [
+                        'client' => $request->attributes->getString('clientname'),
+                        'version_raw' => mb_substr((string)$versionParam, 0, 64),
+                    ]);
+                }
+            }
+        }
+
+        try {
+            $validator->assertRequest(
+                $request->attributes->getString('clientname'),
+                $version,
+                $operationName,
+                is_array($input['variables'] ?? null) ? $input['variables'] : []
+            );
+        } catch (ClientSafeException $e) {
+            return new JsonResponse(
+                ['errors' => [['message' => $e->getMessage(), 'extensions' => ['category' => $e->getCategory()]]]],
+                400
+            );
+        }
 
         $tier = $operationName !== null ? $classifier->getTier($operationName) : Tier::NEITHER;
         $request->attributes->set('_datahub_tier', $tier->value);

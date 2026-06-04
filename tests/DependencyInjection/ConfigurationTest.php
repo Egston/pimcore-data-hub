@@ -460,4 +460,46 @@ final class ConfigurationTest extends TestCase
         ]);
         self::assertSame(7, $graphql['operations']['testOpListSwr']['read_priority_weight']);
     }
+
+    /**
+     * @param array<string, mixed> $config
+     *
+     * @return array<string, mixed>
+     */
+    private function processRoot(array $config): array
+    {
+        $processor = new Processor();
+
+        return $processor->processConfiguration(new Configuration(), [$config]);
+    }
+
+    public function testRequestValidationDefaultsAreNoOp(): void
+    {
+        $config = $this->processRoot([]);
+        self::assertSame('', $config['request_validation']['rules_file']);
+        self::assertSame([], $config['request_validation']['enforced_clients']);
+    }
+
+    public function testRequestValidationAcceptsRulesFileAndClients(): void
+    {
+        $config = $this->processRoot([
+            'request_validation' => [
+                'rules_file' => '/etc/datahub/rules.json',
+                'enforced_clients' => ['public-content'],
+            ],
+        ]);
+        self::assertSame('/etc/datahub/rules.json', $config['request_validation']['rules_file']);
+        self::assertSame(['public-content'], $config['request_validation']['enforced_clients']);
+    }
+
+    public function testRequestValidationUnknownKeyRejected(): void
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->processRoot([
+            'request_validation' => [
+                'rules_file' => '/etc/datahub/rules.json',
+                'typo_key' => true,
+            ],
+        ]);
+    }
 }
