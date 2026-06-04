@@ -6,6 +6,7 @@ namespace Pimcore\Bundle\DataHubBundle\Tests\MessageHandler;
 
 use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
+use Pimcore\Bundle\DataHubBundle\GraphQL\Exception\ClientSafeException;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
@@ -16,6 +17,8 @@ use Pimcore\Bundle\DataHubBundle\Service\Granularity;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Pimcore\Helper\LongRunningHelper;
@@ -1038,6 +1041,169 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
             $before + $cooldownTtl,
             $dispatched[0]->deliverAt,
             'lastRefreshAt+cooldown must precede now+cooldown given lastRefreshAt is in the past',
+        );
+    }
+
+    public function testNonConformingStoredCanonicalIsEvictedAndControllerNotInvoked(): void
+    {
+        $classifier = $this->makeClassifier(['OpReject' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpReject","variables":{"bad":1}}';
+
+        $evictCalls = [];
+        $persistentCache = $this->makeEvictSpyCache($evictCalls);
+
+        $rejectingValidator = new class(new RulesLoader(''), []) extends RequestVariableValidator {
+            public function assertRequest(string $clientName, ?int $version, ?string $operationName, array $variables): void
+            {
+                throw new ClientSafeException('request rejected by request-validation: unknown-variable');
+            }
+        };
+
+        $handler = $this->makeValidatingHandler($classifier, $lockFactory, $controller, $persistentCache, $rejectingValidator);
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpReject');
+        $handler($msg);
+
+        self::assertCount(1, $evictCalls, 'evictEntry must be called exactly once on rejection');
+        self::assertSame('c1', $evictCalls[0][0]);
+        self::assertSame($body, $evictCalls[0][1]);
+        self::assertSame('OpReject', $evictCalls[0][2]);
+    }
+
+    public function testConformingStoredCanonicalProceedsToController(): void
+    {
+        $classifier = $this->makeClassifier(['OpOk' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        $evictCalls = [];
+        $persistentCache = $this->makeEvictSpyCache($evictCalls);
+
+        // A passing validator (shipped no-op defaults: no rules file → never rejects).
+        $passingValidator = new RequestVariableValidator(new RulesLoader(''), []);
+
+        $handler = $this->makeValidatingHandler($classifier, $lockFactory, $controller, $persistentCache, $passingValidator);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpOk"}', 'OpOk');
+        $handler($msg);
+
+        self::assertSame([], $evictCalls, 'conforming entry must not be evicted');
+    }
+
+    public function testNullValidatorProceedsToController(): void
+    {
+        $classifier = $this->makeClassifier(['OpNoValidator' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::once())->method('webonyxAction');
+
+        // The default makeHandler omits the validator (null) — inert by default.
+        $handler = $this->makeHandler($classifier, $lockFactory, $controller, ['persistent_refresh_lock_ttl' => 60]);
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpNoValidator"}', 'OpNoValidator');
+        $handler($msg);
+    }
+
+    public function testEvictThrowDropsMessageWithoutRequeue(): void
+    {
+        $classifier = $this->makeClassifier(['OpEvictFail' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpEvictFail","variables":{"bad":1}}';
+
+        $cache = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['evictEntry', 'loadEntryMeta'])
+            ->getMock();
+        $cache->method('loadEntryMeta')->willReturn(null);
+        $cache->method('evictEntry')->willThrowException(new \RuntimeException('Redis unavailable'));
+
+        $rejectingValidator = new class(new RulesLoader(''), []) extends RequestVariableValidator {
+            public function assertRequest(string $clientName, ?int $version, ?string $operationName, array $variables): void
+            {
+                throw new ClientSafeException('request rejected by request-validation: unknown-variable');
+            }
+        };
+
+        $handler = $this->makeValidatingHandler($classifier, $lockFactory, $controller, $cache, $rejectingValidator);
+
+        // Must not throw RecoverableMessageHandlingException (which would requeue).
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpEvictFail');
+        $handler($msg);
+    }
+
+    /**
+     * @param array<int, array{0: string, 1: string, 2: ?string}> $evictCalls by-ref capture
+     */
+    private function makeEvictSpyCache(array &$evictCalls): PersistentOutputCacheService
+    {
+        $cache = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['evictEntry', 'loadEntryMeta'])
+            ->getMock();
+        $cache->method('loadEntryMeta')->willReturn(null);
+        $cache->method('evictEntry')->willReturnCallback(
+            function (string $client, string $bodyJson, ?string $operationName) use (&$evictCalls): void {
+                $evictCalls[] = [$client, $bodyJson, $operationName];
+            }
+        );
+
+        return $cache;
+    }
+
+    private function makeValidatingHandler(
+        OperationClassifier $classifier,
+        LockFactory $lockFactory,
+        WebserviceController $controller,
+        PersistentOutputCacheService $persistentCache,
+        RequestVariableValidator $validator
+    ): PersistentRefreshMessageHandler {
+        $resolver = new class($lockFactory) extends LockFactoryResolver {
+            public function __construct(private LockFactory $factory)
+            {
+            }
+
+            public function resolve(): ?object
+            {
+                return $this->factory;
+            }
+        };
+
+        $graphQlService = $this->createMock(GraphQLService::class);
+        $localeService = $this->createMock(LocaleServiceInterface::class);
+        $modelFactory = (new \ReflectionClass(Factory::class))->newInstanceWithoutConstructor();
+        $longRunningHelper = (new \ReflectionClass(LongRunningHelper::class))->newInstanceWithoutConstructor();
+        $responseService = $this->createMock(ResponseServiceInterface::class);
+        $container = $this->createMock(ContainerBagInterface::class);
+        $container->method('get')->willReturn(['graphql' => ['persistent_refresh_lock_ttl' => 60]]);
+
+        return new PersistentRefreshMessageHandler(
+            $classifier,
+            $resolver,
+            $controller,
+            $graphQlService,
+            $localeService,
+            $modelFactory,
+            $longRunningHelper,
+            $responseService,
+            $container,
+            null,
+            null,
+            $persistentCache,
+            null,
+            null,
+            validator: $validator,
         );
     }
 

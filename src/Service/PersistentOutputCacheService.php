@@ -414,6 +414,85 @@ class PersistentOutputCacheService
         return $invalidatedAt > 0 && $invalidatedAt > $refreshedAt;
     }
 
+    /**
+     * Remove a single persistent-cache entry (payload + meta + all index
+     * memberships) for a (client, body) pair, bypassing the SWR flow.
+     *
+     * Used by the refresh worker to self-clean an entry whose stored canonical
+     * no longer conforms to the current request-validation rules: such an entry
+     * is pollution that the SWR refresh loop would otherwise re-serve forever.
+     *
+     * Reverse-index cleanup is gated on a usable stored tag set; forward-index
+     * and key removal are not gated on a successful meta load, so a missing meta
+     * never leaves a dangling forward-index member. Idempotent: a second call
+     * for the same body is a clean series of no-ops.
+     */
+    public function evictEntry(string $client, string $bodyJson, ?string $operationName): void
+    {
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $metaKey = $this->keyMeta($client, $canonical);
+        $payloadKey = $this->keyPayload($client, $canonical);
+
+        $meta = $this->cacheLoad($metaKey);
+        $storedTags = is_array($meta) ? ($meta['tags'] ?? null) : null;
+        if (is_array($storedTags) && $storedTags !== []) {
+            foreach ($storedTags as $tag) {
+                $this->removeFromReverseIndex((string)$tag, $payloadKey);
+            }
+        } else {
+            Logger::debug('datahub.swr.evict_meta_absent', [
+                'client' => $client,
+                'operation' => $operationName,
+            ]);
+        }
+
+        $this->removeFromIndex(self::INDEX_ALL, $payloadKey);
+        if ($operationName !== null && $operationName !== '') {
+            $this->removeFromIndex(self::INDEX_OP_PREFIX . $operationName, $payloadKey);
+        }
+        if ($client !== '') {
+            $this->removeFromIndex(self::INDEX_CLIENT_PREFIX . $client, $payloadKey);
+        }
+
+        $this->cacheRemove($payloadKey);
+        $this->cacheRemove($metaKey);
+    }
+
+    private function removeFromReverseIndex(string $tag, string $payloadKey): void
+    {
+        $indexKey = self::REVERSE_INDEX_PREFIX . $tag;
+        $list = $this->cacheLoad($indexKey);
+        if (!is_array($list) || $list === []) {
+            return;
+        }
+        // Mirror dispatchForTags' shape guards: a malformed pair must not fatal
+        // the eviction. Drop only the pair whose payloadKey matches; keep the rest.
+        $filtered = array_values(array_filter($list, static function ($pair) use ($payloadKey): bool {
+            if (!is_array($pair) || count($pair) < 2 || !is_string($pair[0])) {
+                return true;
+            }
+
+            return $pair[0] !== $payloadKey;
+        }));
+        if ($filtered === $list) {
+            return;
+        }
+        $this->cacheSave($indexKey, $filtered, [self::TAG_COMMON], null);
+    }
+
+    private function removeFromIndex(string $indexKey, string $memberKey): void
+    {
+        $list = $this->cacheLoad($indexKey);
+        if (!is_array($list) || $list === []) {
+            return;
+        }
+        $filtered = array_values(array_filter($list, static fn ($member): bool => $member !== $memberKey));
+        if ($filtered === $list) {
+            return;
+        }
+        $this->cacheSave($indexKey, $filtered, [self::TAG_COMMON], null);
+    }
+
     /** Manually set the last invalidation timestamp to now. */
     public function bumpFallbackWatermark(?int $ts = null): void
     {

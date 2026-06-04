@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\DataHubBundle\MessageHandler;
 
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
+use Pimcore\Bundle\DataHubBundle\GraphQL\Exception\ClientSafeException;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockFactoryResolver;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
@@ -17,6 +18,7 @@ use Pimcore\Bundle\DataHubBundle\Service\FrontendRequestScope;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Pimcore\Helper\LongRunningHelper;
@@ -71,6 +73,7 @@ final class PersistentRefreshMessageHandler
         private ?CooldownWindowDispatcher $cooldownDispatcher = null,
         ?CooldownRefreshPolicy $policy = null,
         private ?RequestStack $requestStack = null,
+        private ?RequestVariableValidator $validator = null,
     ) {
         $this->policy = $policy ?? ($persistentCache !== null ? new CooldownRefreshPolicy($persistentCache) : null);
     }
@@ -102,6 +105,38 @@ final class PersistentRefreshMessageHandler
 
         if (!$this->shouldRunRefresh($message, $operationName, $hash)) {
             return;
+        }
+
+        // Validate before acquiring the lock: the controller's 400 response is
+        // discarded by the worker, so this pre-lock check is the only site where
+        // a non-conforming stored entry can be evicted.
+        if ($this->validator !== null) {
+            $input = json_decode($message->bodyJson, true);
+            $input = is_array($input) ? $input : [];
+            $opName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+            $variables = is_array($input['variables'] ?? null) ? $input['variables'] : [];
+
+            try {
+                $this->validator->assertRequest($message->client, null, $opName, $variables);
+            } catch (ClientSafeException $e) {
+                try {
+                    $this->persistentCache?->evictEntry($message->client, $message->bodyJson, $opName);
+                    $this->logInfo('datahub.request_validation.refresh_evicted', [
+                        'client' => $message->client,
+                        'operation' => $opName ?? $operationName,
+                        'reason' => $e->getMessage(),
+                    ]);
+                } catch (\Throwable $evictErr) {
+                    $this->logWarning(sprintf(
+                        'datahub.swr.evict_failed client=%s operation=%s: %s',
+                        $message->client,
+                        $operationName,
+                        $evictErr->getMessage()
+                    ));
+                }
+
+                return;
+            }
         }
 
         $factory = $this->lockResolver->resolve();
@@ -469,5 +504,15 @@ final class PersistentRefreshMessageHandler
     protected function logError(string $message): void
     {
         Logger::error($message);
+    }
+
+    /**
+     * Structured-event info seam. Routes through Pimcore\Logger, a no-op without a booted container.
+     *
+     * @param array<string, mixed> $context
+     */
+    protected function logInfo(string $slug, array $context): void
+    {
+        Logger::info($slug, $context);
     }
 }
