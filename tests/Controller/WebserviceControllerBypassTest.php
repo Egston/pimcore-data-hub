@@ -223,6 +223,25 @@ final class WebserviceControllerBypassTest extends TestCase
         self::assertFalse((bool)$request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE));
         self::assertFalse($controller->auditLogged);
     }
+
+    public function testNoApikeyHeaderDoesNotBypass(): void
+    {
+        $classifier = $this->makeClassifier(['swrOp' => ['tier' => 'swr_only', 'granularity' => 'single']]);
+
+        $cacheService = $this->createMock(OutputCacheService::class);
+        $persistentCacheService = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCacheService->expects(self::once())->method('preHandle')->willReturn(null);
+        $persistentCacheService->expects(self::once())->method('postHandle');
+
+        $controller = $this->makeController($classifier, $cacheService, $persistentCacheService, 'dev-secret', []);
+
+        // makeRequest with null omits the header entirely; resolveApiKey returns null → '' → no match.
+        $request = $this->makeRequest('swrOp', null);
+        $controller->webonyxAction(request: $request, responseService: $this->makeNoopResponseService());
+
+        self::assertFalse((bool)$request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE), 'absent apikey header must not bypass');
+        self::assertFalse($controller->auditLogged);
+    }
 }
 
 /**
@@ -280,8 +299,7 @@ final class TestableBypassController extends WebserviceController
         $bypassApikey = $get('bypassApikey')->getValue($this);
 
         $clientname = $request->attributes->getString('clientname');
-        $input = json_decode($request->getContent(), true) ?: [];
-        $operationName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+        ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
 
         $isBypass = false;
         if ($bypassApikey !== '' && !$validator->isEnforced($clientname)) {
@@ -298,7 +316,7 @@ final class TestableBypassController extends WebserviceController
                     $clientname,
                     null,
                     $operationName,
-                    is_array($input['variables'] ?? null) ? $input['variables'] : []
+                    $inputVariables
                 );
             } catch (ClientSafeException $e) {
                 return new JsonResponse(

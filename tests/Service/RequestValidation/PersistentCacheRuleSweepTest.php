@@ -322,6 +322,42 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
         self::assertSame(0, $result['evicted']);
     }
 
+    /**
+     * Characterization: the sweep validates a stored entry whose canonical body
+     * carries no `operationName` member against the index operation. The index
+     * operation IS in the allowed set with valid variables, so the entry must
+     * pass, not be evicted.
+     */
+    public function testEntryWithoutOperationNameInBodyValidatesAgainstIndexOperation(): void
+    {
+        $store = [PersistentOutputCacheService::INDEX_ALL => []];
+        $rulesLoader = $this->rulesWithClient(self::CLIENT);
+        $cacheService = $this->makeCacheService($store);
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader);
+
+        // Seed an entry whose canonical body has NO operationName key but whose
+        // index `operation` is an allowed operation with conforming variables.
+        $body = json_encode(['query' => '{ x }', 'variables' => ['lang' => 'en']]) ?: '';
+        $canonical = PersistentOutputCacheService::canonicalizePayloadString($body);
+        $payloadKey = PersistentOutputCacheService::keyPayloadFor(self::CLIENT, $canonical);
+        $metaKey = PersistentOutputCacheService::keyMetaFor(self::CLIENT, $canonical);
+
+        $store[PersistentOutputCacheService::INDEX_ALL][] = $payloadKey;
+        $store[$payloadKey] = ['data' => ['x' => 1]];
+        $store[$metaKey] = [
+            'client' => self::CLIENT,
+            'operation' => 'AllowedOp',
+            'canonical' => $canonical,
+        ];
+
+        $result = $sweep->sweep();
+
+        self::assertSame(1, $result['scanned'], 'entry should be scanned');
+        self::assertSame(1, $result['passed'], 'index-fallback operation validates successfully');
+        self::assertSame(0, $result['evicted'], 'conforming entry must not be evicted');
+    }
+
     public function testLoggerReceivesEvictedEntry(): void
     {
         $store = [PersistentOutputCacheService::INDEX_ALL => []];

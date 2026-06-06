@@ -264,6 +264,98 @@ final class RequestVariableValidatorTest extends TempfileTestCase
         $this->assertAccepts($this->contractValidator(), 'getJobListingListing', ['first' => 1000]);
     }
 
+    /**
+     * @return array<string, array{body: string, fallback: ?string, expectedOp: ?string, expectedVars: array<string,mixed>}>
+     */
+    public static function decodeRequestShapeProvider(): array
+    {
+        return [
+            'well-formed body' => [
+                'body' => '{"operationName":"MyOp","variables":{"lang":"en"}}',
+                'fallback' => null,
+                'expectedOp' => 'MyOp',
+                'expectedVars' => ['lang' => 'en'],
+            ],
+            'missing operationName with null fallback' => [
+                'body' => '{"variables":{"lang":"en"}}',
+                'fallback' => null,
+                'expectedOp' => null,
+                'expectedVars' => ['lang' => 'en'],
+            ],
+            'missing operationName with non-null fallback' => [
+                'body' => '{"variables":{"lang":"en"}}',
+                'fallback' => 'IndexOp',
+                'expectedOp' => 'IndexOp',
+                'expectedVars' => ['lang' => 'en'],
+            ],
+            'non-array variables' => [
+                'body' => '{"operationName":"MyOp","variables":"not-an-array"}',
+                'fallback' => null,
+                'expectedOp' => 'MyOp',
+                'expectedVars' => [],
+            ],
+            'non-decodable body with null fallback' => [
+                'body' => 'not-json',
+                'fallback' => null,
+                'expectedOp' => null,
+                'expectedVars' => [],
+            ],
+            'non-decodable body with non-null fallback' => [
+                'body' => 'not-json',
+                'fallback' => 'FallbackOp',
+                'expectedOp' => 'FallbackOp',
+                'expectedVars' => [],
+            ],
+            'numeric operationName with non-null fallback' => [
+                'body' => '{"operationName":123,"variables":{}}',
+                'fallback' => 'IndexOp',
+                'expectedOp' => 'IndexOp',
+                'expectedVars' => [],
+            ],
+            'numeric operationName with null fallback' => [
+                'body' => '{"operationName":123,"variables":{}}',
+                'fallback' => null,
+                'expectedOp' => null,
+                'expectedVars' => [],
+            ],
+            'json-null operationName with non-null fallback' => [
+                'body' => '{"operationName":null,"variables":{}}',
+                'fallback' => 'IndexOp',
+                'expectedOp' => 'IndexOp',
+                'expectedVars' => [],
+            ],
+        ];
+    }
+
+    /**
+     * @dataProvider decodeRequestShapeProvider
+     *
+     * @param array<string,mixed> $expectedVars
+     */
+    public function testDecodeRequestShape(string $body, ?string $fallback, ?string $expectedOp, array $expectedVars): void
+    {
+        $result = RequestVariableValidator::decodeRequestShape($body, $fallback);
+
+        self::assertSame($expectedOp, $result['operationName']);
+        self::assertSame($expectedVars, $result['variables']);
+    }
+
+    public function testAbsentNonNullableDeclaredVariableIsRejected(): void
+    {
+        // getBrandListing declares `defaultLanguage` as a non-nullable enum.
+        // Omitting it entirely (not passing via withLocale) must reject.
+        $v = $this->contractValidator();
+
+        try {
+            $v->assertRequest(self::CLIENT, 1, 'getBrandListing', []);
+            self::fail('absent non-nullable declared variable should reject');
+        } catch (ClientSafeException $e) {
+            self::assertStringStartsWith(RequestVariableValidator::REJECT_MESSAGE_PREFIX, $e->getMessage());
+        }
+        $last = $v->warnings[count($v->warnings) - 1];
+        self::assertSame(RequestVariableValidator::REASON_CONSTRAINT_FAILED, $last['context']['reason']);
+    }
+
     public function testRejectLogContextTruncatesValueAndCarriesSlug(): void
     {
         $v = $this->contractValidator();

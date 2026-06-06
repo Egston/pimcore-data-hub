@@ -111,10 +111,7 @@ final class PersistentRefreshMessageHandler
         // discarded by the worker, so this pre-lock check is the only site where
         // a non-conforming stored entry can be evicted.
         if ($this->validator !== null) {
-            $input = json_decode($message->bodyJson, true);
-            $input = is_array($input) ? $input : [];
-            $opName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
-            $variables = is_array($input['variables'] ?? null) ? $input['variables'] : [];
+            ['operationName' => $opName, 'variables' => $variables] = RequestVariableValidator::decodeRequestShape($message->bodyJson, null);
 
             try {
                 $this->validator->assertRequest($message->client, null, $opName, $variables);

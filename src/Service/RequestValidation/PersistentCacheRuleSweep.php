@@ -74,12 +74,8 @@ class PersistentCacheRuleSweep
                 continue;
             }
 
-            $opName = isset($decoded['operationName']) && is_string($decoded['operationName'])
-                ? $decoded['operationName']
-                : $operation;
-            $variables = isset($decoded['variables']) && is_array($decoded['variables'])
-                ? $decoded['variables']
-                : [];
+            // Fallback is the index operation: stored entries are keyed by operation.
+            ['operationName' => $opName, 'variables' => $variables] = RequestVariableValidator::decodeRequestShape($canonical, $operation);
 
             try {
                 $this->validator->assertRequest($client, null, $opName, $variables);

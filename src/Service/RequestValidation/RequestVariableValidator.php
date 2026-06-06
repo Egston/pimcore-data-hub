@@ -40,6 +40,29 @@ class RequestVariableValidator
     ) {
     }
 
+    /**
+     * Decode the `operationName` and `variables` from a raw GraphQL request body.
+     *
+     * When `operationName` is absent or non-string, `$fallbackOperation` is used.
+     * The sweep passes the index operation: stored entries are keyed by operation,
+     * so absent body operationName falls back to the operation they were stored under.
+     *
+     * @return array{operationName: ?string, variables: array<string, mixed>}
+     */
+    public static function decodeRequestShape(string $bodyJson, ?string $fallbackOperation): array
+    {
+        $decoded = json_decode($bodyJson, true);
+        $input = is_array($decoded) ? $decoded : [];
+        $operationName = isset($input['operationName']) && is_string($input['operationName'])
+            ? $input['operationName']
+            : $fallbackOperation;
+        $variables = isset($input['variables']) && is_array($input['variables'])
+            ? $input['variables']
+            : [];
+
+        return ['operationName' => $operationName, 'variables' => $variables];
+    }
+
     /** Whether request-validation rules are enforced for the given client. */
     public function isEnforced(string $clientName): bool
     {

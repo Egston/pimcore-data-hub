@@ -368,8 +368,7 @@ final class TestableSwrColdMissController extends WebserviceController
         /** @var RequestVariableValidator $validator */
         $validator = $validatorProp->getValue($this);
 
-        $input = json_decode($request->getContent(), true) ?: [];
-        $operationName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+        ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
 
         $versionParam = $request->query->all()['version'] ?? null;
         $version = null;
@@ -397,7 +396,7 @@ final class TestableSwrColdMissController extends WebserviceController
                 $request->attributes->getString('clientname'),
                 $version,
                 $operationName,
-                is_array($input['variables'] ?? null) ? $input['variables'] : []
+                $inputVariables
             );
         } catch (ClientSafeException $e) {
             return new JsonResponse(
