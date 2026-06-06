@@ -51,6 +51,7 @@
             <file>tests/Service/RequestValidation/RequestVariableValidatorTest.php</file>
             <file>tests/Service/RequestValidation/PersistentCacheRuleSweepTest.php</file>
             <file>tests/Service/RequestValidation/PersistentCacheRuleSweepTaskTest.php</file>
+            <file>tests/Service/RequestValidation/SweepCountsTest.php</file>
             <file>tests/Service/TierTest.php</file>
             <file>tests/Service/CooldownWindowDispatcherTest.php</file>
             <file>tests/Service/CooldownRefreshPolicyTest.php</file>

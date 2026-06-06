@@ -21,13 +21,19 @@ class PersistentCacheRuleSweep
     /**
      * Walk every entry in the persistent cache index and evict those that no
      * longer conform to the current request-validation rules.
-     *
-     * @return array{scanned: int, evicted: int, skipped_malformed: int, evict_failed: int, not_enforced: int, passed: int, validate_failed: int}
      */
-    public function sweep(): array
+    public function sweep(): SweepCounts
     {
         if ($this->rulesLoader->load() === null) {
-            return ['scanned' => 0, 'evicted' => 0, 'skipped_malformed' => 0, 'evict_failed' => 0, 'not_enforced' => 0, 'passed' => 0, 'validate_failed' => 0];
+            return new SweepCounts(
+                scanned: 0,
+                evicted: 0,
+                skippedMalformed: 0,
+                evictFailed: 0,
+                notEnforced: 0,
+                passed: 0,
+                validateFailed: 0,
+            );
         }
 
         $result = $this->cache->listAllEntries();
@@ -106,14 +112,14 @@ class PersistentCacheRuleSweep
             }
         }
 
-        return [
-            'scanned' => $scanned,
-            'evicted' => $evicted,
-            'skipped_malformed' => $skipped,
-            'evict_failed' => $evictFailed,
-            'not_enforced' => $notEnforced,
-            'passed' => $passed,
-            'validate_failed' => $validateFailed,
-        ];
+        return new SweepCounts(
+            scanned: $scanned,
+            evicted: $evicted,
+            skippedMalformed: $skipped,
+            evictFailed: $evictFailed,
+            notEnforced: $notEnforced,
+            passed: $passed,
+            validateFailed: $validateFailed,
+        );
     }
 }

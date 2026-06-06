@@ -7,6 +7,7 @@ namespace Pimcore\Bundle\DataHubBundle\Tests\Service\RequestValidation;
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\PersistentCacheRuleSweep;
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\PersistentCacheRuleSweepTask;
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\SweepCounts;
 
 final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
 {
@@ -81,7 +82,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
         $rulesLoader = $this->makeRulesLoader();
 
         $sweepFirst = $this->createMock(PersistentCacheRuleSweep::class);
-        $sweepFirst->method('sweep')->willReturn(['scanned' => 2, 'evicted' => 0, 'skipped_malformed' => 0, 'evict_failed' => 0, 'not_enforced' => 0, 'passed' => 2, 'validate_failed' => 0]);
+        $sweepFirst->method('sweep')->willReturn(new SweepCounts(2, 0, 0, 0, 0, 2, 0));
 
         $savedStamp = null;
         $helper = $this->makeTask($sweepFirst, $rulesLoader, [self::CLIENT], null, $savedStamp);
@@ -106,7 +107,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
         $sweep = $this->createMock(PersistentCacheRuleSweep::class);
         $sweep->expects(self::once())
             ->method('sweep')
-            ->willReturn(['scanned' => 3, 'evicted' => 1, 'skipped_malformed' => 0, 'evict_failed' => 0, 'not_enforced' => 0, 'passed' => 2, 'validate_failed' => 0]);
+            ->willReturn(new SweepCounts(3, 1, 0, 0, 0, 2, 0));
 
         $savedStamp = null;
         $task = $this->makeTask($sweep, $rulesLoader, [self::CLIENT], 'old-stamp-value', $savedStamp);
@@ -122,7 +123,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
         $sweep = $this->createMock(PersistentCacheRuleSweep::class);
         $sweep->expects(self::once())
             ->method('sweep')
-            ->willReturn(['scanned' => 1, 'evicted' => 0, 'skipped_malformed' => 0, 'evict_failed' => 0, 'not_enforced' => 0, 'passed' => 1, 'validate_failed' => 0]);
+            ->willReturn(new SweepCounts(1, 0, 0, 0, 0, 1, 0));
 
         $savedStamp = null;
         $task = $this->makeTask($sweep, $rulesLoader, [self::CLIENT], null, $savedStamp);
@@ -135,7 +136,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
     {
         $rulesLoader = $this->makeRulesLoader();
         $sweep = $this->createMock(PersistentCacheRuleSweep::class);
-        $sweep->method('sweep')->willReturn(['scanned' => 0, 'evicted' => 0, 'skipped_malformed' => 0, 'evict_failed' => 0, 'not_enforced' => 0, 'passed' => 0, 'validate_failed' => 0]);
+        $sweep->method('sweep')->willReturn(new SweepCounts(0, 0, 0, 0, 0, 0, 0));
 
         $savedStamp = null;
         $task = $this->makeTask($sweep, $rulesLoader, [self::CLIENT], null, $savedStamp);
@@ -148,7 +149,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
     {
         $rulesLoader = $this->makeRulesLoader();
         $sweep = $this->createMock(PersistentCacheRuleSweep::class);
-        $sweep->method('sweep')->willReturn(['scanned' => 3, 'evicted' => 1, 'skipped_malformed' => 0, 'evict_failed' => 1, 'not_enforced' => 0, 'passed' => 1, 'validate_failed' => 0]);
+        $sweep->method('sweep')->willReturn(new SweepCounts(3, 1, 0, 1, 0, 1, 0));
 
         $savedStamp = null;
         $task = $this->makeTask($sweep, $rulesLoader, [self::CLIENT], null, $savedStamp);
@@ -174,7 +175,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
     {
         $rulesLoader = $this->makeRulesLoader();
         $sweep = $this->createMock(PersistentCacheRuleSweep::class);
-        $sweep->method('sweep')->willReturn(['scanned' => 1, 'evicted' => 0, 'skipped_malformed' => 0, 'evict_failed' => 0, 'not_enforced' => 0, 'passed' => 1, 'validate_failed' => 0]);
+        $sweep->method('sweep')->willReturn(new SweepCounts(1, 0, 0, 0, 0, 1, 0));
 
         $savedStampA = null;
         $savedStampB = null;

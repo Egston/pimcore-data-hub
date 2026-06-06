@@ -8,6 +8,7 @@ use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\PersistentCacheRuleSweep;
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator;
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\SweepCounts;
 use Psr\Log\AbstractLogger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 
@@ -92,7 +93,14 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(['scanned' => 0, 'evicted' => 0, 'skipped_malformed' => 0, 'evict_failed' => 0, 'not_enforced' => 0, 'passed' => 0, 'validate_failed' => 0], $result);
+        self::assertInstanceOf(SweepCounts::class, $result);
+        self::assertSame(0, $result->scanned);
+        self::assertSame(0, $result->evicted);
+        self::assertSame(0, $result->skippedMalformed);
+        self::assertSame(0, $result->evictFailed);
+        self::assertSame(0, $result->notEnforced);
+        self::assertSame(0, $result->passed);
+        self::assertSame(0, $result->validateFailed);
     }
 
     public function testConformingEntryIsNotEvicted(): void
@@ -107,11 +115,11 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(1, $result['scanned']);
-        self::assertSame(0, $result['evicted']);
-        self::assertSame(0, $result['skipped_malformed']);
-        self::assertSame(1, $result['passed']);
-        self::assertSame(0, $result['not_enforced']);
+        self::assertSame(1, $result->scanned);
+        self::assertSame(0, $result->evicted);
+        self::assertSame(0, $result->skippedMalformed);
+        self::assertSame(1, $result->passed);
+        self::assertSame(0, $result->notEnforced);
     }
 
     public function testNonConformingEntryIsEvicted(): void
@@ -129,9 +137,9 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(1, $result['scanned']);
-        self::assertSame(1, $result['evicted']);
-        self::assertSame(0, $result['evict_failed']);
+        self::assertSame(1, $result->scanned);
+        self::assertSame(1, $result->evicted);
+        self::assertSame(0, $result->evictFailed);
 
         self::assertArrayNotHasKey($payloadKey, $store, 'payload key evicted');
         self::assertArrayNotHasKey($metaKey, $store, 'meta key evicted');
@@ -149,8 +157,8 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(1, $result['scanned']);
-        self::assertSame(1, $result['evicted']);
+        self::assertSame(1, $result->scanned);
+        self::assertSame(1, $result->evicted);
     }
 
     public function testEvictThrowCountedAndSweepContinues(): void
@@ -187,9 +195,9 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(2, $result['scanned']);
-        self::assertSame(1, $result['evicted']);
-        self::assertSame(1, $result['evict_failed']);
+        self::assertSame(2, $result->scanned);
+        self::assertSame(1, $result->evicted);
+        self::assertSame(1, $result->evictFailed);
     }
 
     public function testMalformedMetaSkippedWithoutAbort(): void
@@ -211,9 +219,9 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(0, $result['scanned']);
-        self::assertSame(1, $result['skipped_malformed']);
-        self::assertSame(0, $result['evicted']);
+        self::assertSame(0, $result->scanned);
+        self::assertSame(1, $result->skippedMalformed);
+        self::assertSame(0, $result->evicted);
     }
 
     public function testUnenforceClientIsNotEvicted(): void
@@ -228,9 +236,9 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(0, $result['scanned']);
-        self::assertSame(0, $result['evicted']);
-        self::assertSame(1, $result['not_enforced']);
+        self::assertSame(0, $result->scanned);
+        self::assertSame(0, $result->evicted);
+        self::assertSame(1, $result->notEnforced);
     }
 
     public function testMixedEnforcedAndNotEnforcedBucketsCorrectly(): void
@@ -246,10 +254,10 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(1, $result['scanned']);
-        self::assertSame(1, $result['passed']);
-        self::assertSame(0, $result['evicted']);
-        self::assertSame(1, $result['not_enforced']);
+        self::assertSame(1, $result->scanned);
+        self::assertSame(1, $result->passed);
+        self::assertSame(0, $result->evicted);
+        self::assertSame(1, $result->notEnforced);
     }
 
     public function testUndecodableCanonicalIsEvicted(): void
@@ -277,8 +285,8 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(1, $result['evicted']);
-        self::assertSame(0, $result['evict_failed']);
+        self::assertSame(1, $result->evicted);
+        self::assertSame(0, $result->evictFailed);
         self::assertArrayNotHasKey($payloadKey, $store);
         self::assertArrayNotHasKey($metaKey, $store);
     }
@@ -316,10 +324,10 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(2, $result['scanned']);
-        self::assertSame(1, $result['validate_failed']);
-        self::assertSame(1, $result['passed']);
-        self::assertSame(0, $result['evicted']);
+        self::assertSame(2, $result->scanned);
+        self::assertSame(1, $result->validateFailed);
+        self::assertSame(1, $result->passed);
+        self::assertSame(0, $result->evicted);
     }
 
     /**
@@ -353,9 +361,9 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
 
         $result = $sweep->sweep();
 
-        self::assertSame(1, $result['scanned'], 'entry should be scanned');
-        self::assertSame(1, $result['passed'], 'index-fallback operation validates successfully');
-        self::assertSame(0, $result['evicted'], 'conforming entry must not be evicted');
+        self::assertSame(1, $result->scanned, 'entry should be scanned');
+        self::assertSame(1, $result->passed, 'index-fallback operation validates successfully');
+        self::assertSame(0, $result->evicted, 'conforming entry must not be evicted');
     }
 
     public function testLoggerReceivesEvictedEntry(): void

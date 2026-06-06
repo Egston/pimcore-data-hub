@@ -27,6 +27,7 @@ services:
             - '../../Service/RequestValidation/OperationRule.php'
             - '../../Service/RequestValidation/RulesSet.php'
             - '../../Service/RequestValidation/RulesVersion.php'
+            - '../../Service/RequestValidation/SweepCounts.php'
             - '../../Service/RequestValidation/VariableConstraint.php'
         public: true
         autowire: true

@@ -25,19 +25,8 @@ class PersistentCachePurgeInvalidCommand extends Command
     {
         $counts = $this->sweep->sweep();
 
-        $tag = $counts['evict_failed'] > 0 ? 'comment' : 'info';
-        $output->writeln(sprintf(
-            '<%1$s>Sweep complete: scanned=%2$d evicted=%3$d skipped_malformed=%4$d evict_failed=%5$d not_enforced=%6$d passed=%7$d validate_failed=%8$d</%1$s>',
-            $tag,
-            $counts['scanned'],
-            $counts['evicted'],
-            $counts['skipped_malformed'],
-            $counts['evict_failed'],
-            $counts['not_enforced'],
-            $counts['passed'],
-            $counts['validate_failed'],
-        ));
+        $output->writeln($counts->summaryLine());
 
-        return $counts['evict_failed'] > 0 ? Command::FAILURE : Command::SUCCESS;
+        return $counts->evictFailed > 0 ? Command::FAILURE : Command::SUCCESS;
     }
 }

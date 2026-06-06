@@ -48,13 +48,13 @@ class PersistentCacheRuleSweepTask implements TaskInterface
             return;
         }
 
-        if ($counts['evict_failed'] > 0) {
-            Logger::warning('datahub.request_validation.sweep_task_complete', $counts);
+        if ($counts->evictFailed > 0) {
+            Logger::warning('datahub.request_validation.sweep_task_complete', $counts->toLogContext());
         } else {
-            Logger::info('datahub.request_validation.sweep_task_complete', $counts);
+            Logger::info('datahub.request_validation.sweep_task_complete', $counts->toLogContext());
         }
 
-        if ($counts['scanned'] === 0 || $counts['evict_failed'] > 0) {
+        if (!$counts->isEffectiveSweep()) {
             return;
         }
 
