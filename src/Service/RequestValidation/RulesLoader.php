@@ -39,6 +39,8 @@ class RulesLoader
 
     private ?int $parsedMtime = null;
 
+    private ?int $failedMtime = null;
+
     public function __construct(private readonly string $rulesFilePath)
     {
     }
@@ -53,11 +55,14 @@ class RulesLoader
 
         $mtime = $this->readMtime($this->rulesFilePath);
         if ($mtime === false) {
-            $this->logError(self::LOG_SLUG, [
-                'path' => $this->rulesFilePath,
-                'error' => 'filemtime() failed after is_file() passed',
-                'retained_last_known_good' => $this->lastKnownGood !== null,
-            ]);
+            if ($this->failedMtime !== -1) {
+                $this->failedMtime = -1;
+                $this->logError(self::LOG_SLUG, [
+                    'path' => $this->rulesFilePath,
+                    'error' => 'filemtime() failed after is_file() passed',
+                    'retained_last_known_good' => $this->lastKnownGood !== null,
+                ]);
+            }
 
             return $this->lastKnownGood;
         }
@@ -69,17 +74,21 @@ class RulesLoader
         try {
             $set = $this->parseAndBuild();
         } catch (\Throwable $e) {
-            $this->logError(self::LOG_SLUG, [
-                'path' => $this->rulesFilePath,
-                'error' => $e->getMessage(),
-                'retained_last_known_good' => $this->lastKnownGood !== null,
-            ]);
+            if ($mtime !== $this->failedMtime) {
+                $this->failedMtime = $mtime;
+                $this->logError(self::LOG_SLUG, [
+                    'path' => $this->rulesFilePath,
+                    'error' => $e->getMessage(),
+                    'retained_last_known_good' => $this->lastKnownGood !== null,
+                ]);
+            }
 
             return $this->lastKnownGood;
         }
 
         $this->lastKnownGood = $set;
         $this->parsedMtime = $mtime;
+        $this->failedMtime = null;
 
         return $set;
     }
@@ -266,8 +275,17 @@ class RulesLoader
     }
 
     /**
+     * Mtime of the most recently parsed rules file, or null if no successful
+     * load has occurred. Used by callers that need a change-stamp tied to the
+     * in-memory rules state (e.g. sweep task change-gating).
+     */
+    public function getLoadedMtime(): ?int
+    {
+        return $this->parsedMtime;
+    }
+
+    /**
      * Overrideable in test seams to inject a forced failure without filesystem races.
-     *
      */
     protected function readMtime(string $path): int|false
     {

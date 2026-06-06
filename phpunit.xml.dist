@@ -14,6 +14,7 @@
               install. See tests/_bootstrap.php and tests/Service.suite.dist.yml.
             -->
             <file>tests/Command/PersistentCacheClearCommandTest.php</file>
+            <file>tests/Command/PersistentCachePurgeInvalidCommandTest.php</file>
             <file>tests/Controller/WebserviceControllerTierGateTest.php</file>
             <file>tests/Controller/WebserviceControllerSwrColdMissTest.php</file>
             <file>tests/Controller/WebserviceControllerBypassTest.php</file>
@@ -25,6 +26,7 @@
             <file>tests/Service/PersistentOutputCacheServiceColdMissLockTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceTagCollectionTest.php</file>
             <file>tests/Service/PersistentOutputCacheServiceEvictionTest.php</file>
+            <file>tests/Service/PersistentOutputCacheServiceListAllEntriesTest.php</file>
             <file>tests/Service/OperationClassifierTest.php</file>
             <file>tests/Service/DependencyCollectorTest.php</file>
             <file>tests/EventListener/InProgressLockReleaseListenerTest.php</file>
@@ -47,6 +49,8 @@
             <file>tests/Service/RequestValidation/RulesInheritanceTest.php</file>
             <file>tests/Service/RequestValidation/RulesLoaderTest.php</file>
             <file>tests/Service/RequestValidation/RequestVariableValidatorTest.php</file>
+            <file>tests/Service/RequestValidation/PersistentCacheRuleSweepTest.php</file>
+            <file>tests/Service/RequestValidation/PersistentCacheRuleSweepTaskTest.php</file>
             <file>tests/Service/TierTest.php</file>
             <file>tests/Service/CooldownWindowDispatcherTest.php</file>
             <file>tests/Service/CooldownRefreshPolicyTest.php</file>

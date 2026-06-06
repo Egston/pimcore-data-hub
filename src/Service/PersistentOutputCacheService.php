@@ -1169,4 +1169,62 @@ class PersistentOutputCacheService
     {
         return self::ENQUEUE_DEDUPE_PREFIX . self::entryHashFromBody($client, $bodyJson);
     }
+
+    /**
+     * Enumerate every entry in INDEX_ALL, loading each entry's meta and
+     * yielding the fields needed for re-validation: client, operation, canonical.
+     *
+     * Entries whose payload key maps to no meta (mid-cleanup or backend
+     * corruption) are silently skipped; the caller receives a count of skipped
+     * entries in the returned array alongside the yielded data.
+     *
+     * @return array{entries: list<array{client: string, operation: string|null, canonical: string}>, skipped: int}
+     */
+    public function listAllEntries(): array
+    {
+        $index = $this->cacheLoad(self::INDEX_ALL);
+        if (!is_array($index) || $index === []) {
+            return ['entries' => [], 'skipped' => 0];
+        }
+
+        $entries = [];
+        $skipped = 0;
+
+        foreach ($index as $payloadKey) {
+            if (!is_string($payloadKey) || !str_starts_with($payloadKey, self::PAYLOAD_KEY_PREFIX)) {
+                ++$skipped;
+
+                continue;
+            }
+
+            $hash = substr($payloadKey, strlen(self::PAYLOAD_KEY_PREFIX));
+            $metaKey = self::META_KEY_PREFIX . $hash;
+            $meta = $this->cacheLoad($metaKey);
+
+            if (!is_array($meta)) {
+                ++$skipped;
+
+                continue;
+            }
+
+            $client = isset($meta['client']) && is_string($meta['client']) ? $meta['client'] : null;
+            $canonical = isset($meta['canonical']) && is_string($meta['canonical']) ? $meta['canonical'] : null;
+
+            if ($client === null || $canonical === null) {
+                ++$skipped;
+
+                continue;
+            }
+
+            $operation = isset($meta['operation']) && is_string($meta['operation']) ? $meta['operation'] : null;
+
+            $entries[] = [
+                'client' => $client,
+                'operation' => $operation,
+                'canonical' => $canonical,
+            ];
+        }
+
+        return ['entries' => $entries, 'skipped' => $skipped];
+    }
 }

@@ -40,6 +40,12 @@ services:
         arguments:
             $enforcedClients: '%pimcore_data_hub.request_validation.enforced_clients%'
 
+    Pimcore\Bundle\DataHubBundle\Service\RequestValidation\PersistentCacheRuleSweepTask:
+        arguments:
+            $enforcedClients: '%pimcore_data_hub.request_validation.enforced_clients%'
+        tags:
+            - { name: pimcore.maintenance.task, type: datahub_request_validation_sweep }
+
     Pimcore\Bundle\DataHubBundle\Lock\:
         resource: '../../Lock'
 

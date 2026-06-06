@@ -161,4 +161,83 @@ final class RulesLoaderTest extends TempfileTestCase
         self::assertSame(RulesLoader::LOG_SLUG, $loader->errors[0]['slug']);
         self::assertTrue($loader->errors[0]['context']['retained_last_known_good']);
     }
+
+    public function testWarmParseFailureLogsOncePerMtime(): void
+    {
+        $this->writeRaw((string)json_encode([
+            'versions' => ['1' => ['operations' => ['good' => ['variables' => []]]]],
+        ]), 5000);
+
+        $loader = new CapturingRulesLoader($this->file);
+        $loader->load();
+
+        // Introduce a bad file at a new mtime.
+        $this->writeRaw('{ bad json', 6000);
+        $loader->load();
+        $loader->load();
+        $loader->load();
+
+        self::assertCount(1, $loader->errors, 'repeated warm failure with same mtime logs once');
+        self::assertSame(RulesLoader::LOG_SLUG, $loader->errors[0]['slug']);
+
+        // A different bad mtime triggers one more log entry.
+        $this->writeRaw('{ still bad', 7000);
+        $loader->load();
+        $loader->load();
+
+        self::assertCount(2, $loader->errors, 'new mtime produces one additional error log');
+    }
+
+    public function testWarmParseRecoveryRearmsErrorSignal(): void
+    {
+        $this->writeRaw((string)json_encode([
+            'versions' => ['1' => ['operations' => ['good' => ['variables' => []]]]],
+        ]), 5000);
+
+        $loader = new CapturingRulesLoader($this->file);
+        $loader->load();
+
+        // Bad file — should log once.
+        $this->writeRaw('{ bad', 6000);
+        $loader->load();
+        self::assertCount(1, $loader->errors);
+
+        // Recover.
+        $this->writeRaw((string)json_encode([
+            'versions' => ['1' => ['operations' => ['recovered' => ['variables' => []]]]],
+        ]), 7000);
+        $recovered = $loader->load();
+        self::assertTrue($recovered?->forVersionOrLatest(1)?->hasOperation('recovered'));
+        self::assertSame(7000, $loader->getLoadedMtime());
+
+        // Bad file again — signal must re-arm after the recovery.
+        $this->writeRaw('{ bad again', 8000);
+        $loader->load();
+        self::assertCount(2, $loader->errors, 'error signal re-arms after a successful parse');
+    }
+
+    public function testFilemtimeFailureLogsOncePerSession(): void
+    {
+        $this->writeRaw((string)json_encode([
+            'versions' => ['1' => ['operations' => ['opA' => ['variables' => []]]]],
+        ]), 1000);
+
+        $loader = new class($this->file) extends CapturingRulesLoader {
+            public bool $forceFail = false;
+
+            protected function readMtime(string $path): int|false
+            {
+                return $this->forceFail ? false : parent::readMtime($path);
+            }
+        };
+
+        $loader->load();
+        $loader->forceFail = true;
+
+        $loader->load();
+        $loader->load();
+        $loader->load();
+
+        self::assertCount(1, $loader->errors, 'filemtime failure logs once per failing session');
+    }
 }
