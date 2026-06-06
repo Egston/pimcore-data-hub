@@ -19,6 +19,7 @@ namespace Pimcore\Bundle\DataHubBundle\Command;
 
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
+use Pimcore\Bundle\DataHubBundle\Service\FrontendRequestScope;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Helper\LongRunningHelper;
 use Pimcore\Localization\LocaleServiceInterface;
@@ -30,6 +31,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
 
 #[AsCommand(name: 'datahub:graphql:persistent-cache:refresh', description: 'Refresh persistent GraphQL cache by executing a GraphQL request')]
 class PersistentCacheRefreshCommand extends Command
@@ -40,7 +42,8 @@ class PersistentCacheRefreshCommand extends Command
         private LocaleServiceInterface $localeService,
         private Factory $modelFactory,
         private LongRunningHelper $longRunningHelper,
-        private ResponseServiceInterface $responseService
+        private ResponseServiceInterface $responseService,
+        private ?RequestStack $requestStack = null
     ) {
         parent::__construct();
     }
@@ -97,14 +100,14 @@ class PersistentCacheRefreshCommand extends Command
         $request->attributes->set('_datahub_persistent_refresh', true);
         $request->attributes->set('_datahub_bypass_in_progress_guard', true);
 
-        $response = $this->controller->webonyxAction(
+        $response = FrontendRequestScope::run($this->requestStack, $request, fn () => $this->controller->webonyxAction(
             $this->graphQlService,
             $this->localeService,
             $this->modelFactory,
             $request,
             $this->longRunningHelper,
             $this->responseService
-        );
+        ));
 
         $status = $response->getStatusCode();
         $body = json_decode((string)$response->getContent(), true);

@@ -32,9 +32,11 @@ use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Pimcore\Helper\LongRunningHelper;
+use Pimcore\Http\RequestHelper;
 use Pimcore\Localization\LocaleServiceInterface;
 use Pimcore\Model\Factory;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
+use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\Lock\LockFactory;
 use Symfony\Component\Lock\Store\InMemoryStore;
 use Symfony\Component\Messenger\Exception\RecoverableMessageHandlingException;
@@ -70,7 +72,8 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         OperationClassifier $classifier,
         LockFactory $lockFactory,
         WebserviceController $controller,
-        array $graphqlConfig = []
+        array $graphqlConfig = [],
+        ?RequestStack $requestStack = null
     ): PersistentRefreshMessageHandler {
         $resolver = new class($lockFactory) extends LockFactoryResolver {
             public function __construct(private LockFactory $factory)
@@ -104,7 +107,8 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
             $modelFactory,
             $longRunningHelper,
             $responseService,
-            $container
+            $container,
+            requestStack: $requestStack
         );
     }
 
@@ -708,6 +712,127 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         self::assertIsInt($controller->captured, 'synthetic request must carry the refresh-start timestamp as an int');
         self::assertGreaterThan(0, $controller->captured);
         self::assertEqualsWithDelta(time(), $controller->captured, 2, 'refresh-start timestamp must be close to now');
+    }
+
+    public function testWorkerMarksSyntheticRequestFrontendAndPushesOntoRequestStack(): void
+    {
+        $classifier = $this->makeClassifier(['OpFrontend' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+        $requestStack = new RequestStack();
+
+        $controller = new class($requestStack) extends WebserviceController {
+            /** @var mixed */
+            public $frontendAttribute = 'unset';
+
+            public bool $sawSelfAsMainRequest = false;
+
+            public function __construct(private RequestStack $stack)
+            {
+            }
+
+            public function webonyxAction(
+                \Pimcore\Bundle\DataHubBundle\GraphQL\Service $service,
+                \Pimcore\Localization\LocaleServiceInterface $localeService,
+                \Pimcore\Model\Factory $modelFactory,
+                \Symfony\Component\HttpFoundation\Request $request,
+                \Pimcore\Helper\LongRunningHelper $longRunningHelper,
+                \Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface $responseService
+            ) {
+                $this->frontendAttribute = $request->attributes->get(RequestHelper::ATTRIBUTE_FRONTEND_REQUEST);
+                $this->sawSelfAsMainRequest = $this->stack->getMainRequest() === $request;
+
+                return new \Symfony\Component\HttpFoundation\JsonResponse(['data' => ['x' => 1]]);
+            }
+        };
+
+        $handler = $this->makeHandler(
+            $classifier,
+            $lockFactory,
+            $controller,
+            ['persistent_refresh_lock_ttl' => 60],
+            $requestStack
+        );
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpFrontend"}', 'OpFrontend');
+        $handler($msg);
+
+        self::assertTrue(
+            $controller->frontendAttribute,
+            'synthetic request must be marked frontend so Asset::getFullPath() urlencodes like an FPM-served request'
+        );
+        self::assertTrue(
+            $controller->sawSelfAsMainRequest,
+            'synthetic request must be the RequestStack main request during resolution (Tool::isFrontend reads the stack)'
+        );
+        self::assertNull(
+            $requestStack->getMainRequest(),
+            'request stack must be popped back to empty after the refresh'
+        );
+    }
+
+    public function testRequestStackPoppedWhenControllerThrows(): void
+    {
+        $classifier = $this->makeClassifier(['OpThrow' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+        $requestStack = new RequestStack();
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->method('webonyxAction')->willThrowException(new \RuntimeException('resolver blew up'));
+
+        $handler = $this->makeHandler(
+            $classifier,
+            $lockFactory,
+            $controller,
+            ['persistent_refresh_lock_ttl' => 60],
+            $requestStack
+        );
+
+        $msg = new PersistentRefreshMessage('c1', '{"operationName":"OpThrow"}', 'OpThrow');
+        $handler($msg);
+
+        self::assertNull(
+            $requestStack->getMainRequest(),
+            'request stack must be popped even when the controller throws'
+        );
+    }
+
+    public function testRequestStackPoppedWhenLockContentionRequeues(): void
+    {
+        $classifier = $this->makeClassifier(['OpRequeue' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+        $requestStack = new RequestStack();
+
+        // Pre-hold the lock so the handler throws RecoverableMessageHandlingException.
+        $body = '{"operationName":"OpRequeue"}';
+        $swrKey = PersistentOutputCacheService::computeSwrRefreshLockKey('c1', $body);
+        $blocking = $lockFactory->createLock($swrKey, 60, false);
+        self::assertTrue($blocking->acquire(false));
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $handler = $this->makeHandler(
+            $classifier,
+            $lockFactory,
+            $controller,
+            ['persistent_refresh_lock_ttl' => 60],
+            $requestStack
+        );
+
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpRequeue');
+
+        $caught = null;
+
+        try {
+            $handler($msg);
+        } catch (RecoverableMessageHandlingException $e) {
+            $caught = $e;
+        } finally {
+            $blocking->release();
+        }
+
+        self::assertNotNull($caught, 'RecoverableMessageHandlingException must propagate to Messenger for requeue');
+        self::assertNull($requestStack->getMainRequest(), 'request stack must be popped before the recoverable exception leaves the handler');
     }
 
     public function testFreshnessGuardSkipsRefreshWhenEntryFreshWithinCooldown(): void

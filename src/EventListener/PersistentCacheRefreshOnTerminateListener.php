@@ -21,6 +21,7 @@ use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service as GraphQLService;
 use Pimcore\Bundle\DataHubBundle\Lock\LockSignalRefresher;
 use Pimcore\Bundle\DataHubBundle\Message\PersistentRefreshMessage;
+use Pimcore\Bundle\DataHubBundle\Service\FrontendRequestScope;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
@@ -33,6 +34,7 @@ use Pimcore\Model\Factory;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\HttpKernel\Event\TerminateEvent;
 use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\Lock\LockFactory;
@@ -69,7 +71,8 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         private ContainerBagInterface $container,
         private OperationClassifier $classifier,
         private ?LockFactory $lockFactory = null,
-        private ?MessageBusInterface $bus = null
+        private ?MessageBusInterface $bus = null,
+        private ?RequestStack $requestStack = null
     ) {
     }
 
@@ -237,14 +240,16 @@ class PersistentCacheRefreshOnTerminateListener implements EventSubscriberInterf
         $fresh->attributes->set('_datahub_bypass_in_progress_guard', true);
 
         try {
-            $this->controller->webonyxAction(
+            // kernel.terminate runs after the kernel popped the main request, so the
+            // inline refresh executes on an empty stack like any other CLI writer.
+            FrontendRequestScope::run($this->requestStack, $fresh, fn () => $this->controller->webonyxAction(
                 $this->graphQlService,
                 $this->localeService,
                 $this->modelFactory,
                 $fresh,
                 $this->longRunningHelper,
                 $this->responseService
-            );
+            ));
         } catch (\Throwable $e) {
             Logger::error('DataHub persistent refresh: controller invocation failed: ' . $e->getMessage());
         }

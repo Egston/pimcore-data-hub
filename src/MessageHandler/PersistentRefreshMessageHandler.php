@@ -26,6 +26,7 @@ use Pimcore\Bundle\DataHubBundle\Service\CooldownRefreshPolicy;
 use Pimcore\Bundle\DataHubBundle\Service\CooldownTrailingDecisionKind;
 use Pimcore\Bundle\DataHubBundle\Service\CooldownWindowDispatcher;
 use Pimcore\Bundle\DataHubBundle\Service\DependencyCollector;
+use Pimcore\Bundle\DataHubBundle\Service\FrontendRequestScope;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
@@ -37,6 +38,7 @@ use Pimcore\Logger;
 use Pimcore\Model\Factory;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\Messenger\Attribute\AsMessageHandler;
 use Symfony\Component\Messenger\Exception\RecoverableMessageHandlingException;
 use Symfony\Component\Messenger\MessageBusInterface;
@@ -81,6 +83,7 @@ final class PersistentRefreshMessageHandler
         private ?PersistentOutputCacheService $persistentCache = null,
         private ?CooldownWindowDispatcher $cooldownDispatcher = null,
         ?CooldownRefreshPolicy $policy = null,
+        private ?RequestStack $requestStack = null,
     ) {
         $this->policy = $policy ?? ($persistentCache !== null ? new CooldownRefreshPolicy($persistentCache) : null);
     }
@@ -177,14 +180,14 @@ final class PersistentRefreshMessageHandler
             $request->attributes->set('_datahub_persistent_refresh_started_at', (int)$startedAt);
 
             try {
-                $this->controller->webonyxAction(
+                FrontendRequestScope::run($this->requestStack, $request, fn () => $this->controller->webonyxAction(
                     $this->graphQlService,
                     $this->localeService,
                     $this->modelFactory,
                     $request,
                     $this->longRunningHelper,
                     $this->responseService
-                );
+                ));
                 $controllerSucceeded = true;
             } catch (\Throwable $e) {
                 if ($e instanceof RecoverableMessageHandlingException) {

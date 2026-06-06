@@ -43,6 +43,7 @@
             <file>tests/Service/TierTest.php</file>
             <file>tests/Service/CooldownWindowDispatcherTest.php</file>
             <file>tests/Service/CooldownRefreshPolicyTest.php</file>
+            <file>tests/Service/FrontendRequestScopeTest.php</file>
             <file>tests/PimcoreDataHubBundleBootTest.php</file>
             <file>tests/Functional/Fixtures/KernelTestCaseSentinelTest.php</file>
         </testsuite>
