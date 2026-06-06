@@ -104,6 +104,37 @@ final class RulesInheritanceTest extends TempfileTestCase
         self::assertTrue($set->forVersionOrLatest(1)?->hasOperation('only3'));
     }
 
+    public function testExplicitVersionInheritingParentWithNoOverridesEqualsParent(): void
+    {
+        $set = $this->loadFrom([
+            'versions' => [
+                '1' => ['operations' => [
+                    'opA' => ['variables' => ['x' => ['kind' => 'null']]],
+                    'opB' => ['variables' => ['y' => ['kind' => 'null']]],
+                ]],
+                '2' => ['inherits' => 1],
+            ],
+        ]);
+
+        $v1 = $set->forVersionOrLatest(1);
+        $v2 = $set->forVersionOrLatest(2);
+        self::assertNotNull($v1);
+        self::assertNotNull($v2);
+
+        self::assertTrue($v2->hasOperation('opA'), 'opA inherited by v2');
+        self::assertTrue($v2->hasOperation('opB'), 'opB inherited by v2');
+        self::assertTrue($v1->hasOperation('opA'), 'opA present in v1');
+        self::assertTrue($v1->hasOperation('opB'), 'opB present in v1');
+
+        self::assertNotNull($v2->operationRule('opA'), 'operationRule(opA) non-null on v2');
+        self::assertNotNull($v1->operationRule('opA'), 'operationRule(opA) non-null on v1');
+
+        self::assertFalse($v2->hasOperation('opNotInV1'), 'v2 must not gain operations beyond those inherited from v1');
+
+        self::assertTrue($v2->operationRule('opA')->hasVariable('x'), 'inherited opA rule retains variable x from v1');
+        self::assertTrue($v2->operationRule('opB')->hasVariable('y'), 'inherited opB rule retains variable y from v1');
+    }
+
     public function testEmptySetForVersionReturnsNull(): void
     {
         $set = new RulesSet([]);

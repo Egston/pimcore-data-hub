@@ -11,9 +11,9 @@ namespace Pimcore\Bundle\DataHubBundle\Service\RequestValidation;
 final class RulesSet
 {
     /** @var array<int, RulesVersion> */
-    private array $versions;
+    private readonly array $versions;
 
-    private ?int $latestVersion;
+    private readonly ?int $latestVersion;
 
     /**
      * @param array<int, RulesVersion> $versions
@@ -39,6 +39,13 @@ final class RulesSet
     /**
      * Resolves the requested version, or the latest version for a
      * missing/unknown version. Returns null only when the set is empty.
+     *
+     * The "versions" key in the rules schema is an independent rules-schema
+     * generation counter: it is NOT the frontend GRAPHQL_QUERIES_VERSION nor
+     * the pimcore-cache Redis namespace version — all three share the same
+     * ?version=N wire parameter but advance on different cadences, so an
+     * unknown or over-high version always resolves to the latest declared
+     * rules version rather than failing.
      */
     public function forVersionOrLatest(?int $version): ?RulesVersion
     {
