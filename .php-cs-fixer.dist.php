@@ -20,18 +20,10 @@ $config->setRules([
     'array_syntax'           => ['syntax' => 'short'],
     'list_syntax'            => ['syntax' => 'short'],
 
-    'header_comment'         => [
-        'comment_type' => 'PHPDoc',
-        'header' => 'Pimcore' . PHP_EOL . PHP_EOL .
-            'This source file is available under two different licenses:' . PHP_EOL .
-            '- GNU General Public License version 3 (GPLv3)' . PHP_EOL .
-            '- Pimcore Commercial License (PCL)' . PHP_EOL .
-            'Full copyright and license information is available in' . PHP_EOL .
-            'LICENSE.md which is distributed with this source code.' . PHP_EOL .
-            PHP_EOL .
-            ' @copyright  Copyright (c) Pimcore GmbH (http://www.pimcore.org)' . PHP_EOL .
-            ' @license    http://www.pimcore.org/license     GPLv3 and PCL'
-    ],
+    // No header_comment rule: new files in this fork are not authored by Pimcore GmbH,
+    // licensing is governed by the root LICENSE, and the upstream pimcore.org license
+    // link is stale (upstream has since relicensed). Existing upstream files keep
+    // their original headers.
 
     'blank_line_before_statement'         => true,
     'encoding'                            => true,
