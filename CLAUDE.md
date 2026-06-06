@@ -14,7 +14,11 @@ The `Functional` suite boots the Pimcore kernel and needs minikube/docker-compos
 (see `tests/Functional/bootstrap-minikube.sh`); it is opt-in, not part of the host gate.
 
 **Do not add the Pimcore GmbH license header to new files.** Pimcore GmbH is not the
-author of files created in this fork, licensing is governed by the root `LICENSE`, and
+author of files created in this fork, licensing is governed by the root `LICENSE.md`, and
 the header's pimcore.org license link is stale (upstream has since relicensed away from
 GPL). Existing upstream files keep their original headers; the `header_comment` cs-fixer
 rule was removed so the fixer no longer inserts it.
+
+**Never merge or cherry-pick code from upstream pimcore/data-hub versions released
+after its relicense to POCL.** This fork is GPLv3 (see `LICENSE.md`); POCL is not
+GPL-compatible. Upstream code is only safe to pull from GPL-era history.

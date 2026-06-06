@@ -3,6 +3,10 @@ title: Datahub
 ---
 # Pimcore Datahub
 
+> YAGEO fork of [pimcore/data-hub](https://github.com/pimcore/data-hub), maintained
+> under GPLv3+ only — see [LICENSE.md](LICENSE.md). Upstream relicensed to POCL after
+> the fork point; upstream code from post-relicense versions must not be merged here.
+
 [<img src="https://sonarcloud.io/images/project_badges/sonarcloud-light.svg" alt="SonarQube Cloud" height="30" />](https://sonarcloud.io/summary/new_code?id=pimcore_data-hub)
 
 
