@@ -451,6 +451,11 @@ class WebserviceController extends FrontendController
                     $output = $result->toArray();
                 }
             } catch (\Exception $e) {
+                Logger::error('datahub.graphql.execute_failed', [
+                    'operation' => $operationName,
+                    'client' => $clientname,
+                    'error' => $e->getMessage(),
+                ]);
                 $output = [
                     'errors' => [
                         [
