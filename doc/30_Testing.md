@@ -33,6 +33,29 @@ to stand one up:
 
 Once the stack is up, run `vendor/bin/phpunit --testsuite Functional`. The suite also covers request-validation rejection via `RequestValidationFunctionalTest`; the L3 overlay (`pimcore_data_hub_test.yaml`) enables `request_validation` for the `default` test client with a fixture rules file (`tests/Functional/Fixtures/request-validation-rules.json`) so the validator fires against the real controller.
 
+> **A bare host `--testsuite Functional` fails by design.** With no booted kernel
+> the first fixture load calls `Pimcore::getContainer()` on `null`
+> (`Pimcore.php:133`). That error is the absence of a stack, not a broken test —
+> the Functional suite only runs where the kernel can boot (the minikube namespace
+> or the compose stack above).
+
+#### Known limitation — the `default` DataHub client is not yet seeded
+
+Standing up the stack imports the test classes and loads DataObject fixtures, but
+it does **not** create the DataHub GraphQL endpoint config the controller resolves
+on every request. `WebserviceController` calls `Configuration::getByName('default')`
+first; when that client config is absent the request 404s **before** any validator,
+cache, or resolver runs — so the whole Functional suite (not just the
+request-validation test) currently cannot run green end-to-end. The client config
+must enable the three test classes' queries and pass security without an apikey
+(sibling tests dispatch against `default` with no credentials and expect `200`).
+
+Until the bootstrap seeds that client, verify request-validation enforcement against
+a **running** Pimcore with the black-box smoke instead:
+`pimcore-installation/pimcore/bin/datahub-request-validation-smoke` (fires the
+rejection matrix + a valid request over HTTP at the enforced public-content
+endpoint). It needs no kernel setup on the caller's side.
+
 ## Perform PHPStan Analysis
 
 ### data-hub only context
