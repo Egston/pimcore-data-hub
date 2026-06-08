@@ -1143,6 +1143,47 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
         $handler($msg);
     }
 
+    public function testEvictUnconfirmedDropsMessageWithoutRequeue(): void
+    {
+        $classifier = $this->makeClassifier(['OpEvictFail' => Tier::SWR_ONLY]);
+        $lockFactory = new LockFactory(new InMemoryStore());
+
+        $controller = $this->createMock(WebserviceController::class);
+        $controller->expects(self::never())->method('webonyxAction');
+
+        $body = '{"operationName":"OpEvictFail","variables":{"bad":1}}';
+
+        $evictCalls = 0;
+        $cache = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['evictEntry', 'loadEntryMeta'])
+            ->getMock();
+        $cache->method('loadEntryMeta')->willReturn(null);
+        // Backend did not confirm the removal: false return, no throw. The
+        // handler must still drop the message rather than requeue it (the
+        // reject-storm this path exists to prevent).
+        $cache->method('evictEntry')->willReturnCallback(function () use (&$evictCalls): bool {
+            ++$evictCalls;
+
+            return false;
+        });
+
+        $rejectingValidator = new class(new RulesLoader(''), []) extends RequestVariableValidator {
+            public function assertRequest(string $clientName, ?int $version, ?string $operationName, array $variables): void
+            {
+                throw new ClientSafeException('request rejected by request-validation: unknown-variable');
+            }
+        };
+
+        $handler = $this->makeValidatingHandler($classifier, $lockFactory, $controller, $cache, $rejectingValidator);
+
+        // Must not throw RecoverableMessageHandlingException (which would requeue).
+        $msg = new PersistentRefreshMessage('c1', $body, 'OpEvictFail');
+        $handler($msg);
+
+        self::assertSame(1, $evictCalls, 'eviction was attempted once on the unconfirmed-removal path');
+    }
+
     /**
      * @param array<int, array{0: string, 1: string, 2: ?string}> $evictCalls by-ref capture
      */
@@ -1154,8 +1195,10 @@ final class PersistentRefreshMessageHandlerTest extends TestCase
             ->getMock();
         $cache->method('loadEntryMeta')->willReturn(null);
         $cache->method('evictEntry')->willReturnCallback(
-            function (string $client, string $bodyJson, ?string $operationName) use (&$evictCalls): void {
+            function (string $client, string $bodyJson, ?string $operationName) use (&$evictCalls): bool {
                 $evictCalls[] = [$client, $bodyJson, $operationName];
+
+                return true;
             }
         );
 

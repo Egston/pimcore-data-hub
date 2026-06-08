@@ -66,8 +66,15 @@ class PersistentCacheRuleSweep
                 ]);
 
                 try {
-                    $this->cache->evictEntry($client, $canonical, $operation);
-                    ++$evicted;
+                    if ($this->cache->evictEntry($client, $canonical, $operation)) {
+                        ++$evicted;
+                    } else {
+                        ++$evictFailed;
+                        $this->logger?->warning('datahub.request_validation.sweep_evict_unconfirmed', [
+                            'client' => $client,
+                            'operation' => $operation,
+                        ]);
+                    }
                 } catch (\Throwable $e) {
                     ++$evictFailed;
                     $this->logger?->warning('datahub.request_validation.sweep_evict_failed', [
@@ -88,12 +95,19 @@ class PersistentCacheRuleSweep
                 ++$passed;
             } catch (ClientSafeException) {
                 try {
-                    $this->cache->evictEntry($client, $canonical, $opName);
-                    ++$evicted;
-                    $this->logger?->info('datahub.request_validation.sweep_evicted', [
-                        'client' => $client,
-                        'operation' => $opName,
-                    ]);
+                    if ($this->cache->evictEntry($client, $canonical, $opName)) {
+                        ++$evicted;
+                        $this->logger?->info('datahub.request_validation.sweep_evicted', [
+                            'client' => $client,
+                            'operation' => $opName,
+                        ]);
+                    } else {
+                        ++$evictFailed;
+                        $this->logger?->warning('datahub.request_validation.sweep_evict_unconfirmed', [
+                            'client' => $client,
+                            'operation' => $opName,
+                        ]);
+                    }
                 } catch (\Throwable $e) {
                     ++$evictFailed;
                     $this->logger?->warning('datahub.request_validation.sweep_evict_failed', [

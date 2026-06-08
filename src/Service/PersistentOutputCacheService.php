@@ -421,16 +421,21 @@ class PersistentOutputCacheService
      * Remove a single persistent-cache entry (payload + meta + all index
      * memberships) for a (client, body) pair, bypassing the SWR flow.
      *
-     * Used by the refresh worker to self-clean an entry whose stored canonical
-     * no longer conforms to the current request-validation rules: such an entry
-     * is pollution that the SWR refresh loop would otherwise re-serve forever.
+     * Used by the sweep (maintenance task and CLI) and the refresh worker to
+     * remove entries that no longer conform to request-validation rules.
      *
      * Reverse-index cleanup is gated on a usable stored tag set; forward-index
      * and key removal are not gated on a successful meta load, so a missing meta
      * never leaves a dangling forward-index member. Idempotent: a second call
      * for the same body is a clean series of no-ops.
+     *
+     * Returns whether the payload and meta keys were confirmed removed: the
+     * underlying cache backend reports failure as a `false` return (it never
+     * throws), so a caller that gates a CLI exit code or task severity on
+     * eviction must treat `false` as a survival, not count it as evicted.
+     * Index/reverse-index cleanup is best-effort and does not affect the return.
      */
-    public function evictEntry(string $client, string $bodyJson, ?string $operationName): void
+    public function evictEntry(string $client, string $bodyJson, ?string $operationName): bool
     {
         $canonical = self::canonicalizePayloadString($bodyJson);
         $metaKey = $this->keyMeta($client, $canonical);
@@ -457,8 +462,10 @@ class PersistentOutputCacheService
             $this->removeFromIndex(self::INDEX_CLIENT_PREFIX . $client, $payloadKey);
         }
 
-        $this->cacheRemove($payloadKey);
-        $this->cacheRemove($metaKey);
+        $payloadRemoved = $this->cacheRemove($payloadKey);
+        $metaRemoved = $this->cacheRemove($metaKey);
+
+        return $payloadRemoved && $metaRemoved;
     }
 
     private function removeFromReverseIndex(string $tag, string $payloadKey): void
@@ -1062,9 +1069,9 @@ class PersistentOutputCacheService
         return \Pimcore\Cache::clearTag($tag);
     }
 
-    protected function cacheRemove(string $key): void
+    protected function cacheRemove(string $key): bool
     {
-        \Pimcore\Cache::remove($key);
+        return \Pimcore\Cache::remove($key);
     }
 
     private function keyPayload(string $clientname, string $canonical): string
@@ -1172,11 +1179,11 @@ class PersistentOutputCacheService
 
     /**
      * Enumerate every entry in INDEX_ALL, loading each entry's meta and
-     * yielding the fields needed for re-validation: client, operation, canonical.
+     * returning the fields needed for re-validation: client, operation, canonical.
      *
      * Entries whose payload key maps to no meta (mid-cleanup or backend
      * corruption) are silently skipped; the caller receives a count of skipped
-     * entries in the returned array alongside the yielded data.
+     * entries in the returned array alongside the data.
      *
      * @return array{entries: list<array{client: string, operation: string|null, canonical: string}>, skipped: int}
      */

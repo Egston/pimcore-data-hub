@@ -19,9 +19,10 @@ final class PersistentOutputCacheServiceEvictionTest extends TestCase
     }
 
     /**
-     * @param array<string, mixed> $store by-ref backing store
+     * @param array<string, mixed> $store         by-ref backing store
+     * @param list<string>         $removeFailKeys keys whose removal the backend reports as failed
      */
-    private function makeService(array &$store): PersistentOutputCacheService
+    private function makeService(array &$store, array $removeFailKeys = []): PersistentOutputCacheService
     {
         $service = $this->getMockBuilder(PersistentOutputCacheService::class)
             ->setConstructorArgs([$this->makeContainer()])
@@ -31,8 +32,13 @@ final class PersistentOutputCacheServiceEvictionTest extends TestCase
         $service->method('cacheSave')->willReturnCallback(function (string $key, $value) use (&$store): void {
             $store[$key] = $value;
         });
-        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store): void {
+        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store, $removeFailKeys): bool {
+            if (in_array($key, $removeFailKeys, true)) {
+                return false;
+            }
             unset($store[$key]);
+
+            return true;
         });
 
         return $service;
@@ -68,7 +74,7 @@ final class PersistentOutputCacheServiceEvictionTest extends TestCase
         ];
 
         $service = $this->makeService($store);
-        $service->evictEntry($client, $body, 'TagOp');
+        self::assertTrue($service->evictEntry($client, $body, 'TagOp'), 'confirmed removal returns true');
 
         self::assertArrayNotHasKey($payloadKey, $store, 'payload key removed');
         self::assertArrayNotHasKey($metaKey, $store, 'meta key removed');
@@ -80,6 +86,26 @@ final class PersistentOutputCacheServiceEvictionTest extends TestCase
         // Reverse index: our pair gone, the other pair intact.
         self::assertSame([$otherPair], $store[$reverseObjKey]);
         self::assertSame([], $store[$reverseClassKey]);
+    }
+
+    public function testEvictReturnsFalseWhenBackendDoesNotConfirmPayloadRemoval(): void
+    {
+        $client = 'c1';
+        $body = '{"operationName":"TagOp","query":"{ a }"}';
+        $canonical = PersistentOutputCacheService::canonicalizePayloadString($body);
+        $payloadKey = PersistentOutputCacheService::keyPayloadFor($client, $canonical);
+
+        $store = [
+            $payloadKey => ['data' => ['x' => 1]],
+            PersistentOutputCacheService::INDEX_ALL => [$payloadKey],
+        ];
+
+        $service = $this->makeService($store, removeFailKeys: [$payloadKey]);
+
+        self::assertFalse(
+            $service->evictEntry($client, $body, 'TagOp'),
+            'a silent backend remove failure must surface as false, not be counted as evicted'
+        );
     }
 
     public function testEvictWithMetaAbsentStillRemovesForwardIndexAndKeysWithoutFatal(): void

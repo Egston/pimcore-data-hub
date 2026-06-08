@@ -132,7 +132,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
         self::assertNotNull($savedStamp);
     }
 
-    public function testZeroScanDoesNotStamp(): void
+    public function testEmptySweepStamps(): void
     {
         $rulesLoader = $this->makeRulesLoader();
         $sweep = $this->createMock(PersistentCacheRuleSweep::class);
@@ -142,7 +142,7 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
         $task = $this->makeTask($sweep, $rulesLoader, [self::CLIENT], null, $savedStamp);
         $task->execute();
 
-        self::assertNull($savedStamp);
+        self::assertNotNull($savedStamp, 'a clean sweep over an empty index must advance the stamp');
     }
 
     public function testEvictFailedDoesNotStamp(): void
@@ -169,6 +169,19 @@ final class PersistentCacheRuleSweepTaskTest extends TempfileTestCase
         $task->execute();
 
         self::assertNull($savedStamp);
+    }
+
+    public function testValidateFailedDoesNotStamp(): void
+    {
+        $rulesLoader = $this->makeRulesLoader();
+        $sweep = $this->createMock(PersistentCacheRuleSweep::class);
+        $sweep->method('sweep')->willReturn(new SweepCounts(3, 0, 0, 0, 0, 2, 1));
+
+        $savedStamp = null;
+        $task = $this->makeTask($sweep, $rulesLoader, [self::CLIENT], null, $savedStamp);
+        $task->execute();
+
+        self::assertNull($savedStamp, 'validateFailed > 0 must prevent stamp advance so next cycle retries');
     }
 
     public function testStampIncludesEnforcedClients(): void

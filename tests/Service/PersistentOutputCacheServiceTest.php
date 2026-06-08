@@ -955,8 +955,10 @@ final class PersistentOutputCacheServiceTest extends TestCase
         $service->method('cacheLoad')->willReturnCallback(function (string $key) use (&$store) {
             return $store[$key] ?? null;
         });
-        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store) {
+        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store): bool {
             unset($store[$key]);
+
+            return true;
         });
 
         $this->assertFalse($service->hasOperationCooldown('hash9'));

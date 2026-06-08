@@ -47,6 +47,10 @@ final class VariableConstraint
     }
 
     /**
+     * Unlike `int()` / `string()`, this factory has no `$nullable` parameter:
+     * null is accepted only when `null` is itself a member of `$values`
+     * (strict in-array). The nullability lives in the value list, not a flag.
+     *
      * @param list<int|string|bool|float|null> $values
      */
     public static function enum(array $values): self
@@ -74,6 +78,11 @@ final class VariableConstraint
         return new self(self::KIND_STRING, nullable: $nullable, requiredPrefix: $requiredPrefix);
     }
 
+    /**
+     * Unlike `int()` / `string()`, this factory has no `$nullable` parameter:
+     * a CSV-int value is never nullable — null (and the empty string) are always
+     * rejected; only a non-empty comma-separated list of digit runs passes.
+     */
     public static function csvInt(): self
     {
         return new self(self::KIND_CSV_INT);

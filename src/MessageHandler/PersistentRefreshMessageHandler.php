@@ -116,20 +116,29 @@ final class PersistentRefreshMessageHandler
             try {
                 $this->validator->assertRequest($message->client, null, $opName, $variables);
             } catch (ClientSafeException $e) {
-                try {
-                    $this->persistentCache?->evictEntry($message->client, $message->bodyJson, $opName);
-                    $this->logInfo('datahub.request_validation.refresh_evicted', [
-                        'client' => $message->client,
-                        'operation' => $opName ?? $operationName,
-                        'reason' => $e->getMessage(),
-                    ]);
-                } catch (\Throwable $evictErr) {
-                    $this->logWarning(sprintf(
-                        'datahub.swr.evict_failed client=%s operation=%s: %s',
-                        $message->client,
-                        $operationName,
-                        $evictErr->getMessage()
-                    ));
+                if ($this->persistentCache !== null) {
+                    try {
+                        if ($this->persistentCache->evictEntry($message->client, $message->bodyJson, $opName)) {
+                            $this->logInfo('datahub.request_validation.refresh_evicted', [
+                                'client' => $message->client,
+                                'operation' => $opName ?? $operationName,
+                                'reason' => $e->getMessage(),
+                            ]);
+                        } else {
+                            $this->logWarning(sprintf(
+                                'datahub.swr.evict_unconfirmed client=%s operation=%s: cache backend did not confirm removal',
+                                $message->client,
+                                $opName ?? $operationName
+                            ));
+                        }
+                    } catch (\Throwable $evictErr) {
+                        $this->logWarning(sprintf(
+                            'datahub.swr.evict_failed client=%s operation=%s: %s',
+                            $message->client,
+                            $opName ?? $operationName,
+                            $evictErr->getMessage()
+                        ));
+                    }
                 }
 
                 return;
@@ -503,11 +512,6 @@ final class PersistentRefreshMessageHandler
         Logger::error($message);
     }
 
-    /**
-     * Structured-event info seam. Routes through Pimcore\Logger, a no-op without a booted container.
-     *
-     * @param array<string, mixed> $context
-     */
     protected function logInfo(string $slug, array $context): void
     {
         Logger::info($slug, $context);

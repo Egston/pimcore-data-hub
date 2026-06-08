@@ -39,8 +39,10 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
         $service->method('cacheSave')->willReturnCallback(function (string $key, $value) use (&$store): void {
             $store[$key] = $value;
         });
-        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store): void {
+        $service->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store): bool {
             unset($store[$key]);
+
+            return true;
         });
 
         return $service;
@@ -178,13 +180,15 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
             $store[$key] = $value;
         });
         $throwOnRemove = true;
-        $cacheService->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store, &$throwOnRemove): void {
+        $cacheService->method('cacheRemove')->willReturnCallback(function (string $key) use (&$store, &$throwOnRemove): bool {
             if ($throwOnRemove) {
                 $throwOnRemove = false;
 
                 throw new \RuntimeException('backend unavailable');
             }
             unset($store[$key]);
+
+            return true;
         });
 
         $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
@@ -198,6 +202,56 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
         self::assertSame(2, $result->scanned);
         self::assertSame(1, $result->evicted);
         self::assertSame(1, $result->evictFailed);
+    }
+
+    public function testUnconfirmedRemovalCountedAsEvictFailedNotEvicted(): void
+    {
+        $store = [PersistentOutputCacheService::INDEX_ALL => []];
+        $rulesLoader = $this->rulesWithClient(self::CLIENT);
+
+        $cacheService = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer()])
+            ->onlyMethods(['cacheLoad', 'cacheSave', 'cacheRemove', 'cacheClearTag'])
+            ->getMock();
+
+        $cacheService->method('cacheLoad')->willReturnCallback(function (string $key) use (&$store) {
+            return $store[$key] ?? null;
+        });
+        $cacheService->method('cacheSave')->willReturnCallback(function (string $key, $value) use (&$store): void {
+            $store[$key] = $value;
+        });
+        // Backend reports the removal as failed (false) without throwing — must
+        // count as evictFailed, not evicted.
+        $cacheService->method('cacheRemove')->willReturn(false);
+
+        $captured = [];
+        $logger = new class($captured) extends AbstractLogger {
+            public function __construct(private array &$captured)
+            {
+            }
+
+            public function log($level, $message, array $context = []): void
+            {
+                $this->captured[] = ['level' => $level, 'message' => $message, 'context' => $context];
+            }
+        };
+
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader, $logger);
+
+        $this->seedEntry($store, self::CLIENT, 'BadOp', []);
+
+        $result = $sweep->sweep();
+
+        self::assertSame(1, $result->scanned);
+        self::assertSame(0, $result->evicted);
+        self::assertSame(1, $result->evictFailed);
+
+        $unconfirmed = array_filter(
+            $captured,
+            static fn ($e) => $e['message'] === 'datahub.request_validation.sweep_evict_unconfirmed'
+        );
+        self::assertCount(1, $unconfirmed, 'an unconfirmed removal must emit a sweep_evict_unconfirmed warning');
     }
 
     public function testMalformedMetaSkippedWithoutAbort(): void
@@ -364,6 +418,49 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
         self::assertSame(1, $result->scanned, 'entry should be scanned');
         self::assertSame(1, $result->passed, 'index-fallback operation validates successfully');
         self::assertSame(0, $result->evicted, 'conforming entry must not be evicted');
+    }
+
+    public function testUndecodableCanonicalEvictThrowCountedAsEvictFailed(): void
+    {
+        $client = self::CLIENT;
+        $corruptCanonical = '"corrupted"';
+        $recanonicalizedFallback = PersistentOutputCacheService::canonicalizePayloadString($corruptCanonical);
+        $payloadKey = PersistentOutputCacheService::keyPayloadFor($client, $recanonicalizedFallback);
+        $metaKey = PersistentOutputCacheService::keyMetaFor($client, $recanonicalizedFallback);
+
+        $store = [
+            PersistentOutputCacheService::INDEX_ALL => [$payloadKey],
+            $payloadKey => ['data' => ['x' => 1]],
+            $metaKey => [
+                'client' => $client,
+                'operation' => 'SomeOp',
+                'canonical' => $corruptCanonical,
+            ],
+        ];
+
+        $rulesLoader = $this->rulesWithClient(self::CLIENT);
+
+        $cacheService = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer()])
+            ->onlyMethods(['cacheLoad', 'cacheSave', 'cacheRemove', 'cacheClearTag'])
+            ->getMock();
+
+        $cacheService->method('cacheLoad')->willReturnCallback(function (string $key) use (&$store) {
+            return $store[$key] ?? null;
+        });
+        $cacheService->method('cacheSave')->willReturnCallback(function (string $key, $value) use (&$store): void {
+            $store[$key] = $value;
+        });
+        $cacheService->method('cacheRemove')->willThrowException(new \RuntimeException('backend fault'));
+
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader);
+
+        $result = $sweep->sweep();
+
+        self::assertSame(1, $result->scanned);
+        self::assertSame(0, $result->evicted);
+        self::assertSame(1, $result->evictFailed);
     }
 
     public function testLoggerReceivesEvictedEntry(): void

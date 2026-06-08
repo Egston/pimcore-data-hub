@@ -6,9 +6,12 @@ namespace Pimcore\Bundle\DataHubBundle\Service\RequestValidation;
 
 /**
  * Counters from one sweep pass. `scanned` excludes `notEnforced` and `skippedMalformed`;
- * `evicted` spans both the undecodable-canonical and rule-rejected paths.
+ * every scanned entry lands in exactly one bucket, so
+ * `scanned === evicted + evictFailed + passed + validateFailed`. `evicted` spans both the
+ * undecodable-canonical and rule-rejected paths and counts only confirmed removals;
+ * `evictFailed` absorbs both a throwing backend and an unconfirmed (false-return) removal.
  */
-readonly class SweepCounts
+final readonly class SweepCounts
 {
     public function __construct(
         public int $scanned,
@@ -19,6 +22,21 @@ readonly class SweepCounts
         public int $passed,
         public int $validateFailed,
     ) {
+        if (min($scanned, $evicted, $skippedMalformed, $evictFailed, $notEnforced, $passed, $validateFailed) < 0) {
+            throw new \InvalidArgumentException('SweepCounts values must be non-negative');
+        }
+        if ($scanned !== $evicted + $evictFailed + $passed + $validateFailed) {
+            throw new \InvalidArgumentException(
+                sprintf(
+                    'SweepCounts invariant violated: scanned(%d) !== evicted(%d) + evictFailed(%d) + passed(%d) + validateFailed(%d)',
+                    $scanned,
+                    $evicted,
+                    $evictFailed,
+                    $passed,
+                    $validateFailed,
+                )
+            );
+        }
     }
 
     /**
@@ -40,22 +58,26 @@ readonly class SweepCounts
     public function summaryLine(): string
     {
         $tag = $this->evictFailed > 0 ? 'comment' : 'info';
+        $pairs = [];
+        foreach ($this->toLogContext() as $key => $value) {
+            $pairs[] = $key . '=' . $value;
+        }
 
-        return sprintf(
-            '<%1$s>Sweep complete: scanned=%2$d evicted=%3$d skipped_malformed=%4$d evict_failed=%5$d not_enforced=%6$d passed=%7$d validate_failed=%8$d</%1$s>',
-            $tag,
-            $this->scanned,
-            $this->evicted,
-            $this->skippedMalformed,
-            $this->evictFailed,
-            $this->notEnforced,
-            $this->passed,
-            $this->validateFailed,
-        );
+        return sprintf('<%1$s>Sweep complete: %2$s</%1$s>', $tag, implode(' ', $pairs));
     }
 
     public function isEffectiveSweep(): bool
     {
         return $this->scanned > 0 && $this->evictFailed === 0;
+    }
+
+    /**
+     * Whether the sweep completed without any unresolved entries. Gates the
+     * change-stamp advance: false means some entries could not be assessed or
+     * removed, so the next cycle must retry.
+     */
+    public function isCleanCompletion(): bool
+    {
+        return $this->evictFailed === 0 && $this->validateFailed === 0;
     }
 }

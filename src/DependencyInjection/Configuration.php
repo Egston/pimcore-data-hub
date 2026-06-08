@@ -195,7 +195,7 @@ class Configuration implements ConfigurationInterface
                             ->defaultValue([])
                         ->end()
                         ->scalarNode('bypass_apikey')
-                            ->info('development/explorer bypass key: when a request carries this apikey AND its client is NOT in enforced_clients, request-validation and both cache tiers are skipped. Empty disables the bypass entirely.')
+                            ->info('development/explorer bypass key: when a request carries this apikey AND its client is NOT in enforced_clients, request-validation is skipped and both cache tiers are bypassed for read and write (the request always hits the resolver fresh). Empty disables the bypass entirely.')
                             ->defaultValue('')
                         ->end()
                     ->end()
