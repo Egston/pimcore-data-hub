@@ -31,6 +31,11 @@ class PimcoreDataHubExtension extends Extension implements PrependExtensionInter
         $config = $this->processConfiguration($configuration, $configs);
         $container->setParameter('pimcore_data_hub', $config);
 
+        $requestValidation = is_array($config['request_validation'] ?? null) ? $config['request_validation'] : [];
+        $container->setParameter('pimcore_data_hub.request_validation.rules_file', $requestValidation['rules_file'] ?? '');
+        $container->setParameter('pimcore_data_hub.request_validation.enforced_clients', $requestValidation['enforced_clients'] ?? []);
+        $container->setParameter('pimcore_data_hub.request_validation.bypass_apikey', $requestValidation['bypass_apikey'] ?? '');
+
         $loader = new YamlFileLoader(
             $container,
             new FileLocator(__DIR__ . '/../Resources/config')

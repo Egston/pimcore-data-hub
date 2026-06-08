@@ -123,6 +123,7 @@ class AssetListing
         }
 
         // sorting
+        ListingSortValidator::assertValid($args);
         if (!empty($args['sortBy'])) {
             $objectList->setOrderKey($args['sortBy']);
             if (!empty($args['sortOrder'])) {

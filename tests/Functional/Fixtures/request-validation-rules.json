@@ -1,0 +1,13 @@
+{
+  "versions": {
+    "1": {
+      "operations": {
+        "getTestSwrOnlyItemListing": {
+          "variables": {
+            "defaultLanguage": {"kind": "string", "nullable": true}
+          }
+        }
+      }
+    }
+  }
+}

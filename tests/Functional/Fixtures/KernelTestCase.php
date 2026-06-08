@@ -28,6 +28,8 @@ use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
  */
 abstract class KernelTestCase extends PimcoreSupportTestCase
 {
+    protected const TEST_SECURITY_APIKEY = 'l3-test-security-apikey-0001';
+
     /** @var array<string, list<int>> Cached fixture ids loaded by loadFixturesOnce(). */
     private static array $fixtureIds = [];
 
@@ -93,6 +95,7 @@ abstract class KernelTestCase extends PimcoreSupportTestCase
             ['CONTENT_TYPE' => 'application/json'],
             $body
         );
+        $request->headers->set('apikey', self::TEST_SECURITY_APIKEY);
         $request->attributes->set('clientname', $clientname);
         foreach ($attributes as $name => $value) {
             $request->attributes->set($name, $value);

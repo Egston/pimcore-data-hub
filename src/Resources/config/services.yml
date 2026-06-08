@@ -22,9 +22,30 @@ services:
     
     Pimcore\Bundle\DataHubBundle\Service\:
         resource: '../../Service'
+        # Kernel-free value objects constructed by RulesLoader, not the container.
+        exclude:
+            - '../../Service/RequestValidation/OperationRule.php'
+            - '../../Service/RequestValidation/RulesSet.php'
+            - '../../Service/RequestValidation/RulesVersion.php'
+            - '../../Service/RequestValidation/SweepCounts.php'
+            - '../../Service/RequestValidation/VariableConstraint.php'
         public: true
         autowire: true
         autoconfigure: true
+
+    Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader:
+        arguments:
+            $rulesFilePath: '%pimcore_data_hub.request_validation.rules_file%'
+
+    Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator:
+        arguments:
+            $enforcedClients: '%pimcore_data_hub.request_validation.enforced_clients%'
+
+    Pimcore\Bundle\DataHubBundle\Service\RequestValidation\PersistentCacheRuleSweepTask:
+        arguments:
+            $enforcedClients: '%pimcore_data_hub.request_validation.enforced_clients%'
+        tags:
+            - { name: pimcore.maintenance.task, type: datahub_request_validation_sweep }
 
     Pimcore\Bundle\DataHubBundle\Lock\:
         resource: '../../Lock'

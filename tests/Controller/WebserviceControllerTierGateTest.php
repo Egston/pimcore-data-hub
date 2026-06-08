@@ -6,11 +6,14 @@ namespace Pimcore\Bundle\DataHubBundle\Tests\Controller;
 
 use PHPUnit\Framework\TestCase;
 use Pimcore\Bundle\DataHubBundle\Controller\WebserviceController;
+use Pimcore\Bundle\DataHubBundle\GraphQL\Exception\ClientSafeException;
 use Pimcore\Bundle\DataHubBundle\Service\CheckConsumerPermissionsService;
 use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
@@ -65,6 +68,7 @@ final class WebserviceControllerTierGateTest extends TestCase
      *     classifier?: OperationClassifier,
      *     cacheService?: OutputCacheService,
      *     persistentCacheService?: PersistentOutputCacheService,
+     *     requestVariableValidator?: RequestVariableValidator,
      * } $deps
      */
     private function makeController(array $deps): WebserviceController
@@ -77,6 +81,7 @@ final class WebserviceControllerTierGateTest extends TestCase
         $classifier = $deps['classifier'] ?? $this->makeClassifier([]);
         $cacheService = $deps['cacheService'] ?? $this->createMock(OutputCacheService::class);
         $persistentCacheService = $deps['persistentCacheService'] ?? $this->createMock(PersistentOutputCacheService::class);
+        $validator = $deps['requestVariableValidator'] ?? new RequestVariableValidator(new RulesLoader(''), []);
 
         return new TestableWebserviceController(
             $eventDispatcher,
@@ -84,7 +89,8 @@ final class WebserviceControllerTierGateTest extends TestCase
             $cacheService,
             $persistentCacheService,
             $uploadService,
-            $classifier
+            $classifier,
+            $validator
         );
     }
 
@@ -195,6 +201,35 @@ final class WebserviceControllerTierGateTest extends TestCase
         self::assertSame(Tier::NEITHER->value, $request->attributes->get('_datahub_tier'));
     }
 
+    public function testValidatorRejectionReturns400BeforePreHandle(): void
+    {
+        $rejectingValidator = new class(new RulesLoader(''), []) extends RequestVariableValidator {
+            public function assertRequest(string $clientName, ?int $version, ?string $operationName, array $variables): void
+            {
+                throw new ClientSafeException('request rejected by request-validation: operation-not-allowed');
+            }
+        };
+
+        $persistentCacheService = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCacheService->expects(self::never())->method('preHandle');
+
+        $controller = $this->makeController([
+            'persistentCacheService' => $persistentCacheService,
+            'requestVariableValidator' => $rejectingValidator,
+        ]);
+
+        $request = $this->makeRequest('someOp');
+        $response = $controller->webonyxAction(request: $request, responseService: $this->makeNoopResponseService());
+
+        self::assertInstanceOf(JsonResponse::class, $response);
+        self::assertSame(400, $response->getStatusCode());
+        $body = json_decode((string)$response->getContent(), true);
+        self::assertIsArray($body['errors'] ?? null);
+        self::assertNotEmpty($body['errors']);
+        self::assertStringContainsString('request rejected by request-validation', $body['errors'][0]['message']);
+        self::assertSame('pimcore.datahub', $body['errors'][0]['extensions']['category'] ?? null);
+    }
+
     public function testStatusProbeSkipsCacheLayers(): void
     {
         $classifier = $this->makeClassifier([
@@ -225,6 +260,58 @@ final class WebserviceControllerTierGateTest extends TestCase
         self::assertSame(Tier::HERD_GUARDED->value, $request->attributes->get('_datahub_tier'));
     }
 
+    public function testArrayShapeVersionParamDoesNotThrowAndProceedsToPreHandle(): void
+    {
+        $persistentCacheService = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCacheService->expects(self::once())
+            ->method('preHandle')
+            ->willReturn(new JsonResponse(['data' => ['ok' => true]]));
+
+        $controller = $this->makeController([
+            'persistentCacheService' => $persistentCacheService,
+        ]);
+
+        $request = $this->makeRequest('someOp');
+        $request->query->set('version', ['1', '2']);
+
+        $response = $controller->webonyxAction(request: $request, responseService: $this->makeNoopResponseService());
+
+        self::assertSame(200, $response->getStatusCode());
+    }
+
+    /**
+     * @return iterable<string, array{0: mixed, 1: ?int}>
+     */
+    public static function versionParamProvider(): iterable
+    {
+        yield 'absent'           => [null, null];
+        yield 'canonical int'    => ['2', 2];
+        yield 'leading zero'     => ['01', null];
+        yield 'negative'         => ['-1', null];
+        yield 'zero'             => ['0', null];
+        yield 'non-numeric'      => ['abc', null];
+        yield 'decimal'          => ['1.0', null];
+        yield 'array-shaped'     => [['1', '2'], null];
+    }
+
+    /**
+     * @param mixed $versionParam
+     *
+     * @dataProvider versionParamProvider
+     */
+    public function testParseVersionParamResolvesScalarValue($versionParam, ?int $expected): void
+    {
+        /** @var TestableWebserviceController $controller */
+        $controller = $this->makeController([]);
+
+        $request = $this->makeRequest('someOp');
+        if ($versionParam !== null) {
+            $request->query->set('version', $versionParam);
+        }
+
+        self::assertSame($expected, $controller->exposeParseVersionParam($request));
+    }
+
     private function makeRequest(?string $operationName): Request
     {
         $body = json_encode([
@@ -251,11 +338,6 @@ final class WebserviceControllerTierGateTest extends TestCase
  */
 final class TestableWebserviceController extends WebserviceController
 {
-    /**
-     * Reuses the parent's injected `cacheService`, `persistentCacheService`,
-     * and `operationClassifier` via inherited protected/private state accessed
-     * here as the WebserviceController subclass.
-     */
     public function webonyxAction(
         \Pimcore\Bundle\DataHubBundle\GraphQL\Service $service = null,
         \Pimcore\Localization\LocaleServiceInterface $localeService = null,
@@ -269,6 +351,11 @@ final class TestableWebserviceController extends WebserviceController
         }
 
         return $this->runEarlyFlow($request, $responseService);
+    }
+
+    public function exposeParseVersionParam(Request $request): ?int
+    {
+        return $this->parseVersionParam($request);
     }
 
     private function runEarlyFlow(Request $request, ResponseServiceInterface $responseService): ?JsonResponse
@@ -290,8 +377,28 @@ final class TestableWebserviceController extends WebserviceController
         /** @var OperationClassifier $classifier */
         $classifier = $classifierProp->getValue($this);
 
-        $input = json_decode($request->getContent(), true) ?: [];
-        $operationName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+        $validatorProp = $reflection->getProperty('requestVariableValidator');
+        $validatorProp->setAccessible(true);
+        /** @var RequestVariableValidator $validator */
+        $validator = $validatorProp->getValue($this);
+
+        ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
+
+        $version = $this->parseVersionParam($request);
+
+        try {
+            $validator->assertRequest(
+                $request->attributes->getString('clientname'),
+                $version,
+                $operationName,
+                $inputVariables
+            );
+        } catch (ClientSafeException $e) {
+            return new JsonResponse(
+                ['errors' => [['message' => $e->getMessage(), 'extensions' => ['category' => $e->getCategory()]]]],
+                400
+            );
+        }
 
         $tier = $operationName !== null ? $classifier->getTier($operationName) : Tier::NEITHER;
         $request->attributes->set('_datahub_tier', $tier->value);

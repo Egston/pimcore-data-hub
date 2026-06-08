@@ -75,6 +75,7 @@ class TranslationListing
         }
 
         // sorting
+        ListingSortValidator::assertValid($args);
         if (!empty($args['sortBy'])) {
             $list->setOrderKey($args['sortBy']);
             if (!empty($args['sortOrder'])) {

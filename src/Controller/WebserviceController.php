@@ -26,6 +26,7 @@ use Pimcore\Bundle\DataHubBundle\Event\GraphQL\ExecutorEvents;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\ExecutorEvent;
 use Pimcore\Bundle\DataHubBundle\Event\GraphQL\Model\ExecutorResultEvent;
 use Pimcore\Bundle\DataHubBundle\GraphQL\ClassTypeDefinitions;
+use Pimcore\Bundle\DataHubBundle\GraphQL\Exception\ClientSafeException;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Mutation\MutationType;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Query\QueryType;
 use Pimcore\Bundle\DataHubBundle\GraphQL\Service;
@@ -35,6 +36,7 @@ use Pimcore\Bundle\DataHubBundle\Service\FileUploadService;
 use Pimcore\Bundle\DataHubBundle\Service\OperationClassifier;
 use Pimcore\Bundle\DataHubBundle\Service\OutputCacheService;
 use Pimcore\Bundle\DataHubBundle\Service\PersistentOutputCacheService;
+use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValidator;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
 use Pimcore\Cache\RuntimeCache;
@@ -83,6 +85,10 @@ class WebserviceController extends FrontendController
      */
     private $operationClassifier;
 
+    private readonly RequestVariableValidator $requestVariableValidator;
+
+    private readonly string $bypassApikey;
+
     private readonly ?LoggerInterface $psrLogger;
 
     public function __construct(
@@ -92,6 +98,9 @@ class WebserviceController extends FrontendController
         PersistentOutputCacheService $persistentCacheService,
         FileUploadService $uploadService,
         OperationClassifier $operationClassifier,
+        RequestVariableValidator $requestVariableValidator,
+        #[Autowire('%pimcore_data_hub.request_validation.bypass_apikey%')]
+        string $bypassApikey = '',
         #[Autowire(service: 'monolog.logger.pimcore')]
         ?LoggerInterface $psrLogger = null,
     ) {
@@ -101,7 +110,47 @@ class WebserviceController extends FrontendController
         $this->persistentCacheService = $persistentCacheService;
         $this->uploadService = $uploadService;
         $this->operationClassifier = $operationClassifier;
+        $this->requestVariableValidator = $requestVariableValidator;
+        $this->bypassApikey = $bypassApikey;
         $this->psrLogger = $psrLogger;
+    }
+
+    /**
+     * Resolve the `?version=N` query parameter to a positive int, or null when
+     * absent or malformed. Absent params return null silently. Array-shaped
+     * (`?version[]=`) and non-canonical-integer values ("01", "-1", "abc", "1.0")
+     * resolve to null and emit one invalid_version warning. `->query->all()` is
+     * used rather than `->get()` because the latter throws on array-shaped params.
+     * Extracted so the early-flow test mirrors share this exact parse.
+     */
+    protected function parseVersionParam(Request $request): ?int
+    {
+        $versionParam = $request->query->all()['version'] ?? null;
+        if ($versionParam === null) {
+            return null;
+        }
+
+        $clientname = $request->attributes->getString('clientname');
+        if (!is_scalar($versionParam)) {
+            Logger::warning('datahub.request_validation.invalid_version', [
+                'client' => $clientname,
+                'version_raw' => '[non-scalar]',
+            ]);
+
+            return null;
+        }
+
+        $versionInt = (int)$versionParam;
+        if ($versionInt > 0 && (string)$versionInt === (string)$versionParam) {
+            return $versionInt;
+        }
+
+        Logger::warning('datahub.request_validation.invalid_version', [
+            'client' => $clientname,
+            'version_raw' => mb_substr((string)$versionParam, 0, 64),
+        ]);
+
+        return null;
     }
 
     /**
@@ -130,8 +179,42 @@ class WebserviceController extends FrontendController
             throw new AccessDeniedHttpException('Permission denied, apikey not valid');
         }
 
-        $input = json_decode($request->getContent(), true) ?: [];
-        $operationName = is_string($input['operationName'] ?? null) ? $input['operationName'] : null;
+        ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
+
+        $version = $this->parseVersionParam($request);
+
+        // Development/explorer bypass. Only honoured when the bypass key is
+        // configured AND matches AND the client is NOT rules-enforced: pasting
+        // the key on an enforced client (e.g. public-content) must leave the
+        // endpoint fully validated and cached. The enforced-client guard makes
+        // this a dev convenience, never an authentication escape hatch.
+        $isBypass = false;
+        if ($this->bypassApikey !== '' && !$this->requestVariableValidator->isEnforced($clientname)) {
+            $resolvedApiKey = $this->permissionsService->resolveApiKey($request) ?? '';
+            $isBypass = hash_equals($this->bypassApikey, $resolvedApiKey);
+        }
+
+        if ($isBypass) {
+            $request->attributes->set(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE, true);
+            $this->psrLogger?->info('datahub.request_validation.bypass', [
+                'operation' => $operationName,
+                'client' => $clientname,
+            ]);
+        } else {
+            try {
+                $this->requestVariableValidator->assertRequest(
+                    $clientname,
+                    $version,
+                    $operationName,
+                    $inputVariables
+                );
+            } catch (ClientSafeException $e) {
+                return new JsonResponse(
+                    ['errors' => [['message' => $e->getMessage(), 'extensions' => ['category' => $e->getCategory()]]]],
+                    400
+                );
+            }
+        }
 
         $tier = $operationName !== null
             ? $this->operationClassifier->getTier($operationName)
@@ -164,7 +247,9 @@ class WebserviceController extends FrontendController
         // no compute protection. STALE-HIT's refresh dispatch is deduplicated downstream
         // by PersistentCacheRefreshOnTerminateListener (per-body lock) and by
         // PersistentRefreshMessageHandler (per-op lock at the queue worker).
-        if ($pResponse = $this->persistentCacheService->preHandle($request, $responseService)) {
+        $isBypassCache = (bool)$request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE);
+
+        if (!$isBypassCache && ($pResponse = $this->persistentCacheService->preHandle($request, $responseService))) {
             $responseService->addHitMissHeaders($pResponse, true);
 
             return $pResponse;
@@ -186,6 +271,7 @@ class WebserviceController extends FrontendController
         // never overlaps with the herd-guard atomic lock above.
         $lock = null;
         if ($tier === Tier::SWR_ONLY
+            && !$isBypassCache
             && !$request->attributes->get('_datahub_persistent_refresh')
         ) {
             $waitMs = max(0, (int)($graphqlCfg['swr_cold_miss_lock_wait_ms'] ?? 5000));
@@ -227,7 +313,7 @@ class WebserviceController extends FrontendController
             // When running a background refresh, bypass the standard output cache layer
             $isPersistentRefresh = (bool)$request->attributes->get('_datahub_persistent_refresh');
             $isPersistentApplies = (bool)$request->attributes->get('_datahub_persistent_applies');
-            $skipOutputCache = $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
+            $skipOutputCache = $isBypassCache || $isPersistentRefresh || ($skipOutputCacheForGuarded && $isPersistentApplies);
 
             if (!$skipOutputCache && ($response = $this->cacheService->load($request))) {
                 Logger::debug('Output cache HIT');
@@ -365,6 +451,11 @@ class WebserviceController extends FrontendController
                     $output = $result->toArray();
                 }
             } catch (\Exception $e) {
+                Logger::error('datahub.graphql.execute_failed', [
+                    'operation' => $operationName,
+                    'client' => $clientname,
+                    'error' => $e->getMessage(),
+                ]);
                 $output = [
                     'errors' => [
                         [
@@ -381,7 +472,12 @@ class WebserviceController extends FrontendController
                 $this->cacheService->save($request, $response);
             }
 
-            $this->persistentCacheService->postHandle($request, $response);
+            // A bypass request must never mint a persistent entry — postHandle has
+            // no bypass-awareness internally; without this guard a bypass request
+            // would mint a persistent entry if the operation is classified.
+            if (!$isBypassCache) {
+                $this->persistentCacheService->postHandle($request, $response);
+            }
         } finally {
             $this->persistentCacheService->releaseColdMissLock(
                 $request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_COLD_MISS_LOCK)

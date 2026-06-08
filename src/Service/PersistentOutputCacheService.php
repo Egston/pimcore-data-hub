@@ -22,6 +22,9 @@ class PersistentOutputCacheService
     /** Request attribute carrying the acquired cold-miss lock (or absent when no lock held). */
     public const REQUEST_ATTR_COLD_MISS_LOCK = '_datahub_swr_cold_miss_lock';
 
+    /** Request attribute set by the bypass gate; suppresses both cache read and write for the request. */
+    public const REQUEST_ATTR_BYPASS_CACHE = '_datahub_bypass_cache';
+
     /**
      * Dedicated tag for the singleton invalidation watermark; kept separate from
      * TAG_COMMON so a blanket clear of cached entries by TAG_COMMON does not
@@ -414,6 +417,92 @@ class PersistentOutputCacheService
         return $invalidatedAt > 0 && $invalidatedAt > $refreshedAt;
     }
 
+    /**
+     * Remove a single persistent-cache entry (payload + meta + all index
+     * memberships) for a (client, body) pair, bypassing the SWR flow.
+     *
+     * Used by the sweep (maintenance task and CLI) and the refresh worker to
+     * remove entries that no longer conform to request-validation rules.
+     *
+     * Reverse-index cleanup is gated on a usable stored tag set; forward-index
+     * and key removal are not gated on a successful meta load, so a missing meta
+     * never leaves a dangling forward-index member. Idempotent: a second call
+     * for the same body is a clean series of no-ops.
+     *
+     * Returns whether the payload and meta keys were confirmed removed: the
+     * underlying cache backend reports failure as a `false` return (it never
+     * throws), so a caller that gates a CLI exit code or task severity on
+     * eviction must treat `false` as a survival, not count it as evicted.
+     * Index/reverse-index cleanup is best-effort and does not affect the return.
+     */
+    public function evictEntry(string $client, string $bodyJson, ?string $operationName): bool
+    {
+        $canonical = self::canonicalizePayloadString($bodyJson);
+        $metaKey = $this->keyMeta($client, $canonical);
+        $payloadKey = $this->keyPayload($client, $canonical);
+
+        $meta = $this->cacheLoad($metaKey);
+        $storedTags = is_array($meta) ? ($meta['tags'] ?? null) : null;
+        if (is_array($storedTags) && $storedTags !== []) {
+            foreach ($storedTags as $tag) {
+                $this->removeFromReverseIndex((string)$tag, $payloadKey);
+            }
+        } else {
+            Logger::debug('datahub.swr.evict_meta_absent', [
+                'client' => $client,
+                'operation' => $operationName,
+            ]);
+        }
+
+        $this->removeFromIndex(self::INDEX_ALL, $payloadKey);
+        if ($operationName !== null && $operationName !== '') {
+            $this->removeFromIndex(self::INDEX_OP_PREFIX . $operationName, $payloadKey);
+        }
+        if ($client !== '') {
+            $this->removeFromIndex(self::INDEX_CLIENT_PREFIX . $client, $payloadKey);
+        }
+
+        $payloadRemoved = $this->cacheRemove($payloadKey);
+        $metaRemoved = $this->cacheRemove($metaKey);
+
+        return $payloadRemoved && $metaRemoved;
+    }
+
+    private function removeFromReverseIndex(string $tag, string $payloadKey): void
+    {
+        $indexKey = self::REVERSE_INDEX_PREFIX . $tag;
+        $list = $this->cacheLoad($indexKey);
+        if (!is_array($list) || $list === []) {
+            return;
+        }
+        // Mirror dispatchForTags' shape guards: a malformed pair must not fatal
+        // the eviction. Drop only the pair whose payloadKey matches; keep the rest.
+        $filtered = array_values(array_filter($list, static function ($pair) use ($payloadKey): bool {
+            if (!is_array($pair) || count($pair) < 2 || !is_string($pair[0])) {
+                return true;
+            }
+
+            return $pair[0] !== $payloadKey;
+        }));
+        if ($filtered === $list) {
+            return;
+        }
+        $this->cacheSave($indexKey, $filtered, [self::TAG_COMMON], null);
+    }
+
+    private function removeFromIndex(string $indexKey, string $memberKey): void
+    {
+        $list = $this->cacheLoad($indexKey);
+        if (!is_array($list) || $list === []) {
+            return;
+        }
+        $filtered = array_values(array_filter($list, static fn ($member): bool => $member !== $memberKey));
+        if ($filtered === $list) {
+            return;
+        }
+        $this->cacheSave($indexKey, $filtered, [self::TAG_COMMON], null);
+    }
+
     /** Manually set the last invalidation timestamp to now. */
     public function bumpFallbackWatermark(?int $ts = null): void
     {
@@ -585,13 +674,16 @@ class PersistentOutputCacheService
         // Refuse to persist transient infrastructure failures (non-2xx, empty
         // body) — caching those for payloadTtl seconds turns a momentary DB or
         // herd-guard hiccup into a persistent outage. GraphQL-level errors
-        // co-existing with non-empty `data` (partial success) are still cached:
+        // co-existing with useful `data` (partial success) are still cached:
         // the data is useful and the errors are deterministic against the
-        // input. Errors-only responses (no `data`, null `data`, or empty `data`)
-        // are NOT cached — they typically come from a transient broken-schema
-        // state (orphan class references during deploy, a misconfigured
-        // workspace, etc.) and persisting them outlasts the broken window so
-        // clients see stale errors even after the upstream is fixed.
+        // input. Errors-only responses (no `data`, null `data`, empty `data`,
+        // or `data` whose members are all strictly null — the shape a
+        // resolver-thrown error produces) are NOT cached — they typically come
+        // from a transient broken-schema state or invalid client input, and
+        // persisting them mints junk cache entries that outlast the trigger.
+        $input = json_decode($request->getContent(), true) ?: [];
+        $operationName = (string)($input['operationName'] ?? '');
+
         $status = $response->getStatusCode();
         if ($status < 200 || $status >= 300) {
             Logger::warning(sprintf(
@@ -610,11 +702,13 @@ class PersistentOutputCacheService
         }
         $hasErrors = !empty($payload['errors']);
         $data = $payload['data'] ?? null;
-        $hasNonEmptyDataArray = \is_array($data) && $data !== [];
-        if ($hasErrors && !$hasNonEmptyDataArray) {
+        $hasUsefulData = \is_array($data)
+            && array_filter($data, static fn ($value) => $value !== null) !== [];
+        if ($hasErrors && !$hasUsefulData) {
             $messages = array_column((array)$payload['errors'], 'message');
-            Logger::warning(sprintf(
-                'DataHub persistent cache: refusing to save errors-only response (client=%s, errors=%s)',
+            Logger::info(sprintf(
+                'DataHub persistent cache: refusing to save errors-only response (op=%s, client=%s, errors=%s)',
+                $operationName,
                 (string)$request->attributes->get('clientname'),
                 json_encode($messages)
             ));
@@ -624,7 +718,8 @@ class PersistentOutputCacheService
         if ($hasErrors) {
             $messages = array_column((array)$payload['errors'], 'message');
             Logger::warning(sprintf(
-                'DataHub persistent cache: caching response with non-empty data array and errors (client=%s, errors=%s)',
+                'DataHub persistent cache: caching partial-success response with errors (op=%s, client=%s, errors=%s)',
+                $operationName,
                 (string)$request->attributes->get('clientname'),
                 json_encode($messages)
             ));
@@ -633,9 +728,6 @@ class PersistentOutputCacheService
         [$client, $canonical] = $this->clientAndCanonical($request);
         $metaKey = $this->keyMeta($client, $canonical);
         $payloadKey = $this->keyPayload($client, $canonical);
-
-        $input = json_decode($request->getContent(), true) ?: [];
-        $operationName = (string)($input['operationName'] ?? '');
 
         $baseTags = $this->buildTags($request, $operationName);
         $collectorTags = $this->collectorTagsForOperation($operationName, $client);
@@ -977,9 +1069,9 @@ class PersistentOutputCacheService
         return \Pimcore\Cache::clearTag($tag);
     }
 
-    protected function cacheRemove(string $key): void
+    protected function cacheRemove(string $key): bool
     {
-        \Pimcore\Cache::remove($key);
+        return \Pimcore\Cache::remove($key);
     }
 
     private function keyPayload(string $clientname, string $canonical): string
@@ -1083,5 +1175,63 @@ class PersistentOutputCacheService
     public static function computeEnqueueDedupeKey(string $client, string $bodyJson): string
     {
         return self::ENQUEUE_DEDUPE_PREFIX . self::entryHashFromBody($client, $bodyJson);
+    }
+
+    /**
+     * Enumerate every entry in INDEX_ALL, loading each entry's meta and
+     * returning the fields needed for re-validation: client, operation, canonical.
+     *
+     * Entries whose payload key maps to no meta (mid-cleanup or backend
+     * corruption) are silently skipped; the caller receives a count of skipped
+     * entries in the returned array alongside the data.
+     *
+     * @return array{entries: list<array{client: string, operation: string|null, canonical: string}>, skipped: int}
+     */
+    public function listAllEntries(): array
+    {
+        $index = $this->cacheLoad(self::INDEX_ALL);
+        if (!is_array($index) || $index === []) {
+            return ['entries' => [], 'skipped' => 0];
+        }
+
+        $entries = [];
+        $skipped = 0;
+
+        foreach ($index as $payloadKey) {
+            if (!is_string($payloadKey) || !str_starts_with($payloadKey, self::PAYLOAD_KEY_PREFIX)) {
+                ++$skipped;
+
+                continue;
+            }
+
+            $hash = substr($payloadKey, strlen(self::PAYLOAD_KEY_PREFIX));
+            $metaKey = self::META_KEY_PREFIX . $hash;
+            $meta = $this->cacheLoad($metaKey);
+
+            if (!is_array($meta)) {
+                ++$skipped;
+
+                continue;
+            }
+
+            $client = isset($meta['client']) && is_string($meta['client']) ? $meta['client'] : null;
+            $canonical = isset($meta['canonical']) && is_string($meta['canonical']) ? $meta['canonical'] : null;
+
+            if ($client === null || $canonical === null) {
+                ++$skipped;
+
+                continue;
+            }
+
+            $operation = isset($meta['operation']) && is_string($meta['operation']) ? $meta['operation'] : null;
+
+            $entries[] = [
+                'client' => $client,
+                'operation' => $operation,
+                'canonical' => $canonical,
+            ];
+        }
+
+        return ['entries' => $entries, 'skipped' => $skipped];
     }
 }
