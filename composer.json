@@ -41,7 +41,7 @@
     "test": "vendor/bin/phpunit --colors=always",
     "cs:fix": "vendor/bin/php-cs-fixer fix",
     "cs:check": "vendor/bin/php-cs-fixer fix --dry-run --diff",
-    "stan": "vendor/bin/phpstan analyse --memory-limit=-1",
+    "stan": "env -u CLAUDECODE -u CLAUDE_CODE -u AI_AGENT vendor/bin/phpstan analyse --memory-limit=-1",
     "md": "vendor/bin/phpmd src text phpmd.xml",
     "lint": [
       "@cs:check",
