@@ -31,7 +31,7 @@ to stand one up:
 - **docker-compose:** see `tests/Readme.md` / `bin/init-tests.sh` for the
   self-contained compose stack (it also sets up the database).
 
-Once the stack is up, run `vendor/bin/phpunit --testsuite Functional`.
+Once the stack is up, run `vendor/bin/phpunit --testsuite Functional`. The suite also covers request-validation rejection via `RequestValidationFunctionalTest`; the L3 overlay (`pimcore_data_hub_test.yaml`) enables `request_validation` for the `default` test client with a fixture rules file (`tests/Functional/Fixtures/request-validation-rules.json`) so the validator fires against the real controller.
 
 ## Perform PHPStan Analysis
 

@@ -81,6 +81,7 @@
             <file>tests/Functional/PriorityQueueTest.php</file>
             <file>tests/Functional/ConcurrencyTest.php</file>
             <file>tests/Functional/FailureRecoveryTest.php</file>
+            <file>tests/Functional/RequestValidationFunctionalTest.php</file>
         </testsuite>
     </testsuites>
     <coverage>

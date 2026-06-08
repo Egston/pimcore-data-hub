@@ -29,3 +29,8 @@ pimcore_data_hub:
         persistent_refresh_queue_enabled: true
         persistent_refresh_priority_strategy: oldest_refreshed_at_first_with_weight_bands
         persistent_refresh_priority_weight_band_seconds: 60
+    request_validation:
+        rules_file: '%kernel.project_dir%/vendor/pimcore/data-hub/tests/Functional/Fixtures/request-validation-rules.json'
+        enforced_clients:
+            - default
+        bypass_apikey: 'test-bypass-key-do-not-use'

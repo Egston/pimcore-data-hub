@@ -1,0 +1,12 @@
+pimcore_data_hub:
+    request_validation:
+        rules_file: '%kernel.project_dir%/vendor/pimcore/data-hub/tests/Functional/Fixtures/request-validation-rules.json'
+        enforced_clients:
+            - default
+        bypass_apikey: 'test-bypass-key-do-not-use'
+
+parameters:
+    # Guard against an installation-level config (loaded after this bundle config in the merge chain)
+    # overriding rules_file to the production path. A ParameterBag entry wins over extension-mapped
+    # parameters regardless of config-merge order, so the fixture path is guaranteed in the test kernel.
+    pimcore_data_hub.request_validation.rules_file: '%kernel.project_dir%/vendor/pimcore/data-hub/tests/Functional/Fixtures/request-validation-rules.json'
