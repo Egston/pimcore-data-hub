@@ -34,6 +34,10 @@ A short introduction video of an output channel based on the GraphQL query langu
 - [Configuration & Deployment](./doc/20_Deployment.md)
 - [Testing](./doc/30_Testing.md)
 
+yageo-fork additions (not in upstream):
+- [Request-variable validation](./doc/Request-Variable-Validation.md) — default-deny GraphQL variable gate (see [§ below](#request-variable-validation-yageo-fork))
+- [Persistent Cache Flow](./doc/Persistent-Cache-Flow.md) / [Persistent Cache Architecture](./doc/Persistent-Cache-Architecture.md) — SWR cache deep dive (see [§ below](#two-tier-swr-cache-yageo-fork))
+
 ## Two-tier SWR cache (yageo fork)
 
 This fork ships a stale-while-revalidate (SWR) persistent cache layer on top of
@@ -227,6 +231,39 @@ In particular, do **not** add the bundle's transport name to an unrelated
 maintenance worker's queue-list flag to "drain in the interim" — the
 operational drift produced on credential rotation or worker failure is worse
 than a temporarily-accumulating queue.
+
+## Request-variable validation (yageo fork)
+
+Upstream of every cache layer, the GraphQL endpoint runs a default-deny
+request-level validator that checks each operation's **variables** against a
+positive, contract-derived ruleset before any resolver or cache code executes.
+Junk input (scanner probes, fuzzed enum values) becomes an uncacheable HTTP 400
+instead of a distinct cache entry that re-resolves on every invalidation for its
+whole payload TTL.
+
+The engine is a **no-op until** a `rules_file` is mounted **and** the requesting
+client is listed in `enforced_clients` — so it deploys without changing any
+request's outcome; enforcement is opt-in per client.
+
+```yaml
+pimcore_data_hub:
+    request_validation:
+        rules_file: '%env(DATAHUB_REQUEST_VALIDATION_RULES_FILE)%'  # empty = engine off
+        enforced_clients: ['public-content']                       # empty = enforce nothing
+        bypass_apikey: '%env(DATAHUB_EXPLORER_BYPASS_APIKEY)%'      # dev/explorer; non-enforced clients only
+```
+
+Rules are versioned JSON (inheritance flattened at load; unknown version →
+latest), hot-reloaded on mtime change with last-known-good retention, and each
+variable carries one constraint (`enum` / `const` / `null` / `int` / `string` /
+`csv-int`). A rejected request is rendered outside the executor catch so it is
+never cached. Entries written before enforcement are drained by three surfaces
+(refresh self-clean, the `datahub:graphql:persistent-cache:purge-invalid` sweep,
+and the all-null admission gate).
+
+Full contract — config grammar, the rules JSON schema, default-deny semantics,
+the bypass, and the drain surfaces — is in
+[Request-variable validation](./doc/Request-Variable-Validation.md).
 
 ## Further Information
 On Pimcore Datahub adapters:
