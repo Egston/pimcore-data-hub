@@ -16,7 +16,6 @@ use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValida
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
-use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
@@ -280,6 +279,39 @@ final class WebserviceControllerTierGateTest extends TestCase
         self::assertSame(200, $response->getStatusCode());
     }
 
+    /**
+     * @return iterable<string, array{0: mixed, 1: ?int}>
+     */
+    public static function versionParamProvider(): iterable
+    {
+        yield 'absent'           => [null, null];
+        yield 'canonical int'    => ['2', 2];
+        yield 'leading zero'     => ['01', null];
+        yield 'negative'         => ['-1', null];
+        yield 'zero'             => ['0', null];
+        yield 'non-numeric'      => ['abc', null];
+        yield 'decimal'          => ['1.0', null];
+        yield 'array-shaped'     => [['1', '2'], null];
+    }
+
+    /**
+     * @param mixed $versionParam
+     *
+     * @dataProvider versionParamProvider
+     */
+    public function testParseVersionParamResolvesScalarValue($versionParam, ?int $expected): void
+    {
+        /** @var TestableWebserviceController $controller */
+        $controller = $this->makeController([]);
+
+        $request = $this->makeRequest('someOp');
+        if ($versionParam !== null) {
+            $request->query->set('version', $versionParam);
+        }
+
+        self::assertSame($expected, $controller->exposeParseVersionParam($request));
+    }
+
     private function makeRequest(?string $operationName): Request
     {
         $body = json_encode([
@@ -321,6 +353,11 @@ final class TestableWebserviceController extends WebserviceController
         return $this->runEarlyFlow($request, $responseService);
     }
 
+    public function exposeParseVersionParam(Request $request): ?int
+    {
+        return $this->parseVersionParam($request);
+    }
+
     private function runEarlyFlow(Request $request, ResponseServiceInterface $responseService): ?JsonResponse
     {
         $reflection = new \ReflectionClass(WebserviceController::class);
@@ -347,26 +384,7 @@ final class TestableWebserviceController extends WebserviceController
 
         ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
 
-        $versionParam = $request->query->all()['version'] ?? null;
-        $version = null;
-        if ($versionParam !== null) {
-            if (!is_scalar($versionParam)) {
-                Logger::warning('datahub.request_validation.invalid_version', [
-                    'client' => $request->attributes->getString('clientname'),
-                    'version_raw' => '[non-scalar]',
-                ]);
-            } else {
-                $versionInt = (int)$versionParam;
-                if ($versionInt > 0 && (string)$versionInt === (string)$versionParam) {
-                    $version = $versionInt;
-                } else {
-                    Logger::warning('datahub.request_validation.invalid_version', [
-                        'client' => $request->attributes->getString('clientname'),
-                        'version_raw' => mb_substr((string)$versionParam, 0, 64),
-                    ]);
-                }
-            }
-        }
+        $version = $this->parseVersionParam($request);
 
         try {
             $validator->assertRequest(

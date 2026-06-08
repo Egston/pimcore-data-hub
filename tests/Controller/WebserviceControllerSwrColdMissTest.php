@@ -16,7 +16,6 @@ use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RequestVariableValida
 use Pimcore\Bundle\DataHubBundle\Service\RequestValidation\RulesLoader;
 use Pimcore\Bundle\DataHubBundle\Service\ResponseServiceInterface;
 use Pimcore\Bundle\DataHubBundle\Service\Tier;
-use Pimcore\Logger;
 use Symfony\Component\DependencyInjection\ParameterBag\ContainerBagInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
@@ -370,26 +369,7 @@ final class TestableSwrColdMissController extends WebserviceController
 
         ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
 
-        $versionParam = $request->query->all()['version'] ?? null;
-        $version = null;
-        if ($versionParam !== null) {
-            if (!is_scalar($versionParam)) {
-                Logger::warning('datahub.request_validation.invalid_version', [
-                    'client' => $request->attributes->getString('clientname'),
-                    'version_raw' => '[non-scalar]',
-                ]);
-            } else {
-                $versionInt = (int)$versionParam;
-                if ($versionInt > 0 && (string)$versionInt === (string)$versionParam) {
-                    $version = $versionInt;
-                } else {
-                    Logger::warning('datahub.request_validation.invalid_version', [
-                        'client' => $request->attributes->getString('clientname'),
-                        'version_raw' => mb_substr((string)$versionParam, 0, 64),
-                    ]);
-                }
-            }
-        }
+        $version = $this->parseVersionParam($request);
 
         try {
             $validator->assertRequest(

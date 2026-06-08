@@ -116,6 +116,44 @@ class WebserviceController extends FrontendController
     }
 
     /**
+     * Resolve the `?version=N` query parameter to a positive int, or null when
+     * absent or malformed. Absent params return null silently. Array-shaped
+     * (`?version[]=`) and non-canonical-integer values ("01", "-1", "abc", "1.0")
+     * resolve to null and emit one invalid_version warning. `->query->all()` is
+     * used rather than `->get()` because the latter throws on array-shaped params.
+     * Extracted so the early-flow test mirrors share this exact parse.
+     */
+    protected function parseVersionParam(Request $request): ?int
+    {
+        $versionParam = $request->query->all()['version'] ?? null;
+        if ($versionParam === null) {
+            return null;
+        }
+
+        $clientname = $request->attributes->getString('clientname');
+        if (!is_scalar($versionParam)) {
+            Logger::warning('datahub.request_validation.invalid_version', [
+                'client' => $clientname,
+                'version_raw' => '[non-scalar]',
+            ]);
+
+            return null;
+        }
+
+        $versionInt = (int)$versionParam;
+        if ($versionInt > 0 && (string)$versionInt === (string)$versionParam) {
+            return $versionInt;
+        }
+
+        Logger::warning('datahub.request_validation.invalid_version', [
+            'client' => $clientname,
+            'version_raw' => mb_substr((string)$versionParam, 0, 64),
+        ]);
+
+        return null;
+    }
+
+    /**
      *
      * @return JsonResponse
      *
@@ -143,26 +181,7 @@ class WebserviceController extends FrontendController
 
         ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
 
-        $versionParam = $request->query->all()['version'] ?? null;
-        $version = null;
-        if ($versionParam !== null) {
-            if (!is_scalar($versionParam)) {
-                Logger::warning('datahub.request_validation.invalid_version', [
-                    'client' => $clientname,
-                    'version_raw' => '[non-scalar]',
-                ]);
-            } else {
-                $versionInt = (int)$versionParam;
-                if ($versionInt > 0 && (string)$versionInt === (string)$versionParam) {
-                    $version = $versionInt;
-                } else {
-                    Logger::warning('datahub.request_validation.invalid_version', [
-                        'client' => $clientname,
-                        'version_raw' => mb_substr((string)$versionParam, 0, 64),
-                    ]);
-                }
-            }
-        }
+        $version = $this->parseVersionParam($request);
 
         // Development/explorer bypass. Only honoured when the bypass key is
         // configured AND matches AND the client is NOT rules-enforced: pasting
