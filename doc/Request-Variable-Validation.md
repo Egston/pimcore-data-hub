@@ -33,6 +33,30 @@ is enforced, **and** the operation or one of its variables fails a positive
 constraint. A malformed *first* load fails to no-op (engine inert), never to
 deny-all — availability is preferred over a self-inflicted outage.
 
+## Where the gate runs
+
+The same validator (`RequestVariableValidator`) is consulted at three points —
+one rejects live traffic, two keep the cache clean. It is **not** read-only:
+
+1. **Read path (live reject).** `WebserviceController::webonyxAction` validates
+   every inbound request after the security check and before any resolver or
+   cache code, upstream of both cache tiers. A non-conforming request becomes an
+   HTTP 400 and is never admitted to a cache.
+2. **Refresh worker (self-clean).** `PersistentRefreshMessageHandler`
+   re-validates the stored canonical body *before* taking the refresh lock; a
+   non-conforming entry is evicted instead of re-executed, so an invalidation
+   never repopulates junk. The controller's 400 is discarded by the worker, so
+   this pre-lock check is the only place a non-conforming stored entry can be
+   evicted on the refresh path.
+3. **Sweep (bulk).** `PersistentCacheRuleSweep` walks the whole index and evicts
+   non-conforming entries — it reaches probe-traffic entries whose tags never
+   invalidate, which the refresh path alone would never revisit.
+
+All three need the rules file visible in the pod they run in. On the
+yageogroup.com deployment that means pimcore-php (read path), the refresh-worker
+and maintenance-worker (self-clean + maintenance-task sweep), and the
+maintenance-shell (interactive `bin/console` sweep) — see [Related](#related).
+
 ## Configuration
 
 All knobs live under `pimcore_data_hub.request_validation`.
@@ -181,12 +205,24 @@ task:
 # Exits non-zero when any eviction failed, so operator scripting can detect an
 # incomplete drain.
 bin/console datahub:graphql:persistent-cache:purge-invalid
+
+# Preview only: report how many entries WOULD be evicted, touching nothing.
+# `evicted` in the summary is the would-evict count; evict_failed is always 0
+# and the command always exits 0. Use it to size the impact before draining.
+bin/console datahub:graphql:persistent-cache:purge-invalid --dry-run
 ```
 
 The maintenance task re-runs automatically after every rules change (its
 change-stamp is the rules-file mtime + the enforced-clients hash). The stamp
 advances only on a clean sweep (no eviction failures and no undeterminable
 entries), so a transient failure forces a retry on the next cycle.
+
+**Run the sweep where the rules file is mounted.** Both the command and the
+maintenance task short-circuit to a no-op when `rules_file` is unset or absent
+(`RulesLoader::load()` returns null → all-zero counts, *not* an error), so a
+sweep invoked in an environment without the rules file silently reports
+`scanned=0` — which reads like "cache clean" when it really means "rules
+invisible." Confirm visibility with `--dry-run` first if unsure.
 
 ## Resolver-side tightening
 
