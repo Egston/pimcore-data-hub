@@ -8,7 +8,8 @@ namespace Pimcore\Bundle\DataHubBundle\Service\RequestValidation;
  * Counters from one sweep pass. `scanned` excludes `notEnforced` and `skippedMalformed`;
  * every scanned entry lands in exactly one bucket, so
  * `scanned === evicted + evictFailed + passed + validateFailed`. `evicted` spans both the
- * undecodable-canonical and rule-rejected paths and counts only confirmed removals;
+ * undecodable-canonical and rule-rejected paths; in normal mode it counts confirmed removals,
+ * in dry-run mode it counts would-be removals (nothing is touched).
  * `evictFailed` absorbs both a throwing backend and an unconfirmed (false-return) removal.
  */
 final readonly class SweepCounts

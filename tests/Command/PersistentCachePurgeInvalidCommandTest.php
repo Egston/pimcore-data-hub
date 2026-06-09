@@ -65,4 +65,30 @@ final class PersistentCachePurgeInvalidCommandTest extends TestCase
 
         self::assertSame(Command::FAILURE, $exitCode);
     }
+
+    public function testDefaultRunSweepsForReal(): void
+    {
+        $sweep = $this->createMock(PersistentCacheRuleSweep::class);
+        $sweep->expects(self::once())->method('sweep')->with(false)->willReturn($this->counts(scanned: 4, passed: 4));
+
+        $tester = new CommandTester(new PersistentCachePurgeInvalidCommand($sweep));
+        $exitCode = $tester->execute([]);
+
+        self::assertSame(Command::SUCCESS, $exitCode);
+        self::assertStringNotContainsString('DRY RUN', $tester->getDisplay());
+    }
+
+    public function testDryRunPassesFlagAndPrintsBanner(): void
+    {
+        $sweep = $this->createMock(PersistentCacheRuleSweep::class);
+        $sweep->expects(self::once())->method('sweep')->with(true)->willReturn($this->counts(scanned: 5, evicted: 2, passed: 3));
+
+        $tester = new CommandTester(new PersistentCachePurgeInvalidCommand($sweep));
+        $exitCode = $tester->execute(['--dry-run' => true]);
+        $display = $tester->getDisplay();
+
+        self::assertSame(Command::SUCCESS, $exitCode);
+        self::assertStringContainsString('DRY RUN', $display);
+        self::assertStringContainsString('evicted=2', $display);
+    }
 }

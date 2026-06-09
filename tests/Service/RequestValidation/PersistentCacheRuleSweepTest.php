@@ -147,6 +147,70 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
         self::assertArrayNotHasKey($metaKey, $store, 'meta key evicted');
     }
 
+    public function testDryRunCountsWouldEvictWithoutRemoving(): void
+    {
+        $store = [PersistentOutputCacheService::INDEX_ALL => []];
+        $rulesLoader = $this->rulesWithClient(self::CLIENT);
+        $cacheService = $this->makeCacheService($store);
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader);
+
+        $canonical = $this->seedEntry($store, self::CLIENT, 'AllowedOp', ['lang' => 'INVALID_VALUE']);
+
+        $payloadKey = PersistentOutputCacheService::keyPayloadFor(self::CLIENT, $canonical);
+        $metaKey = PersistentOutputCacheService::keyMetaFor(self::CLIENT, $canonical);
+
+        $result = $sweep->sweep(true);
+
+        self::assertSame(1, $result->scanned);
+        self::assertSame(1, $result->evicted, 'non-conforming entry counted as would-evict');
+        self::assertSame(0, $result->evictFailed);
+
+        self::assertArrayHasKey($payloadKey, $store, 'dry run must leave the payload in place');
+        self::assertArrayHasKey($metaKey, $store, 'dry run must leave the meta in place');
+    }
+
+    public function testDryRunMixedPassAndWouldEvictTouchesNothing(): void
+    {
+        $store = [PersistentOutputCacheService::INDEX_ALL => []];
+        $rulesLoader = $this->rulesWithClient(self::CLIENT);
+        $cacheService = $this->makeCacheService($store);
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader);
+
+        $this->seedEntry($store, self::CLIENT, 'AllowedOp', ['lang' => 'en']);
+        $evictCanonical = $this->seedEntry($store, self::CLIENT, 'AllowedOp', ['lang' => 'INVALID_VALUE']);
+
+        $evictPayloadKey = PersistentOutputCacheService::keyPayloadFor(self::CLIENT, $evictCanonical);
+        $evictMetaKey = PersistentOutputCacheService::keyMetaFor(self::CLIENT, $evictCanonical);
+
+        $result = $sweep->sweep(true);
+
+        self::assertSame(2, $result->scanned);
+        self::assertSame(1, $result->passed, 'conforming entry passes');
+        self::assertSame(1, $result->evicted, 'non-conforming entry counted as would-evict');
+        self::assertSame(0, $result->evictFailed);
+
+        self::assertArrayHasKey($evictPayloadKey, $store, 'dry run must leave the would-evict payload in place');
+        self::assertArrayHasKey($evictMetaKey, $store, 'dry run must leave the would-evict meta in place');
+    }
+
+    public function testDryRunWithNullRulesReturnsZeroCounts(): void
+    {
+        $store = [];
+        $cacheService = $this->makeCacheService($store);
+        $rulesLoader = new CapturingRulesLoader('');
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader);
+
+        $result = $sweep->sweep(true);
+
+        self::assertSame(0, $result->scanned);
+        self::assertSame(0, $result->evicted);
+        self::assertSame(0, $result->evictFailed);
+        self::assertSame(0, $result->passed);
+    }
+
     public function testUnknownOperationIsEvicted(): void
     {
         $store = [PersistentOutputCacheService::INDEX_ALL => []];
@@ -345,6 +409,48 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
         self::assertArrayNotHasKey($metaKey, $store);
     }
 
+    public function testUndecodableCanonicalEvictionLogsSweptEntry(): void
+    {
+        $client = self::CLIENT;
+        $corruptCanonical = '"corrupted"';
+        $recanonicalizedFallback = PersistentOutputCacheService::canonicalizePayloadString($corruptCanonical);
+        $payloadKey = PersistentOutputCacheService::keyPayloadFor($client, $recanonicalizedFallback);
+
+        $store = [
+            PersistentOutputCacheService::INDEX_ALL => [$payloadKey],
+            $payloadKey => ['data' => ['x' => 1]],
+            PersistentOutputCacheService::keyMetaFor($client, $recanonicalizedFallback) => [
+                'client' => $client,
+                'operation' => 'SomeOp',
+                'canonical' => $corruptCanonical,
+            ],
+        ];
+
+        $rulesLoader = $this->rulesWithClient(self::CLIENT);
+        $cacheService = $this->makeCacheService($store);
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+
+        $captured = [];
+        $logger = new class($captured) extends AbstractLogger {
+            public function __construct(private array &$captured)
+            {
+            }
+
+            public function log($level, $message, array $context = []): void
+            {
+                $this->captured[] = ['level' => $level, 'message' => $message, 'context' => $context];
+            }
+        };
+
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader, $logger);
+        $sweep->sweep();
+
+        $infos = array_filter($captured, static fn ($e) => $e['message'] === 'datahub.request_validation.sweep_evicted');
+        self::assertCount(1, $infos, 'undecodable-canonical eviction must emit sweep_evicted');
+        $info = reset($infos);
+        self::assertSame($client, $info['context']['client']);
+    }
+
     public function testValidateThrowableCountedAndSweepContinues(): void
     {
         $store = [PersistentOutputCacheService::INDEX_ALL => []];
@@ -418,6 +524,39 @@ final class PersistentCacheRuleSweepTest extends TempfileTestCase
         self::assertSame(1, $result->scanned, 'entry should be scanned');
         self::assertSame(1, $result->passed, 'index-fallback operation validates successfully');
         self::assertSame(0, $result->evicted, 'conforming entry must not be evicted');
+    }
+
+    public function testDryRunUndecodableCanonicalCountsWouldEvictWithoutRemoving(): void
+    {
+        $client = self::CLIENT;
+        $corruptCanonical = '"corrupted"';
+        $recanonicalizedFallback = PersistentOutputCacheService::canonicalizePayloadString($corruptCanonical);
+        $payloadKey = PersistentOutputCacheService::keyPayloadFor($client, $recanonicalizedFallback);
+        $metaKey = PersistentOutputCacheService::keyMetaFor($client, $recanonicalizedFallback);
+
+        $store = [
+            PersistentOutputCacheService::INDEX_ALL => [$payloadKey],
+            $payloadKey => ['data' => ['x' => 1]],
+            $metaKey => [
+                'client' => $client,
+                'operation' => 'SomeOp',
+                'canonical' => $corruptCanonical,
+            ],
+        ];
+
+        $rulesLoader = $this->rulesWithClient(self::CLIENT);
+        $cacheService = $this->makeCacheService($store);
+        $validator = new CapturingRequestVariableValidator($rulesLoader, [self::CLIENT]);
+        $sweep = new PersistentCacheRuleSweep($cacheService, $validator, $rulesLoader);
+
+        $result = $sweep->sweep(true);
+
+        self::assertSame(1, $result->scanned);
+        self::assertSame(1, $result->evicted, 'undecodable canonical counted as would-evict in dry-run');
+        self::assertSame(0, $result->evictFailed);
+
+        self::assertArrayHasKey($payloadKey, $store, 'dry run must leave the payload in place');
+        self::assertArrayHasKey($metaKey, $store, 'dry run must leave the meta in place');
     }
 
     public function testUndecodableCanonicalEvictThrowCountedAsEvictFailed(): void

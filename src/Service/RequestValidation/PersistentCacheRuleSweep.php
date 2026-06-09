@@ -21,8 +21,12 @@ class PersistentCacheRuleSweep
     /**
      * Walk every entry in the persistent cache index and evict those that no
      * longer conform to the current request-validation rules.
+     *
+     * In dry-run mode the backend is never touched: a non-conforming entry is
+     * still counted under `evicted` (read it as "would evict"), and `evictFailed`
+     * stays zero.
      */
-    public function sweep(): SweepCounts
+    public function sweep(bool $dryRun = false): SweepCounts
     {
         if ($this->rulesLoader->load() === null) {
             return new SweepCounts(
@@ -65,23 +69,10 @@ class PersistentCacheRuleSweep
                     'operation' => $operation,
                 ]);
 
-                try {
-                    if ($this->cache->evictEntry($client, $canonical, $operation)) {
-                        ++$evicted;
-                    } else {
-                        ++$evictFailed;
-                        $this->logger?->warning('datahub.request_validation.sweep_evict_unconfirmed', [
-                            'client' => $client,
-                            'operation' => $operation,
-                        ]);
-                    }
-                } catch (\Throwable $e) {
+                if ($this->evictOrCount($dryRun, $client, $canonical, $operation)) {
+                    ++$evicted;
+                } else {
                     ++$evictFailed;
-                    $this->logger?->warning('datahub.request_validation.sweep_evict_failed', [
-                        'client' => $client,
-                        'operation' => $operation,
-                        'exception' => $e,
-                    ]);
                 }
 
                 continue;
@@ -94,27 +85,10 @@ class PersistentCacheRuleSweep
                 $this->validator->assertRequest($client, null, $opName, $variables);
                 ++$passed;
             } catch (ClientSafeException) {
-                try {
-                    if ($this->cache->evictEntry($client, $canonical, $opName)) {
-                        ++$evicted;
-                        $this->logger?->info('datahub.request_validation.sweep_evicted', [
-                            'client' => $client,
-                            'operation' => $opName,
-                        ]);
-                    } else {
-                        ++$evictFailed;
-                        $this->logger?->warning('datahub.request_validation.sweep_evict_unconfirmed', [
-                            'client' => $client,
-                            'operation' => $opName,
-                        ]);
-                    }
-                } catch (\Throwable $e) {
+                if ($this->evictOrCount($dryRun, $client, $canonical, $opName)) {
+                    ++$evicted;
+                } else {
                     ++$evictFailed;
-                    $this->logger?->warning('datahub.request_validation.sweep_evict_failed', [
-                        'client' => $client,
-                        'operation' => $opName,
-                        'exception' => $e,
-                    ]);
                 }
             } catch (\Throwable $e) {
                 ++$validateFailed;
@@ -135,5 +109,42 @@ class PersistentCacheRuleSweep
             passed: $passed,
             validateFailed: $validateFailed,
         );
+    }
+
+    /**
+     * Remove one non-conforming entry, or in dry-run merely report it as a
+     * would-evict. The caller owns the evicted/evictFailed counters.
+     */
+    private function evictOrCount(bool $dryRun, string $client, string $canonical, string $operation): bool
+    {
+        if ($dryRun) {
+            return true;
+        }
+
+        try {
+            if ($this->cache->evictEntry($client, $canonical, $operation)) {
+                $this->logger?->info('datahub.request_validation.sweep_evicted', [
+                    'client' => $client,
+                    'operation' => $operation,
+                ]);
+
+                return true;
+            }
+
+            $this->logger?->warning('datahub.request_validation.sweep_evict_unconfirmed', [
+                'client' => $client,
+                'operation' => $operation,
+            ]);
+
+            return false;
+        } catch (\Throwable $e) {
+            $this->logger?->warning('datahub.request_validation.sweep_evict_failed', [
+                'client' => $client,
+                'operation' => $operation,
+                'exception' => $e,
+            ]);
+
+            return false;
+        }
     }
 }
