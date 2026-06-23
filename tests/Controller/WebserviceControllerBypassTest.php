@@ -22,11 +22,12 @@ use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 
 /**
- * Development/explorer bypass-key tests; production-mirror fixture is
+ * Privileged bypass-key tests; production-mirror fixture is
  * {@see TestableBypassController}. The bypass gate sits after
  * `performSecurityCheck` and before the request-validation `assertRequest`;
- * a matching key on a non-enforced client skips validation and both cache
- * tiers (read and write).
+ * a matching key skips validation and both cache tiers (read and write) on any
+ * client — enforced or not — because the upstream security check already
+ * guarantees the key is a valid credential on that client.
  */
 final class WebserviceControllerBypassTest extends TestCase
 {
@@ -124,17 +125,22 @@ final class WebserviceControllerBypassTest extends TestCase
         self::assertTrue($controller->resolverRan);
     }
 
-    public function testBypassKeyMatchesButClientEnforcedRunsNormalValidation(): void
+    public function testBypassKeyMatchesEvenWhenClientEnforcedSkipsValidationAndCache(): void
     {
         $classifier = $this->makeClassifier(['swrOp' => ['tier' => 'swr_only', 'granularity' => 'single']]);
 
+        // Enforcement no longer suppresses the bypass: a matching key skips
+        // validation and both cache tiers even when the client is enforced —
+        // the path a trusted internal client relies on to introspect the
+        // enforced schema unguarded.
         $cacheService = $this->createMock(OutputCacheService::class);
-        $persistentCacheService = $this->createMock(PersistentOutputCacheService::class);
-        // Enforced client: bypass ignored, normal flow runs preHandle.
-        $persistentCacheService->expects(self::once())->method('preHandle')->willReturn(null);
-        $persistentCacheService->expects(self::once())->method('postHandle');
+        $cacheService->expects(self::never())->method('load');
+        $cacheService->expects(self::never())->method('save');
 
-        // Client IS enforced — bypass must be ignored even with the right key.
+        $persistentCacheService = $this->createMock(PersistentOutputCacheService::class);
+        $persistentCacheService->expects(self::never())->method('preHandle');
+        $persistentCacheService->expects(self::never())->method('postHandle');
+
         $controller = $this->makeController(
             $classifier,
             $cacheService,
@@ -144,10 +150,13 @@ final class WebserviceControllerBypassTest extends TestCase
         );
 
         $request = $this->makeRequest('swrOp', 'dev-secret');
-        $controller->webonyxAction(request: $request, responseService: $this->makeNoopResponseService());
+        $response = $controller->webonyxAction(request: $request, responseService: $this->makeNoopResponseService());
 
-        self::assertFalse((bool)$request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE), 'enforced client must never bypass');
-        self::assertFalse($controller->auditLogged, 'no bypass audit log for an enforced client');
+        self::assertInstanceOf(JsonResponse::class, $response);
+        self::assertSame(200, $response->getStatusCode());
+        self::assertTrue((bool)$request->attributes->get(PersistentOutputCacheService::REQUEST_ATTR_BYPASS_CACHE), 'enforced client must still bypass with a matching key');
+        self::assertTrue($controller->auditLogged, 'a bypass request must emit the audit log even on an enforced client');
+        self::assertTrue($controller->resolverRan);
     }
 
     public function testEmptyBypassKeyNeverMatches(): void
@@ -250,8 +259,8 @@ final class WebserviceControllerBypassTest extends TestCase
  * call that requires a booted Pimcore kernel; this subclass bypasses that
  * call so the bypass decision and the cache-skip wiring can be exercised
  * under pure phpunit. Production drift in the bypass gate ordering, the
- * enforced-client guard, the `hash_equals` comparison, or the cache read/
- * write skip is the mismatch this fixture is designed to catch.
+ * security-check-before-bypass sequencing, the `hash_equals` comparison, or
+ * the cache read/write skip is the mismatch this fixture is designed to catch.
  */
 final class TestableBypassController extends WebserviceController
 {
@@ -302,7 +311,7 @@ final class TestableBypassController extends WebserviceController
         ['operationName' => $operationName, 'variables' => $inputVariables] = RequestVariableValidator::decodeRequestShape($request->getContent(), null);
 
         $isBypass = false;
-        if ($bypassApikey !== '' && !$validator->isEnforced($clientname)) {
+        if ($bypassApikey !== '') {
             $resolvedApiKey = $permissions->resolveApiKey($request) ?? '';
             $isBypass = hash_equals($bypassApikey, $resolvedApiKey);
         }

@@ -183,13 +183,17 @@ class WebserviceController extends FrontendController
 
         $version = $this->parseVersionParam($request);
 
-        // Development/explorer bypass. Only honoured when the bypass key is
-        // configured AND matches AND the client is NOT rules-enforced: pasting
-        // the key on an enforced client (e.g. public-content) must leave the
-        // endpoint fully validated and cached. The enforced-client guard makes
-        // this a dev convenience, never an authentication escape hatch.
+        // Privileged bypass: honoured on ANY client — including a rules-enforced
+        // one — whenever the configured bypass key is non-empty and matches the
+        // resolved apikey. This is what lets a trusted internal client introspect
+        // the authentic, enforced schema unguarded.
+        // It is not an escape hatch: performSecurityCheck has already run above,
+        // so the bypass key must itself be a valid apikey on the client to reach
+        // here (in practice a dedicated second credential on that client), and an
+        // empty key disables the bypass entirely. Treat the key as a secret —
+        // guard, audit, and re-roll it like one.
         $isBypass = false;
-        if ($this->bypassApikey !== '' && !$this->requestVariableValidator->isEnforced($clientname)) {
+        if ($this->bypassApikey !== '') {
             $resolvedApiKey = $this->permissionsService->resolveApiKey($request) ?? '';
             $isBypass = hash_equals($this->bypassApikey, $resolvedApiKey);
         }

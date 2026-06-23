@@ -195,7 +195,7 @@ class Configuration implements ConfigurationInterface
                             ->defaultValue([])
                         ->end()
                         ->scalarNode('bypass_apikey')
-                            ->info('development/explorer bypass key: when a request carries this apikey AND its client is NOT in enforced_clients, request-validation is skipped and both cache tiers are bypassed for read and write (the request always hits the resolver fresh). Empty disables the bypass entirely.')
+                            ->info('privileged bypass key: when a request carries this apikey, request-validation is skipped and both cache tiers are bypassed for read and write (the request always hits the resolver fresh), on ANY client including an enforced one — this is how a trusted internal client introspects the enforced schema unguarded. The key must itself be a valid apikey on the target client (the per-client security check runs first), so provision it as a dedicated second credential and treat it as a secret. Comparison is constant-time and every use is audit-logged. Empty disables the bypass entirely.')
                             ->defaultValue('')
                         ->end()
                     ->end()

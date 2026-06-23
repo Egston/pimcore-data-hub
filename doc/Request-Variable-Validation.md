@@ -13,10 +13,10 @@ instead of a distinct cache entry that re-resolves on every invalidation for its
 whole payload TTL.
 
 This document is the bundle-portable contract: configuration grammar, the rules
-JSON schema, default-deny semantics, the reject shape, the development bypass,
-and the cache-hygiene drain surfaces. The yageogroup.com deployment specifics
-(ConfigMap wiring, the refresh-worker mount, the health-probe allowlist) live in
-the workspace wiki — see [Related](#related).
+JSON schema, default-deny semantics, the reject shape, the privileged bypass,
+and the cache-hygiene drain surfaces. Deployment specifics (ConfigMap wiring,
+worker mounts, health-probe allowlists) are deployment-specific and live outside
+this bundle.
 
 ## Activation — opt-in, fail-safe by construction
 
@@ -52,10 +52,10 @@ one rejects live traffic, two keep the cache clean. It is **not** read-only:
    non-conforming entries — it reaches probe-traffic entries whose tags never
    invalidate, which the refresh path alone would never revisit.
 
-All three need the rules file visible in the pod they run in. On the
-yageogroup.com deployment that means pimcore-php (read path), the refresh-worker
-and maintenance-worker (self-clean + maintenance-task sweep), and the
-maintenance-shell (interactive `bin/console` sweep) — see [Related](#related).
+All three need the rules file visible in the pod they run in: the
+request-handling pod (read path), the refresh and maintenance workers
+(self-clean + maintenance-task sweep), and whatever pod runs the interactive
+`bin/console` sweep.
 
 ## Configuration
 
@@ -71,16 +71,19 @@ pimcore_data_hub:
         # DataHub configuration (client) names the validator enforces.
         # Empty enforces no client — the engine stays a no-op.
         enforced_clients:
-            - public-content
+            - internal-content
 
-        # Development / GraphQL-explorer convenience. When a request carries
-        # this apikey AND its client is NOT in enforced_clients, validation is
-        # skipped and BOTH cache tiers (persistent + output, read and write)
+        # Privileged bypass key. When a request carries this apikey, validation
+        # is skipped and BOTH cache tiers (persistent + output, read and write)
         # are bypassed — the request always hits the resolver fresh, with an
-        # audit-log line per bypass. Empty disables the bypass. Comparison is
-        # constant-time. Pasting the key on an enforced client does nothing:
-        # that client stays fully validated and cached.
-        bypass_apikey: '%env(DATAHUB_EXPLORER_BYPASS_APIKEY)%'
+        # audit-log line per bypass. This holds on ANY client, INCLUDING an
+        # enforced one: it is what lets a trusted internal client introspect
+        # the enforced schema unguarded. It is not an escape hatch — the
+        # per-client security check runs first, so the key must itself be a
+        # valid apikey on the target client (provision it as a dedicated second
+        # credential on that client). Empty disables the bypass. Comparison is
+        # constant-time. Treat the key as a secret: guard, audit, re-roll.
+        bypass_apikey: '%env(DATAHUB_BYPASS_APIKEY)%'
 ```
 
 ## Rules JSON schema
@@ -92,7 +95,7 @@ pimcore_data_hub:
       "operations": {
         // Operation name → its allowed variables. An operation absent from a
         // version's `operations` is rejected outright on an enforced client.
-        "getResourceLibraryAssetItemListing": {
+        "getArticleListing": {
           "variables": {
             // Every variable the operation may carry MUST be declared.
             // An undeclared variable present in the request is rejected.
@@ -230,6 +233,53 @@ Independently of the variable gate, the listing resolvers reject `sortOrder`
 without `sortBy`, and any `sortOrder` other than `ASC` / `DESC`, with a
 client-safe GraphQL error rather than silently ignoring it.
 
+## Bypass key — privilege and threat model
+
+The bypass key is a privileged credential, not a convenience flag. A request
+whose resolved apikey equals the configured `bypass_apikey` skips the variable
+gate **and** both cache tiers (read and write) on any client, including an
+enforced one. `performSecurityCheck` runs first, so the key only works when it
+is itself a valid apikey on the target client — its blast radius is bounded by,
+and never exceeds, that client's existing apikey permissions. It cannot reach
+data the client could not already reach.
+
+What a holder of the key gains over an ordinary apikey on the same client:
+
+- **The full operation surface, not the allowlisted subset.** The operation
+  allowlist and per-variable constraints no longer apply, so every operation the
+  client's schema exposes is reachable with arbitrary variables.
+- **Uncached execution.** Every request runs the resolver fresh and writes
+  nothing back to either cache tier — a far more effective compute-amplification
+  (DoS) lever than ordinary traffic, which cache HITs absorb.
+
+What the key does **not** grant:
+
+- **Backend object permissions stay on.** The bypass disables only this bundle's
+  request-validation, not the underlying object-level security, so the data
+  ceiling is unchanged.
+- **The security-check precondition stays.** `performSecurityCheck` runs first,
+  so the key only ever works as a valid apikey on the target client.
+
+**Do not assume an independent injection backstop behind the gate.** The gate's
+per-variable constraints are the request-boundary input check on `filter` /
+`sortBy` shape for enforced clients, and the bypass removes it. Resolver-side
+input hardening — a `buildSqlCondition` type-guard that rejects a raw-string
+filter (the unguarded form returns the string straight into the WHERE clause)
+and an order-key column allowlist for `sortBy` — is a *separate* layer that is
+**not present in every deployment cut**. Where it is absent, the gate is the
+only thing between a bypass-keyed request and those sinks. Treat the gate as
+load-bearing for input safety, not merely defense-in-depth, and keep the key's
+exposure correspondingly tight until the resolver-side hardening is also
+deployed (or the enforced client's rules tightly constrain those variables).
+
+If the key leaks, treat it as a credential compromise. Every bypass request is
+audit-logged (the `...bypass` slug, carrying operation and client — never the
+key itself), so detection rides on capturing that slug and alerting on its
+volume. Response is rotation: re-roll the secret **and** remove the
+corresponding client apikey, which severs the `performSecurityCheck`
+precondition immediately. Because an empty `bypass_apikey` disables the bypass
+entirely, clearing the configured value is a valid emergency kill switch.
+
 ## Code map
 
 | Concern | Class |
@@ -244,4 +294,4 @@ client-safe GraphQL error rather than silently ignoring it.
 ## Related
 
 - [Two-tier SWR cache](../README.md#two-tier-swr-cache-yageo-fork) — the cache layer this gate sits in front of.
-- Deployment wiring (ConfigMap, refresh-worker mount, health-probe allowlist) — workspace wiki, *DataHub Request Validation* under Projects → yageogroup-com → Pimcore.
+- Deployment wiring (ConfigMaps, worker mounts, health-probe allowlists) is deployment-specific and documented outside this bundle; this contract stays deployment-agnostic.
