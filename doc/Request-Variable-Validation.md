@@ -13,10 +13,10 @@ instead of a distinct cache entry that re-resolves on every invalidation for its
 whole payload TTL.
 
 This document is the bundle-portable contract: configuration grammar, the rules
-JSON schema, default-deny semantics, the reject shape, the development bypass,
-and the cache-hygiene drain surfaces. The yageogroup.com deployment specifics
-(ConfigMap wiring, the refresh-worker mount, the health-probe allowlist) live in
-the workspace wiki — see [Related](#related).
+JSON schema, default-deny semantics, the reject shape, the privileged bypass,
+and the cache-hygiene drain surfaces. Deployment specifics (ConfigMap wiring,
+worker mounts, health-probe allowlists) are deployment-specific and live outside
+this bundle.
 
 ## Activation — opt-in, fail-safe by construction
 
@@ -52,10 +52,10 @@ one rejects live traffic, two keep the cache clean. It is **not** read-only:
    non-conforming entries — it reaches probe-traffic entries whose tags never
    invalidate, which the refresh path alone would never revisit.
 
-All three need the rules file visible in the pod they run in. On the
-yageogroup.com deployment that means pimcore-php (read path), the refresh-worker
-and maintenance-worker (self-clean + maintenance-task sweep), and the
-maintenance-shell (interactive `bin/console` sweep) — see [Related](#related).
+All three need the rules file visible in the pod they run in: the
+request-handling pod (read path), the refresh and maintenance workers
+(self-clean + maintenance-task sweep), and whatever pod runs the interactive
+`bin/console` sweep.
 
 ## Configuration
 
@@ -71,16 +71,19 @@ pimcore_data_hub:
         # DataHub configuration (client) names the validator enforces.
         # Empty enforces no client — the engine stays a no-op.
         enforced_clients:
-            - public-content
+            - internal-content
 
-        # Development / GraphQL-explorer convenience. When a request carries
-        # this apikey AND its client is NOT in enforced_clients, validation is
-        # skipped and BOTH cache tiers (persistent + output, read and write)
+        # Privileged bypass key. When a request carries this apikey, validation
+        # is skipped and BOTH cache tiers (persistent + output, read and write)
         # are bypassed — the request always hits the resolver fresh, with an
-        # audit-log line per bypass. Empty disables the bypass. Comparison is
-        # constant-time. Pasting the key on an enforced client does nothing:
-        # that client stays fully validated and cached.
-        bypass_apikey: '%env(DATAHUB_EXPLORER_BYPASS_APIKEY)%'
+        # audit-log line per bypass. This holds on ANY client, INCLUDING an
+        # enforced one: it is what lets a trusted internal client introspect
+        # the enforced schema unguarded. It is not an escape hatch — the
+        # per-client security check runs first, so the key must itself be a
+        # valid apikey on the target client (provision it as a dedicated second
+        # credential on that client). Empty disables the bypass. Comparison is
+        # constant-time. Treat the key as a secret: guard, audit, re-roll.
+        bypass_apikey: '%env(DATAHUB_BYPASS_APIKEY)%'
 ```
 
 ## Rules JSON schema
@@ -244,4 +247,4 @@ client-safe GraphQL error rather than silently ignoring it.
 ## Related
 
 - [Two-tier SWR cache](../README.md#two-tier-swr-cache-yageo-fork) — the cache layer this gate sits in front of.
-- Deployment wiring (ConfigMap, refresh-worker mount, health-probe allowlist) — workspace wiki, *DataHub Request Validation* under Projects → yageogroup-com → Pimcore.
+- Deployment wiring (ConfigMaps, worker mounts, health-probe allowlists) is deployment-specific and documented outside this bundle; this contract stays deployment-agnostic.

@@ -249,8 +249,8 @@ request's outcome; enforcement is opt-in per client.
 pimcore_data_hub:
     request_validation:
         rules_file: '%env(DATAHUB_REQUEST_VALIDATION_RULES_FILE)%'  # empty = engine off
-        enforced_clients: ['public-content']                       # empty = enforce nothing
-        bypass_apikey: '%env(DATAHUB_EXPLORER_BYPASS_APIKEY)%'      # dev/explorer; non-enforced clients only
+        enforced_clients: ['internal-content']                     # empty = enforce nothing
+        bypass_apikey: '%env(DATAHUB_BYPASS_APIKEY)%'               # privileged; skips validation on any client incl. enforced
 ```
 
 Rules are versioned JSON (inheritance flattened at load; unknown version →

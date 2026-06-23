@@ -82,25 +82,29 @@ final class RequestValidationFunctionalTest extends KernelTestCase
         );
     }
 
-    public function testBypassFlagIgnoredOnEnforcedPublicContent(): void
+    public function testBypassKeySkipsValidationOnEnforcedClient(): void
     {
+        // The seeder registers the overlay's bypass_apikey as a SECOND apikey on
+        // the enforced `default` client, mirroring the production setup where an
+        // admin adds a dedicated bypass credential to the enforced client. The key
+        // therefore clears performSecurityCheck and then fires the bypass, so an
+        // operation that request-validation would otherwise reject (the fixture
+        // allows only getTestSwrOnlyItemListing) executes instead of returning 400.
         $response = $this->dispatchWithApikey(
             'DisallowedOperation',
             'query DisallowedOperation { __typename }',
             'test-bypass-key-do-not-use'
         );
 
-        self::assertSame(400, $response->getStatusCode(), 'bypass apikey must be ignored for an enforced client — junk must still return 400');
+        self::assertSame(200, $response->getStatusCode(), 'a valid bypass key must skip validation on an enforced client — the disallowed operation executes');
 
         $body = json_decode((string)$response->getContent(), true);
         self::assertIsArray($body);
-        self::assertArrayHasKey('errors', $body);
-        self::assertIsArray($body['errors']);
-        self::assertNotEmpty($body['errors']);
-        $first = $body['errors'][0];
-        self::assertIsArray($first);
-        self::assertArrayHasKey('message', $first);
-        self::assertStringStartsWith(RequestVariableValidator::REJECT_MESSAGE_PREFIX, (string)$first['message']);
+        self::assertArrayNotHasKey(
+            'errors',
+            $body,
+            'the bypass skips request-validation, so no reject-shaped errors body must be present'
+        );
     }
 
     /**
