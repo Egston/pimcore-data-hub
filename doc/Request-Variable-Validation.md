@@ -95,7 +95,7 @@ pimcore_data_hub:
       "operations": {
         // Operation name → its allowed variables. An operation absent from a
         // version's `operations` is rejected outright on an enforced client.
-        "getResourceLibraryAssetItemListing": {
+        "getArticleListing": {
           "variables": {
             // Every variable the operation may carry MUST be declared.
             // An undeclared variable present in the request is rejected.
@@ -232,6 +232,53 @@ invisible." Confirm visibility with `--dry-run` first if unsure.
 Independently of the variable gate, the listing resolvers reject `sortOrder`
 without `sortBy`, and any `sortOrder` other than `ASC` / `DESC`, with a
 client-safe GraphQL error rather than silently ignoring it.
+
+## Bypass key — privilege and threat model
+
+The bypass key is a privileged credential, not a convenience flag. A request
+whose resolved apikey equals the configured `bypass_apikey` skips the variable
+gate **and** both cache tiers (read and write) on any client, including an
+enforced one. `performSecurityCheck` runs first, so the key only works when it
+is itself a valid apikey on the target client — its blast radius is bounded by,
+and never exceeds, that client's existing apikey permissions. It cannot reach
+data the client could not already reach.
+
+What a holder of the key gains over an ordinary apikey on the same client:
+
+- **The full operation surface, not the allowlisted subset.** The operation
+  allowlist and per-variable constraints no longer apply, so every operation the
+  client's schema exposes is reachable with arbitrary variables.
+- **Uncached execution.** Every request runs the resolver fresh and writes
+  nothing back to either cache tier — a far more effective compute-amplification
+  (DoS) lever than ordinary traffic, which cache HITs absorb.
+
+What the key does **not** grant:
+
+- **Backend object permissions stay on.** The bypass disables only this bundle's
+  request-validation, not the underlying object-level security, so the data
+  ceiling is unchanged.
+- **The security-check precondition stays.** `performSecurityCheck` runs first,
+  so the key only ever works as a valid apikey on the target client.
+
+**Do not assume an independent injection backstop behind the gate.** The gate's
+per-variable constraints are the request-boundary input check on `filter` /
+`sortBy` shape for enforced clients, and the bypass removes it. Resolver-side
+input hardening — a `buildSqlCondition` type-guard that rejects a raw-string
+filter (the unguarded form returns the string straight into the WHERE clause)
+and an order-key column allowlist for `sortBy` — is a *separate* layer that is
+**not present in every deployment cut**. Where it is absent, the gate is the
+only thing between a bypass-keyed request and those sinks. Treat the gate as
+load-bearing for input safety, not merely defense-in-depth, and keep the key's
+exposure correspondingly tight until the resolver-side hardening is also
+deployed (or the enforced client's rules tightly constrain those variables).
+
+If the key leaks, treat it as a credential compromise. Every bypass request is
+audit-logged (the `...bypass` slug, carrying operation and client — never the
+key itself), so detection rides on capturing that slug and alerting on its
+volume. Response is rotation: re-roll the secret **and** remove the
+corresponding client apikey, which severs the `performSecurityCheck`
+precondition immediately. Because an empty `bypass_apikey` disables the bypass
+entirely, clearing the configured value is a valid emergency kill switch.
 
 ## Code map
 
