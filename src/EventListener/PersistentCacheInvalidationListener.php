@@ -82,7 +82,11 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
                 // `fallbackWatermark > refreshedAt` stale-detection in preHandle
                 // when the queue path is disabled.
                 $this->persistentCache->bumpFallbackWatermark();
-                Logger::info('persistent_cache_invalidation: watermark bumped (queue disabled)');
+                // WARNING, not INFO: a watermark bump marks the entire
+                // persistent cache stale and triggers a cache-wide refresh
+                // storm. It must survive to container stdout / application_logs
+                // so the next storm is attributable in one query.
+                Logger::warning('persistent_cache_invalidation: watermark bumped (queue disabled)');
 
                 return;
             }
@@ -91,8 +95,9 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
             if ($element === null) {
                 // Non-element event on the queue-enabled path: fall back to the watermark
                 // so invalidation is never silently dropped.
+                // WARNING (not INFO) for the same reason as the queue-disabled bump above.
                 $this->persistentCache->bumpFallbackWatermark();
-                Logger::info(sprintf(
+                Logger::warning(sprintf(
                     'persistent_cache_invalidation: watermark bumped (non-element event, type=%s)',
                     get_class($event)
                 ));
@@ -128,8 +133,9 @@ class PersistentCacheInvalidationListener implements EventSubscriberInterface
             } elseif (!$result['hadReverseIndexHits']) {
                 // Nothing in cache depends on this element's tags — watermark
                 // safety floor is appropriate for the genuinely-unknown case.
+                // WARNING (not INFO) for the same reason as the queue-disabled bump above.
                 $this->persistentCache->bumpFallbackWatermark();
-                Logger::info(sprintf(
+                Logger::warning(sprintf(
                     'persistent_cache_invalidation: watermark bumped (no cached entries depend on tags) for %s id=%s tags=[%s]',
                     get_class($element),
                     (string)$element->getId(),
