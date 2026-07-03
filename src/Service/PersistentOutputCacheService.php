@@ -941,26 +941,30 @@ class PersistentOutputCacheService
         if (!is_array($list)) {
             $list = [];
         }
-        if (in_array($memberKey, $list, true)) {
-            return;
-        }
-        $list[] = $memberKey;
-        // Prune dead entries when we cross the soft cap; FIFO-evict if still over.
-        // Without bounding, the index grows by one entry per unique canonical
-        // request body, never shrinks even when payloads have expired.
-        if (count($list) > self::MAX_INDEX_SIZE) {
-            $alive = [];
-            foreach ($list as $k) {
-                $v = $this->cacheLoad($k);
-                if ($v !== false && $v !== null) {
-                    $alive[] = $k;
+        if (!in_array($memberKey, $list, true)) {
+            $list[] = $memberKey;
+            // Prune dead entries when we cross the soft cap; FIFO-evict if still over.
+            // Without bounding, the index grows by one entry per unique canonical
+            // request body, never shrinks even when payloads have expired.
+            if (count($list) > self::MAX_INDEX_SIZE) {
+                $alive = [];
+                foreach ($list as $k) {
+                    $v = $this->cacheLoad($k);
+                    if ($v !== false && $v !== null) {
+                        $alive[] = $k;
+                    }
+                }
+                $list = $alive;
+                if (count($list) > self::MAX_INDEX_SIZE) {
+                    $list = array_slice($list, -self::MAX_INDEX_SIZE);
+                    Logger::warning('persistent_cache: forward-index truncated at max size', ['index' => $indexKey, 'size' => self::MAX_INDEX_SIZE]);
                 }
             }
-            $list = $alive;
-            if (count($list) > self::MAX_INDEX_SIZE) {
-                $list = array_slice($list, -self::MAX_INDEX_SIZE);
-            }
         }
+        // Re-save even when the member is already present so a repeat write of an
+        // already-indexed key renews the index's (Pimcore-default 7-day) TTL.
+        // Skipping the save let a stable index silently expire and drop entries
+        // from the sweep's listAllEntries enumeration.
         $this->cacheSave($indexKey, $list, [self::TAG_COMMON], null);
     }
 
@@ -982,29 +986,40 @@ class PersistentOutputCacheService
             $list = [];
         }
         $pair = [$payloadKey, $metaKey];
+        $alreadyPresent = false;
         foreach ($list as $existing) {
             if (is_array($existing) && ($existing[0] ?? null) === $payloadKey) {
-                return;
+                $alreadyPresent = true;
+
+                break;
             }
         }
-        $list[] = $pair;
-        if (count($list) > self::MAX_INDEX_SIZE) {
-            $alive = [];
-            foreach ($list as $entry) {
-                if (!is_array($entry) || count($entry) < 2) {
-                    continue;
-                }
-                $v = $this->cacheLoad((string)$entry[0]);
-                if ($v !== false && $v !== null) {
-                    $alive[] = $entry;
-                }
-            }
-            $list = $alive;
+        if (!$alreadyPresent) {
+            $list[] = $pair;
             if (count($list) > self::MAX_INDEX_SIZE) {
-                $list = array_slice($list, -self::MAX_INDEX_SIZE);
-                Logger::warning('persistent_cache: reverse-index truncated at max size', ['tag' => $tag, 'size' => self::MAX_INDEX_SIZE]);
+                $alive = [];
+                foreach ($list as $entry) {
+                    if (!is_array($entry) || count($entry) < 2) {
+                        continue;
+                    }
+                    $v = $this->cacheLoad((string)$entry[0]);
+                    if ($v !== false && $v !== null) {
+                        $alive[] = $entry;
+                    }
+                }
+                $list = $alive;
+                if (count($list) > self::MAX_INDEX_SIZE) {
+                    $list = array_slice($list, -self::MAX_INDEX_SIZE);
+                    Logger::warning('persistent_cache: reverse-index truncated at max size', ['tag' => $tag, 'size' => self::MAX_INDEX_SIZE]);
+                }
             }
         }
+        // Re-save even when the pair is already present so a refresh of an
+        // already-cached query renews the reverse index's (Pimcore-default
+        // 7-day) TTL. Skipping the save let a stable-variant list query's
+        // taginx expire, sending the next element save of that class down the
+        // global watermark-bump path (the fallback-watermark storm).
+        //
         // Reverse-index entries carry only TAG_COMMON — clearAll() drops them
         // on cache flush. Per-object tag membership belongs in the index
         // body, not in the index entry's tag set.
@@ -1055,9 +1070,12 @@ class PersistentOutputCacheService
      * Write helper – separated for testability.
      *
      * @param mixed    $value
-     * @param int|null $ttl  null = no expiry (use for sentinel/index entries);
-     *                       int  = seconds. Do NOT pass 0 — Symfony Cache
-     *                       interprets that as "expires immediately".
+     * @param int|null $ttl  null = the cache pool's default lifetime, NOT
+     *                       unlimited (604800 s / 7 days in the deployed
+     *                       installation via Symfony `default_lifetime`); used
+     *                       for sentinel/index entries, which rely on a save
+     *                       to renew that window. int = seconds. Do NOT pass
+     *                       0 — Symfony Cache treats it as "expires immediately".
      */
     protected function cacheSave(string $key, $value, array $tags, ?int $ttl): void
     {

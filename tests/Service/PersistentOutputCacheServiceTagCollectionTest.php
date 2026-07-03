@@ -359,6 +359,123 @@ final class PersistentOutputCacheServiceTagCollectionTest extends TestCase
         self::assertCount(1, $reverseIndex, 'reverse-index must not accumulate duplicate pairs for the same payloadKey');
     }
 
+    /**
+     * Store-backed service double: cacheLoad reads from / cacheSave writes to an
+     * in-memory `$capture['store']`, and every cacheSave is recorded in
+     * `$capture['writes']` as a {key,value,tags,ttl} record so a test can assert
+     * both the write count and the TTL/tags contract of each write.
+     *
+     * @param array<string, mixed>                                                                                                  $graphql
+     * @param array{store: array<string, mixed>, writes: list<array{key: string, value: mixed, tags: list<string>, ttl: ?int}>} $capture by-ref state (reset here)
+     */
+    private function makeStoreBackedService(array $graphql, DependencyCollector $collector, array &$capture): PersistentOutputCacheService
+    {
+        $capture = ['store' => [], 'writes' => []];
+        $service = $this->getMockBuilder(PersistentOutputCacheService::class)
+            ->setConstructorArgs([$this->makeContainer($graphql), $this->makeClassifier($graphql), null, $collector])
+            ->onlyMethods(['cacheLoad', 'cacheSave'])
+            ->getMock();
+        // NOTE: a regular closure with use(&$capture), not an arrow fn — an arrow
+        // fn captures $capture by value at definition time, so cacheLoad would
+        // forever return the empty initial store and the already-present
+        // detection these tests exercise would never fire.
+        $service->method('cacheLoad')->willReturnCallback(function (string $key) use (&$capture) {
+            return $capture['store'][$key] ?? null;
+        });
+        $service->method('cacheSave')->willReturnCallback(function (string $key, $value, array $tags, ?int $ttl) use (&$capture) {
+            $capture['store'][$key] = $value;
+            $capture['writes'][] = compact('key', 'value', 'tags', 'ttl');
+        });
+
+        return $service;
+    }
+
+    /**
+     * @param array{store: array<string, mixed>, writes: list<array{key: string, value: mixed, tags: list<string>, ttl: ?int}>} $capture
+     *
+     * @return list<array{key: string, value: mixed, tags: list<string>, ttl: ?int}>
+     */
+    private static function writesTo(array $capture, string $key): array
+    {
+        return array_values(array_filter($capture['writes'], static fn ($w) => $w['key'] === $key));
+    }
+
+    public function testTouchingExistingListReverseIndexRenewsItsTtl(): void
+    {
+        // Reproduces the fallback-watermark-storm shape: a list-granularity query
+        // records a per-CLASS reverse index (taginx). A refresh of the
+        // already-cached query must re-save that entry so its null TTL (the cache
+        // pool's 7-day default) window is renewed. When the save was skipped for
+        // an already-present pair, the taginx expired after 7 days and the next
+        // save of any element of that class took the global watermark-bump path.
+        $graphql = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 12,
+            'persistent_output_cache_payload_ttl' => 3456,
+
+            'operations' => [
+                'ListOp' => ['tier' => 'swr_only', 'granularity' => 'list'],
+            ],
+        ];
+
+        $collector = new DependencyCollector();
+        $e1 = $this->fakeElement(11);
+        $collector->recordObject($e1);
+
+        $expectedIndexKey = PersistentOutputCacheService::REVERSE_INDEX_PREFIX
+            . PersistentOutputCacheService::TAG_CLASS_PREFIX . self::sanitize(get_class($e1));
+
+        $capture = [];
+        $service = $this->makeStoreBackedService($graphql, $collector, $capture);
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'ListOp']);
+        $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
+        $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
+
+        $indexWrites = self::writesTo($capture, $expectedIndexKey);
+        self::assertCount(2, $indexWrites, 'reverse index must be re-saved on touch to renew its TTL');
+        // The renewal mechanism itself: each re-save passes a null TTL (pool
+        // default) and carries TAG_COMMON so clearAll() still drops the entry.
+        self::assertNull($indexWrites[1]['ttl'], 're-save must pass null TTL so the pool-default window is renewed');
+        self::assertContains(PersistentOutputCacheService::TAG_COMMON, $indexWrites[1]['tags']);
+        // Dedup still holds: the re-save must not accumulate duplicate pairs.
+        self::assertCount(1, $capture['store'][$expectedIndexKey]);
+    }
+
+    public function testTouchingExistingForwardIndexMemberRenewsItsTtl(): void
+    {
+        // Same TTL-renewal contract for the forward index INDEX_ALL, which the
+        // sweep's listAllEntries enumerates (the per-op / per-client indices are
+        // maintained on the same path but consumed only by targeted eviction):
+        // a repeat save of an already-indexed payload key must re-save the index
+        // so it does not silently expire and drop entries from the sweep.
+        $graphql = [
+            'persistent_output_cache_enabled' => true,
+            'persistent_output_cache_lifetime' => 12,
+            'persistent_output_cache_payload_ttl' => 3456,
+
+            'operations' => [
+                'TagOp' => ['tier' => 'swr_only', 'granularity' => 'single'],
+            ],
+        ];
+
+        $collector = new DependencyCollector();
+        $collector->recordObject($this->fakeElement(11));
+
+        $capture = [];
+        $service = $this->makeStoreBackedService($graphql, $collector, $capture);
+
+        $request = $this->makeRequest('c1', ['query' => '{ __typename }', 'operationName' => 'TagOp']);
+        $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
+        $service->savePersistent($request, new JsonResponse(['data' => ['x' => 1]]));
+
+        $allIndexWrites = self::writesTo($capture, PersistentOutputCacheService::INDEX_ALL);
+        self::assertCount(2, $allIndexWrites, 'forward index must be re-saved on touch to renew its TTL');
+        self::assertNull($allIndexWrites[1]['ttl'], 're-save must pass null TTL so the pool-default window is renewed');
+        self::assertContains(PersistentOutputCacheService::TAG_COMMON, $allIndexWrites[1]['tags']);
+        self::assertCount(1, $capture['store'][PersistentOutputCacheService::INDEX_ALL]);
+    }
+
     public function testCollectorObjectTagsDoNotAppearInPayloadForListGranularity(): void
     {
         // For list-granularity operations, collectorTagsForOperation() emits class-level
