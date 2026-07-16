@@ -172,11 +172,12 @@ during an in-flight refresh:
 
 - **What it stores:** the literal value `1`. Same shape as the dedupe
   sentinel and pending flag; presence is the signal.
-- **Set by:** the invalidation listener when it handles the first
-  invalidation in a window for an operation that carries an
-  `invalidation_cooldown_ttl`. Armed *instead of* dispatching an
-  immediate refresh — the listener instead dispatches a single dated
-  refresh message (see *Invalidation cooldown* below).
+- **Set by:** the invalidation listener when it opens a cooldown window
+  for an operation that carries an `invalidation_cooldown_ttl` — on the
+  **leading edge** (the first edit of an elapsed window, which also
+  refreshes immediately) or when opening a trailing-only window. Armed
+  alongside a single dated trailing refresh message (see *Invalidation
+  cooldown* below).
 - **TTL:** the operation's `invalidation_cooldown_ttl` (6h in
   production for the translation-verification listings). Tagged
   `TAG_WATERMARK`, not `TAG_COMMON`, so an SWR-layer `clearAll()`
@@ -193,38 +194,47 @@ during an in-flight refresh:
 ## Invalidation cooldown (per-operation refresh throttle)
 
 Operations carrying an `invalidation_cooldown_ttl` (the coarse
-translation-verification listings) take a throttled path on the
-invalidation side. Operations with a coarse listing granularity carry
-`granularity: list`, so a save on any contributing DataObject class
-would otherwise invalidate the whole listing and trigger a full refresh
-— once per edit. A translator marking items verified one-by-one would
-drive a full refresh per click.
+translation-verification listings) take a **leading-edge-plus-trailing**
+throttle on the invalidation side instead of refreshing once per edit.
+They carry `granularity: list`, so a save on any contributing DataObject
+class would otherwise invalidate the whole listing and trigger a full
+refresh — once per edit. A translator marking items verified one-by-one
+would drive a full-listing refresh per click.
 
-Instead, the first invalidation in a cooldown window:
+`CooldownRefreshPolicy` decides both edges. An edit takes one of three
+**forward** arms, keyed on whether the cooldown window has elapsed since
+the last refresh (`pastCooldown`) and whether a window is already armed:
 
-1. arms the `datahub_graphql_op_cooldown_<hash>` sentinel (TTL = the
-   cooldown window), and
-2. dispatches a single `PersistentRefreshMessage` carrying an absolute
-   `deliverAt = now + cooldown`.
+1. **Leading edge** (`pastCooldown` — includes the first edit of an
+   elapsed window): refresh **immediately**, *and* open a fresh window by
+   arming the `datahub_graphql_op_cooldown_<hash>` sentinel and dispatching
+   a trailing `PersistentRefreshMessage` dated `deliverAt = now + cooldown`.
+2. **Coalesce** (window open, sentinel already armed): no-op — a trailing
+   refresh is already queued.
+3. **Open trailing** (not yet armed, window not elapsed): dispatch a
+   trailing dated `deliverAt = lastRefreshAt + cooldown`.
 
-The dated message sits in the priority queue, invisible, until its
-`deliverAt` elapses; it then pops and refreshes the entry against
-then-current data, reflecting every edit made during the window. The
-worker clears the sentinel on success, opening the next window. Further
-invalidations while the sentinel is live are no-ops — a dated refresh is
-already queued.
+The trailing (dated) message rides the same priority queue but stays
+**invisible** until its `deliverAt` elapses — `get()` reads only members
+whose score is `<= now`. When it pops, the worker re-evaluates against
+then-current meta and takes one of three **reverse** arms:
 
-This is a pure trailing-edge throttle: N edits in one window collapse to
-exactly one refresh, fired `cooldown` after the first edit. There is no
-periodic poller — the dated message *is* the timer; a window with no
-edits queues nothing.
+- **Cancel** — the entry is no longer stale (the leading-edge refresh
+  already caught everything and nothing landed after it): drop it.
+- **Fire** — still stale *and* past cooldown: acquire the lock and refresh.
+- **Re-arm** — still stale but within the window: dispatch the next
+  trailing dated `lastRefreshAt + cooldown`.
+
+So a burst of edits yields at most one immediate (leading) refresh plus
+one trailing per window, and a window whose leading refresh already
+covered every edit self-cancels its trailing. There is no periodic poller
+— the dated message *is* the timer; a window with no edits queues nothing.
 
 **The read path is unchanged for these operations.** The cooldown guards
-only the invalidation→enqueue side. A targeted invalidation of a
-cooldown op does not move any watermark, so reads continue to serve a
-HIT carrying knowingly-slightly-stale data until the scheduled refresh
-lands. The global-watermark fallback still stales these ops normally
-when it fires.
+only the invalidation→enqueue side. A cooldown invalidation moves no
+watermark, so reads keep serving a HIT carrying knowingly-slightly-stale
+data until a refresh (leading or trailing) lands. The global-watermark
+fallback still stales these ops normally when it fires.
 
 ## Determining freshness: the watermark
 
@@ -498,19 +508,23 @@ Messenger Doctrine transport. The ZSET score determines pop order:
   persistent_refresh_priority_weight_band_seconds`; the factory validates this
   at startup under the weighted-bands strategy.
 
-A single worker pod runs `messenger:consume` against this transport
-(`replicas: 1` in the worker chart). Worker parallelism is therefore
-**one refresh at a time across the whole queue**. The refresh lock
-above is defense-in-depth for the case where someone scales the
-worker > 1 or where the inline kernel.terminate path runs alongside
-the worker.
+The worker deployment runs **2 replicas** of `messenger:consume` against
+this transport, so more than one refresh can be in flight at once. The
+transport's `get()` is a single atomic Lua pop (ZRANGEBYSCORE + ZREM +
+claim-inflight in one uninterruptible `EVAL`), so exactly one consumer
+wins each message even at `N ≥ 2`. The per-query **refresh lock** above is
+therefore **load-bearing, not hypothetical**: it is what stops two
+replicas that each legitimately popped a refresh for the *same* query
+(e.g. one read-triggered, one invalidation-triggered message) from both
+re-running the resolver and clobbering each other's payload write. It also
+covers the inline `kernel.terminate` path running alongside the workers.
 
 ## Failure modes and recovery
 
 | What goes wrong | What happens | Recovery |
 |---|---|---|
 | Worker dies mid-refresh (OOM, eviction, SIGKILL) | Refresh lock released by Redis TTL (or by Symfony Lock's destructor on graceful shutdown). Sentinel expires on its own TTL. | Next invalidation re-dispatches fresh. Up to `enqueue_dedupe_ttl` seconds of "STALE but served from cache" for affected queries. |
-| Resolver throws / returns non-2xx / errors-only payload | `savePersistent` refuses to persist (would otherwise turn a transient outage into a sticky cached error). Sentinel left to TTL-expire so Messenger retries don't pile up dispatches. | Messenger retries the message (up to 3 retries with exponential backoff). If all retries fail, the message lands in the failure queue and the entry stays STALE until the next invalidation triggers a fresh dispatch. |
+| Resolver throws / returns non-2xx / errors-only payload / `data` array whose members are all null | `savePersistent` refuses to persist (would otherwise turn a transient outage into a sticky cached error). The all-null-`data` case catches a resolver-thrown error that nulls its field but keeps the `data` key — the admission gate requires at least one non-null `data` member. Sentinel left to TTL-expire so Messenger retries don't pile up dispatches. | Messenger retries the message (up to 3 retries with exponential backoff). If all retries fail, the message lands in the failure queue and the entry stays STALE until the next invalidation triggers a fresh dispatch. |
 | Redis is down | Cache loads return false → MISS path. Cold-miss lock factory unavailable → loud warning + falls through to inline resolver. Cache writes throw → caught and logged. | When Redis returns, the system self-heals — first request after recovery is a MISS, gets cached, normal operation resumes. |
 | Sentinel TTL expires mid-refresh (because refresh is unusually long, or queue is unusually deep) | New invalidations after the expiry trigger fresh dispatches → duplicate refresh messages queue behind the in-flight one → wasted work, no correctness loss | Tune `persistent_enqueue_dedupe_ttl` to comfortably exceed worst-case (queue wait + refresh duration). See *Tuning notes* below. |
 | Reverse index entry malformed | Listener logs per-entry warning, skips the entry; never amplifies a data-shape bug into a global watermark bump. | Surface the warnings in logs; bad entries naturally cycle out as their payloads age out. |
@@ -528,6 +542,12 @@ moving part:
 | `datahub.refresh_dispatch` | the read path (`kernel.terminate`) | a stale read enqueued a refresh (operation / client / variables / request URI) |
 | `datahub.refresh_handler` | the refresh worker | a queued refresh started / completed (duration, peak memory), lock-contention requeues, trailing-refresh and cooldown-window-close dispatches |
 | `datahub.swr` | `PersistentOutputCacheService` | cache-save / HIT-repaint outcomes and malformed-meta guards on the read path |
+
+The three fallback **watermark-bump** decisions (queue disabled,
+non-element event, no cached entries depend on the tags) log at
+**WARNING**, not INFO — a bump cascade-stales the whole cache, so it is a
+signal worth alerting on rather than routine chatter. The targeted-dispatch
+and coalesce decisions stay at INFO.
 
 These lines land wherever the application logger's Monolog handler is
 configured to write — commonly `var/log/<kernel-env>.log`, plus a

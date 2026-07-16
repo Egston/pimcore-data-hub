@@ -55,9 +55,26 @@ src/
 │   │                                         per-class tags during a
 │   │                                         GraphQL request (driven
 │   │                                         by POST_LOAD subscriber)
-│   └── GraphQLRequestCanonicalizer.php     ← canonicalizes the request
-│                                            body so equivalent requests
-│                                            hash to the same keys
+│   ├── GraphQLRequestCanonicalizer.php     ← canonicalizes the request
+│   │                                         body so equivalent requests
+│   │                                         hash to the same keys
+│   ├── FrontendRequestScope.php            ← runs an out-of-request
+│   │                                         GraphQL execution (worker,
+│   │                                         console, kernel.terminate)
+│   │                                         inside a frontend request so
+│   │                                         asset paths URL-encode
+│   │                                         identically to FPM writes
+│   ├── CooldownRefreshPolicy.php           ← pure decision engine for the
+│   │                                         per-operation cooldown throttle
+│   │                                         (forward + reverse arms)
+│   ├── CooldownWindowDispatcher.php        ← owns the cooldown I/O (arm /
+│   │                                         clear sentinel, dispatch dated
+│   │                                         message) around the policy
+│   ├── CooldownInvalidationDecision.php    ← forward-arm value object
+│   │                                         (leading-edge / coalesce /
+│   │                                         open-trailing)
+│   └── CooldownTrailingDecision.php        ← reverse-arm value object
+│                                            (cancel / fire / re-arm)
 ├── Lock/
 │   ├── LockSignalRefresher.php             ← SIGALRM-based renewer for
 │   │                                         Symfony Locks
@@ -121,7 +138,9 @@ WebserviceController::webonyxAction
     │       │  guards:
     │       │     - HTTP 2xx only (refuses to cache transient errors)
     │       │     - non-empty array payload only
-    │       │     - errors-only payloads (no data, errors set) refused
+    │       │     - errors-only payloads (errors set with no useful
+    │       │       data) — including a `data` array whose members are
+    │       │       all null — refused
     │       │  calls savePersistent → writes payload + meta + indices
     │       │  also updates the reverse index for every collected tag
     │       │
@@ -189,7 +208,7 @@ Unknown operations bypass entirely and run the resolver every time.
 KEY:  datahub_graphql_fallback_watermark_ts
 VAL:  unix timestamp (int)
 TAG:  TAG_WATERMARK ("datahub_graphql_persistent_watermark")
-TTL:  null (never expires)
+TTL:  null = cache-pool default (7d), renewed on each bump
 ```
 
 The watermark lives under its own dedicated tag —
@@ -332,25 +351,29 @@ else:
     runInline()                              # legacy fallback
 ```
 
-The queue path is the only one in production use. It mirrors the
-invalidation listener's dispatch logic but with the inputs already
-captured on the request:
+The queue path is the only one in production use. It builds the message
+from the inputs already captured on the request and dispatches
+**unconditionally** — it neither writes nor checks the
+`datahub_enqueue_req_` sentinel:
 
 ```
 dispatchToBus(request, $graphql):
-    $dedupeKey      = buildEnqueueDedupeKey(request)
-    $existingEnqueue = cacheLoad($dedupeKey)
-    if $existingEnqueue: return              # already queued, skip
-
-    cacheSave(1, $dedupeKey, TAG_COMMON, $enqueueTtl)
-    bus->dispatch(new PersistentRefreshMessage(...))
+    $payload       = request->getContent()
+    $client        = request attr 'clientname'
+    $op            = operationName from payload
+    $scoreBaseline = request attr '_datahub_persistent_refreshed_at' ?: time()
+    bus->dispatch(new PersistentRefreshMessage(
+        $client, $payload, $op, $scoreBaseline, $priorityWeight,
+        readTriggered: true))
 ```
 
-The two dispatchers — invalidation-triggered and read-triggered —
-share the same sentinel key space, so an invalidation that landed
-just before a stale read sees the same sentinel as the read-path
-would write, and the read-path skips. Both converge on the same
-worker.
+The read path no longer participates in sentinel-based dispatch dedupe.
+Transient read-side duplicates for the same query are absorbed
+downstream: the worker's execution-time freshness guard
+(`shouldRunRefresh` — skip the resolver if the entry is already fresh)
+plus the per-entry refresh lock make a redundant read dispatch cheap. The
+invalidation-triggered dispatcher still owns the sentinel; both converge
+on the same worker.
 
 ## Worker: `PersistentRefreshMessageHandler`
 
@@ -433,6 +456,16 @@ if $pending && $bus !== null:
 
 One trailing refresh per finished message, no matter how many
 pending bumps happened during its run.
+
+The `webonyxAction` invocation runs inside `FrontendRequestScope::run`,
+which pushes the synthetic refresh request onto the `RequestStack` as a
+frontend main request. Without it, an out-of-request execution (worker,
+console, `kernel.terminate`) has an empty stack, so `Asset::getFullPath()`
+skips its `Tool::isFrontend()` URL-encoding branch and worker-written
+payloads would carry unencoded asset paths that differ from FPM-written
+ones — the same `(client, query)` entry would hash-collide on identical
+input yet serve byte-divergent bodies depending on which process last
+wrote it. The scope makes cache content independent of the writer.
 
 ## Lock spaces
 
@@ -555,6 +588,17 @@ Size discipline:
 - If still over after prune, FIFO-truncate the tail and emit a
   `persistent_cache: reverse-index truncated at max size` warning.
 
+TTL / renewal: index entries are written with a `null` TTL, which is
+**not** unlimited — Symfony's cache-pool `default_lifetime` caps it at
+7 days (604800s). `addToReverseIndex` (and `addToIndex` for the forward
+indices) therefore re-saves on **every** `savePersistent`, even when the
+member already exists, purely to renew that 7-day clock. This matters: if
+a stable-variant listing query stops being re-saved and its `taginx_`
+entry lapses, the next element save of that class finds an empty reverse
+index, falls through to the global-watermark-bump path, and cascade-stales
+the whole cache (a fallback-watermark refresh storm). Renewal-on-touch is
+what keeps a hot query's index alive indefinitely.
+
 The forward indices (`INDEX_ALL`, `INDEX_OP_*`, `INDEX_CLIENT_*`)
 follow the same pattern. None of these indices are tagged with
 collector tags — they carry only `TAG_COMMON` so `clearAll()` drops
@@ -576,23 +620,39 @@ HASH  datahub_refresh_priority_messages     id → serialized envelope
 HASH  datahub_refresh_priority_inflight     id → marker (set by get, cleared by ack)
 ```
 
-Send: MULTI / ZADD + HSET messages / EXEC. On re-send (id already in
-inflight) the score is bumped by `persistent_refresh_priority_requeue_score_bump`
-to demote contended messages so freshly-stale ones drain first.
+Send: MULTI / ZADD + HSET messages / EXEC. A **fresh** queue id is minted
+on every send — even when the envelope arrives carrying a
+`TransportMessageIdStamp` — because Messenger's retry flow re-sends the
+received envelope and *then* rejects the original by its id; reusing the
+inbound id would let that reject `HDEL` the body of the just-re-queued
+retry copy and silently drop it. On a retry re-send (`RedeliveryStamp`
+present) the score is bumped by
+`persistent_refresh_priority_requeue_score_bump` to demote contended
+messages so freshly-stale ones drain first. A Messenger `DelayStamp` is
+honored as a ZSET visibility floor (`max(score, now + delay)`) so a
+delayed re-queue stays invisible until due instead of tight-spinning the
+worker — a genuinely-scheduled message (non-null `deliverAt`) is exempt
+and owns its due-time score verbatim.
 
-Get: ZRANGEBYSCORE (lowest-scored member with score `<= now`, LIMIT 1)
-then ZREM + HGET messages + HSET inflight in MULTI/EXEC. The
-score-bounded read is the scheduled-delivery gate (see below); the
-non-atomic ZRANGEBYSCORE+ZREM is safe only at `replicas: 1` (a Lua wrap
-would be required to scale the refresh worker past one consumer).
+Get: a single Lua `EVAL` runs ZRANGEBYSCORE (lowest-scored member with
+score `<= now`, LIMIT 1) + ZREM + HGET messages + HSET inflight in one
+uninterruptible step. Folding the read and the claim into one script is
+what makes the transport exactly-one-consumer-safe: no second consumer
+can be handed the same id between the read and the remove. The
+score-bounded read is also the scheduled-delivery gate (see below). The
+reaper's stuck-inflight re-queue likewise runs a Lua `RECLAIM_SCRIPT` that
+re-asserts the id is still inflight and still stale before ZADD + HDEL, so
+two reapers can't resurrect the same id twice. The transport is therefore
+safe at `N ≥ 2` consumers, and the worker deployment runs **2 replicas**.
 
-Ack / reject: HDEL on both messages and inflight.
+Ack / reject: HDEL on both messages and inflight in MULTI/EXEC
+(idempotent, so concurrent acks of distinct ids are safe).
 
 Score strategies (`persistent_refresh_priority_strategy`):
 
 | Strategy | Score = |
 |---|---|
-| `oldest_refreshed_at_first` (default) | `PersistentRefreshMessage::refreshedAt` — longest-stale pops first |
+| `oldest_refreshed_at_first` (default) | `PersistentRefreshMessage::scoreBaseline` — longest-stale pops first |
 | `oldest_refreshed_at_first_with_weight_bands` | same minus `priority_weight × band_seconds` — higher-weight ops drop into earlier bands |
 | `disabled` | no scoring — FIFO equivalent |
 
@@ -653,8 +713,16 @@ pcntl-less platforms).
 
 | Case | Collector tag granularity |
 |---|---|
-| `SINGLE` | Per-object tags (`obj_<class>_<id>`); requires non-empty collector at save — emits `collector_empty_on_save` warning otherwise (canonical detector for missing POST_LOAD coverage) |
+| `SINGLE` | Per-object tags (`obj_<class>_<id>`) so a single object update targets this exact entry |
 | `LIST` | Per-class tags (`class_<class>`); any object of the class invalidates the entry |
+
+Both granularities require a non-empty `DependencyCollector` at save
+time. **Any** classified op that reaches the write with an empty collector
+emits a `collector_empty_on_save` warning — the canonical detector for
+missing POST_LOAD coverage (raw-SQL hydrators bypass the subscriber, so
+the collector stays empty). A `LIST` op with no tags is as broken as a
+`SINGLE` one: its reverse-index entry is never written and invalidation
+can never find it.
 
 Per-operation overrides (in `operations:` config block):
 
@@ -717,7 +785,7 @@ documented inline in `Configuration.php`.
 | What | Detection | Recovery |
 |---|---|---|
 | Resolver throws | controller try/catch in worker → log "controller invocation failed" | Sentinel kept (TTL-expires); worker retries via Messenger backoff (3 retries, 1s-2s-4s delays); if all retries fail, message lands in failure queue |
-| Resolver returns non-2xx / errors-only / empty | `savePersistent` refuses to persist → log "refusing to save non-2xx response" etc. | Entry stays STALE on the previous payload; client sees stale-served data |
+| Resolver returns non-2xx / errors-only / empty / all-null data | `savePersistent` refuses to persist → log "refusing to save non-2xx response" etc. (an errors-set response with no non-null `data` member, the shape a resolver-thrown error produces, is treated as errors-only) | Entry stays STALE on the previous payload; client sees stale-served data |
 | Worker dies mid-refresh (OOM, SIGKILL) | Lock TTL expires (Symfony Lock destructor releases on graceful shutdown; on SIGKILL relies on TTL) | Sentinel TTL-expires; next invalidation re-dispatches |
 | Sentinel TTL expires while message still queued | Symptom: duplicate refresh messages stack behind the in-flight one | Tune `persistent_enqueue_dedupe_ttl` higher; see Tuning notes in flow doc |
 | Lock factory unavailable | Resolver-call warning at worker arm time → "lock factory unavailable; dropping message" | Operator must wire LockFactory; messages silently dropped meanwhile (acked, no work done) |
