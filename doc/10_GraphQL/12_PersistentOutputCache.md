@@ -1,189 +1,87 @@
 # Persistent GraphQL Output Cache (SWR)
 
-This adds an additional, persistent GraphQL cache layer to Data Hub that is separate from Pimcore’s `output` tag cache. It enables serving stale responses safely after content changes while a fresh result is recomputed (stale‑while‑revalidate), and keeps the existing Data Hub output cache fully functional.
+A persistent, stale-while-revalidate GraphQL cache layer for Data Hub, separate from Pimcore's `output` tag cache. It serves a cached response immediately — even a knowingly-stale one after a content change — and recomputes a fresh result asynchronously, so visitor requests never block on a cold recompute and survive `output` tag invalidations.
 
-## Why
+> **This page is a feature-level overview.** The authoritative internals — the code map, the per-query reverse index, the fallback watermark, the tier model, the priority-transport refresh worker, the invalidation cooldown, and the failure-mode catalog — live in the two deep-dive docs, which are kept current:
+>
+> - [`../Persistent-Cache-Architecture.md`](../Persistent-Cache-Architecture.md) — code map, key/tag namespaces, priority transport (incl. scheduled delivery), lock spaces, per-operation config knobs.
+> - [`../Persistent-Cache-Flow.md`](../Persistent-Cache-Flow.md) — the runtime flow: states, the Redis keys per query, the sentinels, the watermark, the invalidation cooldown.
+>
+> When this page and a deep-dive disagree, the deep-dive wins.
 
-- Survive Pimcore `output` tag invalidations and continue serving responses.
-- Indicate staleness clearly through headers.
-- Keep thundering herd protection in place; by default the persistent layer applies to the same guarded operation names.
-- Provide tags and console commands for operational control.
+## Behaviour overview
 
-## Behavior Overview
+- **Fresh HIT** — returned immediately; the freshness TTL is renewed (sliding window).
+- **Stale HIT** — the stale response is returned to the caller immediately (SWR) and a background refresh is scheduled to recompute it.
+- **MISS** — the request proceeds normally and the fresh result is stored.
 
-- On request, the persistent cache is checked first.
-  - Fresh HIT: returns immediately and refreshes TTL (sliding window).
-- Stale HIT: returns a stale response to the caller immediately and schedules a background refresh (after response via kernel.terminate) to update both the standard output cache and the persistent cache.
-  - MISS: no change; request proceeds normally and fresh result is stored in both caches as applicable.
+Background refreshes run on a dedicated Messenger **refresh-worker** pod draining the `datahub_graphql_refresh` priority transport (a scheduled sorted-set queue, safe at `replicas ≥ 2`), not inline on the request. See the deep-dives for the transport, the per-entry refresh lock, and the `FrontendRequestScope` under which worker writes run.
 
-## Response Headers
+## Response headers
 
-- `X-Pimcore-DataHub-Persistent-Cache: HIT` when response is served from the persistent cache and is fresh.
-- `X-Pimcore-DataHub-Persistent-Cache: STALE` when stale was served (SWR). Also includes:
-  - `Warning: 110 - "Response is Stale"`
-- Existing `X-Pimcore-DataHub-Cache` header continues to reflect the standard output cache HIT/MISS.
+- `X-Pimcore-DataHub-Persistent-Cache: HIT` — served fresh from the persistent cache.
+- `X-Pimcore-DataHub-Persistent-Cache: STALE` — a stale response was served (SWR); also carries `Warning: 110 - "Response is Stale"`.
+- `X-Pimcore-DataHub-Cache: HIT|MISS` — the standard output cache status (unchanged).
+
+### Cache-status probe
+
+To obtain cache status without fetching the full response (for polling / external cache services), add `?cache_status=1` to the GraphQL POST (same body). Response: `204 No Content` with a `Cache-Status` header (RFC 9211) reporting both layers — `pimcore-output; hit|miss|disabled` and, when the persistent layer applies, `pimcore-persistent; hit|stale|miss`. Probing has no side effects (no TTL renewal, no refresh scheduled).
 
 ## Configuration
 
-Add the following keys to `pimcore_data_hub.graphql` (e.g. in `config.yml`):
+Under `pimcore_data_hub.graphql` (see `pimcore-installation/pimcore/config/config.yaml` for the live values, and Architecture.md § config knobs for the full list):
 
-```
+```yaml
 pimcore_data_hub:
-  graphql:
-    # existing
-    output_cache_enabled: true
-    output_cache_lifetime: 30
+    graphql:
+        output_cache_enabled: true               # standard output cache
+        output_cache_lifetime: 2592000
 
-    # thundering herd protection (existing)
-    in_progress_protection_enabled: true
-    in_progress_queries: ['ProductsQuery', 'SearchQuery']
+        persistent_output_cache_enabled: true     # this layer
+        persistent_refresh_queue_enabled: true    # async refresh via the priority transport
+        persistent_output_cache_payload_ttl: 86400
+        persistent_output_cache_payload_ttl_by_granularity: { ... }
+        persistent_disable_output_cache_for_guarded: true  # herd_guarded ops are owned by this layer
 
-    # NEW: persistent layer
-    persistent_output_cache_enabled: true
-    # optional; defaults to output_cache_lifetime if omitted
-    persistent_output_cache_lifetime: 120
-    # when true (default), persistent cache applies only to operations listed in in_progress_queries
-    persistent_output_cache_guard_only: true
-    # large payload TTL (sidecar key), longer than freshness TTL to avoid frequent rewrites
-    persistent_output_cache_payload_ttl: 86400
-    # optional: dedupe background refresh for non-guarded ops (kernel.terminate path)
-    persistent_refresh_lock_enabled: true
-    persistent_refresh_lock_ttl: 120
-    # queue background refresh to Symfony Messenger instead of kernel.terminate
-    persistent_refresh_queue_enabled: false
-    # operation-level lock TTL in worker (when herd guard uses operation-name)
-    persistent_refresh_operation_lock_ttl: 120
-    # enqueue dedupe TTL to avoid flooding queue with identical refresh jobs
-    persistent_enqueue_dedupe_ttl: 60
+        in_progress_protection_enabled: true      # herd guard (in-progress lock) for tier=herd_guarded
 
-    # skip standard output cache for requests where the persistent layer applies (reduces duplicate work)
-    persistent_disable_output_cache_for_guarded: false
+        # Per-operation classification — the single source of truth for
+        # persistent-cache membership, herd-guard participation, and tagging.
+        operations:
+            someListingOperation:
+                tier: herd_guarded                # in-progress lock + SWR
+                granularity: list                 # class-only invalidation tags
+            someDetailOperation:
+                tier: swr_only                    # SWR, no lock
+                granularity: single               # per-object-id tags
+                # ttl_override / priority_weight / invalidation_cooldown_ttl optional
 ```
 
-Notes:
-- Set `persistent_output_cache_guard_only: false` to apply the persistent cache to all queries handled by Data Hub.
-- Freshness TTL (persistent_output_cache_lifetime) is refreshed on each fresh HIT by updating a small meta key; the large payload is stored under a separate key with a longer TTL to avoid heavy writes per request.
+Membership and behaviour are driven entirely by the `operations:` map. The earlier `persistent_output_cache_guard_only` flag and the `in_progress_queries` allowlist have been removed — every listed operation participates in the persistent cache; `tier` decides only whether it also takes the in-progress lock.
 
-## Tags for Clearing
+## Tags for clearing
 
-You can clear via the Pimcore console by tags:
+Cleared via the Pimcore console by tag. The current families:
 
-- Common: `datahub_graphql_persistent`
-- Per operation: `datahub_graphql_op:<operation>`
-- Per client: `datahub_graphql_client:<client>`
-
-Example:
+- `datahub_graphql_persistent` — common tag on every entry.
+- `datahub_graphql_op:<operation>` — per operation.
+- `datahub_graphql_client:<client>` — per client.
+- per-class and per-object-id tags — attached per `granularity` (`list` → class, `single` → object id) so an edit invalidates only the dependent entries via the reverse index.
 
 ```
 bin/console pimcore:cache:clear --tags=datahub_graphql_persistent
-bin/console pimcore:cache:clear --tags=datahub_graphql_op:ProductsQuery
-bin/console pimcore:cache:clear --tags=datahub_graphql_client:my-client
+bin/console pimcore:cache:clear --tags=datahub_graphql_op:getResourceLibraryArticleItemListing
 ```
 
-## Invalidation and Staleness
-
-- The persistent layer stores a single “last output invalidation” timestamp internally. On data changes (objects/documents/assets updated/deleted), this timestamp is updated. On each HIT, the cached item’s `refreshedAt` is compared to that timestamp to decide if it’s stale.
-- This does not alter Pimcore’s own output cache invalidation; it merely allows the persistent layer to continue serving stale data while a fresh result is recomputed.
-
-### Background refresh deduplication
-
-- For operations listed in `in_progress_queries`, the existing thundering herd guard already deduplicates background refresh calls.
-- For other operations, enable a lightweight refresh lock with `persistent_refresh_lock_enabled` (kernel.terminate path). The lock uses a request‑scoped key and is explicitly removed after refresh; the TTL is a safety net if the process dies.
-
-### Queueing background refresh (Messenger)
-
-- Enable `persistent_refresh_queue_enabled` to dispatch a refresh job to Symfony Messenger using transport `datahub_graphql_refresh` (configure in your app). The handler serializes refreshes per operation (when herd guard uses operation name) and recomputes the exact request.
-- TTLs:
-  - `persistent_refresh_operation_lock_ttl`: TTL for per‑operation lock (seconds). Set slightly above your p99 refresh duration (e.g., 120). Used to ensure one refresh per operation at a time.
-  - `persistent_enqueue_dedupe_ttl`: TTL for enqueue dedupe marker (seconds). Prevents flooding the queue with identical refresh jobs when many stale hits arrive. Short window (e.g., 60) is usually sufficient.
-
-Worker deduplication
-- Per‑operation serialization (when herd guard uses operation name) via Symfony Lock: resource `datahub_refresh_op:<operationName>`, TTL = `persistent_refresh_operation_lock_ttl`, released after refresh.
-- Per‑request deduplication always on the worker via lock resource `datahub_refresh_req:<hash(client + body)>`, ensures no parallel refresh for the same variant even if multiple jobs are queued.
-
-Transport setup (example):
+## Console commands
 
 ```
-# config/packages/messenger.yaml
-framework:
-  messenger:
-    transports:
-      datahub_graphql_refresh: '%env(MESSENGER_TRANSPORT_DSN)%'
-    routing:
-      'Pimcore\\Bundle\\DataHubBundle\\Message\\PersistentRefreshMessage': datahub_graphql_refresh
+datahub:graphql:persistent-cache:mark-output-invalidated   # bump the fallback watermark (stale everything)
+datahub:graphql:persistent-cache:refresh <client> [--operation=] [--query=] [--variables=] [--body-file=]
+datahub:graphql:persistent-cache:clear                     # drop persistent entries
+datahub:graphql:persistent-cache:purge-invalid [--dry-run] # evict entries that no longer satisfy the request-validation rules
 ```
 
-### Lightweight Cache Status Probe
+## Invalidation
 
-For polling and external cache services, you can obtain cache status without fetching the full response.
-
-- Methods:
-  - For POST workflows: send the same GraphQL body but add `?cache_status=1` to the request (recommended for POST).
-  - Alternatively, use `HEAD` to the same endpoint. Note: many clients do not send a body with `HEAD`; for GraphQL POST flows prefer `cache_status=1` to ensure status is computed against the same payload.
-
-- Response:
-  - Status: `204 No Content` (no body)
-  - Headers:
-    - `Cache-Status`: includes both layers when applicable, following RFC 9211
-      - `pimcore-output; hit|miss|disabled`
-      - and, when the persistent layer applies: `pimcore-persistent; hit|stale|miss`
-    - `X-Pimcore-DataHub-Cache`: `HIT` or `MISS` (compat)
-    - `X-Pimcore-DataHub-Persistent-Cache`: `HIT|STALE|MISS` (compat, only when persistent applies)
-    - `Warning: 110 - "Response is Stale"` when the persistent status is `STALE`
-    - CORS headers are included
-
-- Side effects: none. Probing does not update TTLs nor schedule refreshes.
-
-- Examples:
-
-```
-# POST flow: same GraphQL body, light status-only probe
-curl -s -X POST 'https://host/datahub/graphql?cache_status=1' \
-  -H 'Content-Type: application/json' \
-  --data '{"query":"query Op($id:ID!){node(id:$id){id}}","variables":{"id":123},"operationName":"Op"}' -i
-
-# (Optional) HEAD flow: only if your client can submit an equivalent request context via query string
-curl -s -X HEAD 'https://host/datahub/graphql?cache_status=1' -i
-```
-
-Notes:
-- The persistent layer “applies” only to requests matching its conditions (e.g., `persistent_output_cache_guard_only` with an `operationName` included in `in_progress_queries`). If it does not apply, the `pimcore-persistent` entry is omitted from `Cache-Status` and only the output cache status is returned.
-- For POST flows, prefer the `?cache_status=1` probe with the same body to obtain precise status for the exact query and variables.
-
-
-## Console Commands
-
-- Mark persistent cache as stale (updates the internal timestamp):
-
-```
-bin/console datahub:graphql:persistent-cache:mark-output-invalidated
-```
-
-- Refresh a specific persistent cache entry by executing a GraphQL request through the same pipeline:
-
-```
-bin/console datahub:graphql:persistent-cache:refresh <client> \
-  [--operation=OperationName] \
-  [--query='query ...'] \
-  [--variables='{"key": "value"}'] \
-  [--body-file=/path/to/graphQLBody.json]
-```
-
-`--body-file` can be used to pass a raw GraphQL JSON payload (including `query`, `variables`, `operationName`).
-
-## Notes
-
-- This layer is designed to be minimally invasive and complementary to the existing output cache and guards.
-- If your project exposes a dedicated event for Pimcore’s cache tag invalidation, you can switch the invalidation listener to that event; the current implementation listens to content change events as a robust default.
-
-### Skipping standard output cache for persistent‑guarded requests
-
-- Enable `persistent_disable_output_cache_for_guarded` to bypass the standard output cache for requests where the persistent layer applies (typically your guarded operation names when `persistent_output_cache_guard_only` is true).
-- Pros:
-  - Reduces duplicate writes/storage and removes one cache layer for those requests.
-  - Simplifies invalidation semantics (persistent layer fully owns guarded queries).
-- Cons / considerations:
-  - OutputCacheEvents (PRE_LOAD/PRE_SAVE) will not fire for those requests; if you rely on listeners to modify responses, they won’t run.
-  - Standard output cache TTLs don’t apply; only persistent TTLs are in effect.
-  - Output cache metrics for those requests won’t be recorded; use persistent headers instead.
-  - If a request doesn’t match persistent “applies” conditions (e.g., missing operationName when guard_only is true), the output cache is still used.
+On a content change, the invalidation listener resolves which cached entries depend on the changed element (via the reverse index, keyed by the per-class / per-object tags above) and dispatches a targeted refresh for each — rather than storing a single global "last invalidation" timestamp. A **fallback watermark** is the safety floor: when a change cannot be attributed to specific entries (a non-element event, the refresh queue disabled, or no indexed dependants), the watermark is bumped and the entire persistent cache is treated as stale. Watermark bumps are logged at WARNING because a bump triggers a cluster-wide refresh. The exact decision tree, the cooldown throttle for coarse listings, and the storm failure modes are in Persistent-Cache-Flow.md.
