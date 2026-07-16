@@ -123,7 +123,7 @@ pimcore_data_hub:
 ### Constraint kinds
 
 Each variable declares exactly one `kind`. The value the request sends must
-satisfy it, or the request is rejected with `constraint_failed`.
+satisfy it, or the request is rejected with `constraint-failed`.
 
 | `kind`    | Extra fields                       | Matches |
 | --------- | ---------------------------------- | ------- |
@@ -152,9 +152,9 @@ A request carries its rules version via the `?version=N` query parameter
 
 On an enforced client, a request is rejected (HTTP 400) when **any** holds:
 
-- the operation is not declared in the resolved version → `operation_not_allowed`;
-- the request carries a variable not declared for that operation → `undeclared_variable`;
-- a declared variable's value fails its constraint → `constraint_failed`.
+- the operation is not declared in the resolved version → `operation-not-allowed`;
+- the request carries a variable not declared for that operation → `unknown-variable`;
+- a declared variable's value fails its constraint → `constraint-failed`.
 
 "Declared but absent" is also default-deny: a non-nullable declared variable
 that the request omits feeds `null` to the constraint and fails it. Only a

@@ -13,7 +13,7 @@ Before working on the default-deny request-variable validation engine (the
 `Service\RequestValidation\` family, the `WebserviceController` gate, or the
 persistent-cache rule sweep), read
 [`doc/Request-Variable-Validation.md`](doc/Request-Variable-Validation.md) — the
-config grammar, rules JSON schema, default-deny semantics, the dev bypass, and
+config grammar, rules JSON schema, default-deny semantics, the privileged bypass, and
 the cache-hygiene drain surfaces.
 
 Host-runnable gate: `composer cs:check && composer stan && vendor/bin/phpunit --testsuite=Unit`.
